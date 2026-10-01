@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# 同一分支连续推送时取消尚未跑完的旧运行。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # -D warnings 是硬门禁：有警告即失败，不靠人工 review 拦。
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    strategy:
+      # Windows 挂而别的平台过时，两边的结果都要能看到。
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # e2e 要在真实的 Perforce 服务器上跑，而 runner 上什么都没有。
+      # 脚本会校验 SHA256 并冒烟，任一步失败即整个 job 失败——
+      # 下载不到就让 CI 红，不能静默退化成「e2e 全部跳过」而看起来是绿的。
+      - name: Install p4 and p4d
+        shell: bash
+        run: bash scripts/fetch-p4-tools.sh
+      # 找不到 p4d 时 e2e 会打印一行 skipping 后整段跳过，测试仍然全绿——
+      # 那是个「什么都没验证」的成功。安装脚本失败已经会让 job 红，但那只
+      # 保证下载没出错，保证不了二进制真的能用。P4_E2E_REQUIRED 补上这道防线：
+      # 设了它，跳过就是失败。
+      - name: Run tests
+        env:
+          P4_E2E_REQUIRED: "1"
+        run: cargo test --all-targets --all-features --locked

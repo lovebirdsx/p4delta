@@ -1,0 +1,5 @@
+/.idea
+/target
+.claude/explore-results
+# scripts/fetch-p4-tools.sh 下载的 p4/p4d，不进版本库
+/vendor

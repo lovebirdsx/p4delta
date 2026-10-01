@@ -1,0 +1,38 @@
+[package]
+name = "p4delta"
+version = "0.1.3"
+edition = "2024"
+# 代码里用了 let-chains（if let ... && let ...），Rust 1.88 起稳定，
+# 高于 edition 2024 自身的 1.85 下限。
+rust-version = "1.88"
+authors = ["lovebirdsx"]
+description = "A fast replacement for P4V's Reconcile Offline Work"
+license = "MIT"
+repository = "https://github.com/lovebirdsx/p4delta"
+readme = "README.md"
+# 这是给 P4V 调用的内部工具，不作为库发布。
+publish = false
+
+[dependencies]
+anyhow = { version = "1.0.100", features = ["backtrace"] }
+clap = { version = "4.5.51", features = ["derive"] }
+walkdir = "2.5.0"
+md-5 = "0.11.0-rc.3"
+rayon = "1.11.0"
+async-global-executor = "2.4.1"
+async-process = "2.5.0"
+futures = "0.3.31"
+hex = "0.4.3"
+encoding_rs = "0.8.35"
+encoding_rs_io = "0.1.7"
+humansize = "2.1.3"
+bincode = "2.0.1"
+directories = "6.0.0"
+serde_json = "1.0.145"
+
+[build-dependencies]
+embed-resource = "2.5"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
