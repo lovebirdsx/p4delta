@@ -85,8 +85,9 @@ fn an_unreadable_name_does_not_take_the_whole_ignore_query_down() {
     // 剪枝照常生效：目录名是全 ASCII 的，不受影响。
     assert!(!stdout.contains("Not pruning"), "{stdout}");
 
-    // 唯一该报的就是那个读不出名字的文件——它交不到 p4 手上，只能保守地当新增。
-    // `.p4ignore` 被自己的规则挡下、build/ 的噪音被剪掉，两者都靠同一次查询。
+    // 唯一该报的就是那个读不出名字的文件。它交不到 p4 手上，改由 `p4 add -n` 补判
+    // （见 `apply_file_ignores`），而它并没有被忽略，所以仍然该当新增。
+    // `.p4ignore` 被自己的规则挡下、build/ 的噪音被剪掉，两者都靠主查询。
     let changes = support::listed_changes(&stdout);
     assert_eq!(
         changes.len(),
@@ -95,6 +96,78 @@ fn an_unreadable_name_does_not_take_the_whole_ignore_query_down() {
     );
     assert_eq!(changes[0].0, "Add", "{changes:?}");
     assert!(changes[0].1.contains("📁"), "{changes:?}");
+}
+
+/// 交不到命令行上的名字如果**确实被忽略**，必须问得出来，不能报成新增。
+///
+/// 这是上一条用例的另一半：`p4 ignores` 不认 stdin，那些名字改由同样认 stdin 的
+/// `p4 add -n` 补判（见 `apply_file_ignores`）。
+///
+/// `*.sketch` 是挑过的：ASCII 通配，不把非 ASCII 规则文本拖进 p4 的字符集处理；
+/// 它匹配那个非 ASCII 名字，却不碰 seed 里的任何文件。文件放在 `src/` 下（目录名全
+/// ASCII），免得被目录级剪枝先剪掉——那样根本走不到文件级过滤，用例就白测了。
+/// `keep.txt` 是对照组：补充判据只该过滤被忽略的那些，不许扩大打击面。
+#[test]
+fn an_ignored_name_p4_cannot_read_is_still_filtered() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox.write(".p4ignore", ".p4ignore\n*.sketch\n");
+    sandbox.write("src/草图📁.sketch", "ignored, and the name is unreadable\n");
+    sandbox.write("src/keep.txt", "brand new\n");
+
+    let output = sandbox
+        .cli()
+        .args(["-l", "-v"])
+        .arg(".")
+        .output()
+        .expect("run tool");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // `.p4ignore` 被自己的规则挡下（主查询），非 ASCII 名字由补充判据挡下，
+    // 只剩对照组。
+    let changes = support::listed_changes(&stdout);
+    assert_eq!(
+        changes.len(),
+        1,
+        "expected only keep.txt: {changes:?}\n{stdout}"
+    );
+    assert_eq!(changes[0].0, "Add", "{changes:?}");
+    assert!(changes[0].1.ends_with("keep.txt"), "{changes:?}");
+}
+
+/// clean 模式下这条修复是**防数据丢失**，不只是防误报。
+///
+/// `CleanChanges::project`（`src/reconcile/clean.rs`）直接把 `changes.add` 当成待删清单，
+/// `delete_workspace_files` 真的从磁盘删。修复前被忽略的非 ASCII 文件会落进 `add`，
+/// 于是一次 `--clean -a` 就把它们静默删光，还打印 "Workspace matches the depot."
+#[test]
+fn clean_does_not_delete_an_ignored_name_p4_cannot_read() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox.write(".p4ignore", ".p4ignore\n*.sketch\n");
+    sandbox.write("src/草图📁.sketch", "ignored, and the name is unreadable\n");
+    assert!(sandbox.exists("src/草图📁.sketch"));
+
+    sandbox
+        .cli()
+        .args(["--clean", "-a", "-l"])
+        .arg(".")
+        .assert()
+        .success();
+
+    assert!(
+        sandbox.exists("src/草图📁.sketch"),
+        "clean 删掉了被忽略的文件"
+    );
+    assert_eq!(
+        sandbox.read("src/草图📁.sketch"),
+        "ignored, and the name is unreadable\n"
+    );
 }
 
 /// 关掉剪枝后结论必须一模一样——剪枝只该省查询，不该改语义。

@@ -193,16 +193,12 @@ pub(crate) async fn run_p4_have(
 /// 代价有两条，都指向同一个后果——非 ASCII 的路径名在 Windows 上失配：
 ///
 /// - 这些名字只能挂在命令行上，在 ANSI 代码页表达不了它们的机器上会被转换吃掉（p4 侧的硬限制）；
-/// - 被忽略的文件名因此过滤不掉：`workspace.rs` 的文件级忽略拿不到结果，非 ASCII 的
-///   被忽略文件会一路走到 Add 类，最后由 `p4 add` 以「拒绝忽略文件」报错退场。
-///   `tests/e2e_prune.rs` 里盯着这条回退路径的用例是这里的守门人。
+/// - `p4 ignores` 因此问不出这些名字的忽略状态。文件级过滤有一条回退：改用同样
+///   认 stdin 的 `p4 add -n` 补判（见 `crate::workspace::apply_file_ignores`）。
+///   目录级剪枝没有回退，那些目录照常完整扫描——只损失性能，不改变结论。
 fn takes_paths_from_stdin(always_args: &[&str]) -> bool {
     !always_args.contains(&"ignores")
 }
-
-/// 已经提醒过「有路径交不到 p4 手上」。同一轮里文件级过滤与目录级剪枝会各问一次，
-/// 同一个问题重复出现，刷屏没有信息量。
-static WARNED_UNSENDABLE_PATHS: AtomicBool = AtomicBool::new(false);
 
 /// 该路径能不能安全地挂在 p4 命令行上。
 ///
@@ -226,25 +222,19 @@ pub(crate) fn command_line_safe(path: &str) -> bool {
     !cfg!(windows) || path.is_ascii()
 }
 
-/// 从一批路径里挑出能交给 p4 命令行的那些。剩下的保守地按「p4 判断不了」处理——
-/// 宁可多报一个变更，也不能把交不出去的路径当成「未被忽略」以外的结论。
-pub(crate) fn command_line_ready_paths(paths: &[String]) -> Vec<String> {
-    let (ready, dropped): (Vec<String>, Vec<String>) = paths
+/// 把一批路径劈成「能交给 p4 命令行的」与「交不出去的」两半，顺序各自保持。
+///
+/// 后半不是终点，但两个调用点的善后差得很远，一句通用文案说不准，所以这里只划分、
+/// 不报告——报告交给各自的调用方，在 `-v` 下按自己的口径打印：
+///
+/// - 文件级过滤有回退：`p4 ignores` 不认 stdin，但 `p4 add -n` 认，于是那些名字改走
+///   那条字节无损的通道补判（见 [`crate::workspace::apply_file_ignores`]）。
+/// - 目录级剪枝没有回退：交不出去的目录照常完整扫描，只损失性能。
+pub(crate) fn split_command_line_paths(paths: &[String]) -> (Vec<String>, Vec<String>) {
+    paths
         .iter()
         .cloned()
-        .partition(|path| command_line_safe(path));
-
-    if !dropped.is_empty() && !WARNED_UNSENDABLE_PATHS.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "Warning: {} of {} path(s) contain characters p4 cannot read from the command line \
-             on this platform; their ignored state is left undecided, so they are never treated \
-             as ignored.",
-            dropped.len(),
-            paths.len()
-        );
-    }
-
-    ready
+        .partition(|path| command_line_safe(path))
 }
 
 /// 组装一次「一批路径参数」的 p4 调用，返回命令与要写进 stdin 的载荷。
@@ -357,6 +347,12 @@ fn warn_p4_could_not_start(command: &str, reason: &dyn std::fmt::Display) {
 /// 一次 p4 调用失败与否的判据。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureMode {
+    /// 退出码与 stderr 都不作判据：调用方自己解析输出来下结论。
+    ///
+    /// `p4 add -n` 遇到被忽略的文件**必然**退出 1，而那条正是调用方要的信号
+    /// （见 `crate::workspace::apply_file_ignores` 的补充判据），报成警告只会误导。
+    /// p4 起不来时仍按 lenient 降级，不中断整轮。
+    Silent,
     /// 只告警，不失败。查询与预演用它。
     Warn,
     /// 退出码非零即失败，stderr 上的提示不算失败。
@@ -374,9 +370,9 @@ pub(crate) enum FailureMode {
 }
 
 impl FailureMode {
-    /// 只告警不失败。
+    /// 不会让调用方失败：p4 起不来时只告警并交出空结果，由调用方保守处理。
     fn is_lenient(self) -> bool {
-        self == Self::Warn
+        matches!(self, Self::Warn | Self::Silent)
     }
 }
 
@@ -391,6 +387,11 @@ fn p4_failure_message(
     stderr: &str,
     mode: FailureMode,
 ) -> Option<String> {
+    // Silent 连退出码都不看：调用方要的裁决就写在 stdout 上，非零退出正是其中一种结论。
+    if mode == FailureMode::Silent {
+        return None;
+    }
+
     if !success {
         return Some(format!("p4 {command} exited with {status}: {stderr}"));
     }
@@ -666,21 +667,23 @@ mod tests {
         assert_eq!(command_line_safe("/ws/使用说明.txt"), !cfg!(windows));
     }
 
-    /// 挑剩下的路径交给调用方按「未被忽略」处理，顺序保持不变。
+    /// 两半各自保持原顺序。交不出去的那半不是被丢掉，而是留给 `p4 add -n` 的补充判据。
     #[test]
-    fn command_line_ready_paths_drop_only_what_p4_cannot_read() {
+    fn split_command_line_paths_separates_what_p4_cannot_read() {
         let paths = vec![
             r"C:\ws\readme.txt".to_owned(),
             r"C:\ws\使用说明.txt".to_owned(),
             r"C:\ws\build".to_owned(),
         ];
 
-        let ready = command_line_ready_paths(&paths);
+        let (ready, unreadable) = split_command_line_paths(&paths);
 
         if cfg!(windows) {
             assert_eq!(ready, [paths[0].clone(), paths[2].clone()]);
+            assert_eq!(unreadable, [paths[1].clone()]);
         } else {
             assert_eq!(ready, paths);
+            assert!(unreadable.is_empty());
         }
     }
 

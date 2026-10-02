@@ -14,8 +14,8 @@ use walkdir::WalkDir;
 use crate::charset::query_p4_variable;
 use crate::cli::Options;
 use crate::p4::process::{
-    FailureMode, command_line_ready_paths, compute_batches, run_p4_command_batched,
-    run_p4_command_slice,
+    FailureMode, compute_batches, run_p4_command_batched, run_p4_command_slice,
+    split_command_line_paths,
 };
 use crate::path::{local_path_key, normalize_local_path_owned, path_is_under_key};
 
@@ -171,7 +171,20 @@ pub(crate) async fn query_ignored_dirs(
     // 目录名里也可能有 p4 在命令行上认不出的字符（见 [`command_line_safe`]）。它们
     // 不进查询，于是也剪不掉——这是一条保守的回退：那些目录照常完整扫描，
     // 由文件级过滤接手。留在查询里的话，一个这样的名字会让**整批**失败。
-    let dirs = command_line_ready_paths(dirs);
+    // 文件级过滤有 `p4 add -n` 的补充判据，目录级没有：这里只损失性能。
+    let total = dirs.len();
+    let (dirs, unreadable) = split_command_line_paths(dirs);
+
+    // 只在 `-v` 下说一声。本函数每轮剪枝规划会被调两次（顶层与其余各一次），
+    // 两批的分母不同，所以这里不去重：各自说各自的，反而看得清是哪一批。
+    if options.verbose && !unreadable.is_empty() {
+        println!(
+            "         {} of {} directory name(s) cannot go on the p4 command line; \
+             those directories are scanned in full instead of being pruned.",
+            unreadable.len(),
+            total
+        );
+    }
 
     if dirs.is_empty() {
         return Ok(DirQueryResult {
@@ -686,7 +699,7 @@ mod tests {
 
     /// 用真实 p4 查询哪些路径被忽略；p4 不存在时返回 None 让调用方跳过。
     ///
-    /// 路径先过 [`command_line_ready_paths`]：`p4 ignores` 不认 `-x`，路径只能挂在命令行上，
+    /// 路径先过 [`split_command_line_paths`]：`p4 ignores` 不认 `-x`，路径只能挂在命令行上，
     /// 生产会把送不进命令行的那些挑掉（见 `src/p4/process.rs` 里那段说明）。这里照做，
     /// 否则用例会去断言一个生产根本不会发出的请求。
     fn p4_ignored_paths(
@@ -698,7 +711,7 @@ mod tests {
             .iter()
             .map(|path| path.display().to_string())
             .collect();
-        let ready = command_line_ready_paths(&path_strings);
+        let (ready, _unreadable) = split_command_line_paths(&path_strings);
         let mut args: Vec<&str> = vec!["ignores", "-i"];
         args.extend(ready.iter().map(String::as_str));
 
@@ -788,8 +801,8 @@ mod tests {
         ))));
 
         // 非 ASCII 的目录名在 Windows 上送不进 p4 的命令行（生产的
-        // `command_line_ready_paths` 会把它挑掉，见 `src/p4/process.rs`），那时它只能保守地
-        // 按「未被忽略」处理；Unix 上没有这道转换，必须命中。
+        // `split_command_line_paths` 会把它挑掉，见 `src/p4/process.rs`），目录级剪枝对此
+        // 没有回退，只能保守地按「未被忽略」处理；Unix 上没有这道转换，必须命中。
         let key = local_path_key(&unreadable.display().to_string());
         let probe = local_path_key(&ignore_probe_path(&unreadable.display().to_string()));
         let sendable = command_line_safe(&unreadable.display().to_string());

@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 
 use crate::cli::Options;
 use crate::model::{DepotState, WorkspaceFile, WorkspaceState};
-use crate::p4::process::{FailureMode, command_line_ready_paths, run_p4_command_batched};
+use crate::p4::process::{FailureMode, run_p4_command_batched, split_command_line_paths};
 use crate::path::{local_path_key, normalize_local_path_owned, path_is_under_key};
 use crate::prune::{
     IGNORES_ARGS, PrunePlan, has_pruned_ancestor, parse_ignores_output, plan_directory_pruning,
@@ -73,14 +73,40 @@ pub(crate) async fn apply_file_ignores(
         return Ok(0);
     }
 
-    // p4 在命令行上认不出的名字整个不进查询：一条这样的路径就足以让**整批**失败，
+    // p4 在命令行上认不出的名字整个不进主查询：一条这样的路径就足以让**整批**失败，
     // 同批里 ASCII 文件的忽略判断会被一起带走（见 [`command_line_safe`]）。
-    let ignores_paths = command_line_ready_paths(
+    // 它们改走下面的补充判据，不是被放弃。
+    let (ignores_paths, unreadable_paths) = split_command_line_paths(
         &files
             .iter()
             .map(|file| file.path.clone())
             .collect::<Vec<_>>(),
     );
+
+    // 交不出去的那些不是被放弃，下面有补充判据接手。只在 `-v` 下说一声：它们现在有解，
+    // 不该在正常输出里冒充告警——那会让人以为出了事。
+    if options.verbose && !unreadable_paths.is_empty() {
+        println!(
+            "         {} of {} path(s) cannot go on the p4 command line; \
+             their ignored state comes from a \"p4 add -n\" query instead.",
+            unreadable_paths.len(),
+            files.len()
+        );
+    }
+
+    let queried = query_ignores(options, work_dir, files, &ignores_paths).await?;
+    let refused = query_ignored_refusals(options, work_dir, files, &unreadable_paths).await?;
+
+    Ok(queried + refused)
+}
+
+/// 主查询：`p4 ignores -i`，路径挂在命令行上。
+async fn query_ignores(
+    options: &Options,
+    work_dir: &str,
+    files: &mut [WorkspaceFile],
+    ignores_paths: &[String],
+) -> Result<usize> {
     if ignores_paths.is_empty() {
         return Ok(0);
     }
@@ -92,7 +118,7 @@ pub(crate) async fn apply_file_ignores(
         options,
         work_dir,
         &IGNORES_ARGS,
-        &ignores_paths,
+        ignores_paths,
         false,
         FailureMode::Warn,
     )
@@ -121,6 +147,106 @@ pub(crate) async fn apply_file_ignores(
     }
 
     Ok(ignored_count)
+}
+
+/// 补充判据的命令参数。`p4 add` 认 stdin，`p4 ignores` 不认——这正是这条判据成立的原因。
+const ADD_PREVIEW_ARGS: [&str; 2] = ["add", "-n"];
+
+/// p4 拒绝添加被忽略文件时给的行尾，前面是它回显的本地路径。
+const IGNORED_REFUSAL_SUFFIX: &str = " - ignored file can't be added.";
+
+/// 给交不到命令行上的路径补一次 `p4 add -n`，返回新标记的数量。
+///
+/// 这些路径只能走 stdin（`p4 ignores` 不认 `-x`，`p4 add` 认），而 stdin 是字节无损的
+/// 通道，恰好绕开让它们上不了命令行的代码页转换。问的是「p4 会不会让我 add 它」——
+/// 这正是这些路径最终会撞上的那个操作：被忽略又没入库的文件会被报成 Add，
+/// `-a` 时 `p4 add` 拒绝它并让整轮失败。
+///
+/// 只采纳肯定结论。已入库的路径 p4 只回 `can't add existing file`，那里面没有忽略信息，
+/// 所以「没被拒绝」不能反推成「未被忽略」——那些文件维持原状，与没有这条判据时一样。
+async fn query_ignored_refusals(
+    options: &Options,
+    work_dir: &str,
+    files: &mut [WorkspaceFile],
+    unreadable_paths: &[String],
+) -> Result<usize> {
+    if unreadable_paths.is_empty() {
+        return Ok(0);
+    }
+
+    let requested: HashSet<String> = unreadable_paths
+        .iter()
+        .map(|path| local_path_key(path))
+        .collect();
+
+    // 被忽略的文件必然让 p4 退出 1，那正是这里的信号，不能当失败上报。
+    let lines = run_p4_command_batched(
+        options,
+        work_dir,
+        &ADD_PREVIEW_ARGS,
+        unreadable_paths,
+        false,
+        FailureMode::Silent,
+    )
+    .await?;
+
+    let (refused, unrecognized) = parse_ignored_refusals(&lines, &requested);
+    if unrecognized > 0 {
+        eprintln!(
+            "Warning: {} line(s) of p4 add -n output did not match a requested file.",
+            unrecognized
+        );
+    }
+
+    let mut ignored_count = 0;
+    for file in files.iter_mut() {
+        if !file.filtered && refused.contains(&local_path_key(&file.path)) {
+            if options.verbose {
+                println!("         Ignored file \"{}\" by add -n", file.path);
+            }
+            ignored_count += 1;
+            file.filtered = true;
+        }
+    }
+
+    Ok(ignored_count)
+}
+
+/// 解析 `p4 add -n` 输出里「被忽略」的裁决，返回命中路径的 [`local_path_key`] 集合。
+///
+/// 只认 `<本地路径> - ignored file can't be added.` 这一种行。同一批里还有 p4 给每条路径
+/// 的 depot 侧附注（`//depot/path#1 - opened for add` 之类），那些不含裁决，不算异常输出。
+///
+/// 回显的盘符大小写与请求未必一致（实测输入 `E:\...` 回来是 `e:\...`），所以路径按键比对。
+/// 判据是「这一行是不是本地路径」：裁决行必然不是 depot 路径，因此不以 `//` 开头；
+/// 反过来，不认得的本地路径行说明输出格式变了，计进 `unrecognized` 提醒一声——
+/// 漏认只会少过滤，方向是保守的。
+fn parse_ignored_refusals(
+    lines: &[String],
+    requested: &HashSet<String>,
+) -> (HashSet<String>, usize) {
+    let mut refused = HashSet::new();
+    let mut unrecognized = 0;
+
+    for line in lines {
+        if line.starts_with("//") {
+            continue;
+        }
+
+        let Some(path) = line.strip_suffix(IGNORED_REFUSAL_SUFFIX) else {
+            unrecognized += 1;
+            continue;
+        };
+
+        let key = local_path_key(path);
+        if requested.contains(&key) {
+            refused.insert(key);
+        } else {
+            unrecognized += 1;
+        }
+    }
+
+    (refused, unrecognized)
 }
 
 /// `p4 where` 的查询参数。它只读 client spec 的 view，不需要连服务器。
@@ -351,6 +477,54 @@ mod tests {
             drop_unmapped(&files, &unmapped),
             vec![r"C:\ws\a.txt".to_owned(), r"C:\ws\c.txt".to_owned()]
         );
+    }
+
+    /// 裁决行里的路径是 p4 回显的本地路径，盘符大小写未必与请求一致（实测 `E:\` 回来是 `e:\`）。
+    #[test]
+    fn ignored_refusals_match_across_case() {
+        let lines = vec![r"e:\ws\使用说明.txt - ignored file can't be added.".to_owned()];
+        let requested: HashSet<String> = [local_path_key(r"E:\ws\使用说明.txt")]
+            .into_iter()
+            .collect();
+
+        let (refused, unrecognized) = parse_ignored_refusals(&lines, &requested);
+
+        assert_eq!(refused, requested);
+        assert_eq!(unrecognized, 0);
+    }
+
+    /// 每条请求路径都会换回一行 depot 侧附注，那些不含裁决，不能当成异常输出刷警告。
+    #[test]
+    fn add_preview_depot_notes_are_not_verdicts() {
+        let lines = vec![
+            r"//depot/ws/readme.txt#1 - opened for add".to_owned(),
+            r"//depot/ws/lib.txt - can't add existing file".to_owned(),
+        ];
+        let requested: HashSet<String> =
+            [local_path_key(r"C:\ws\readme.txt")].into_iter().collect();
+
+        let (refused, unrecognized) = parse_ignored_refusals(&lines, &requested);
+
+        assert!(refused.is_empty());
+        assert_eq!(unrecognized, 0, "depot 侧附注是预期输出，不是格式漂移");
+    }
+
+    /// 不认得的本地路径行说明输出格式变了：只记数告警，绝不产生过滤结果。
+    #[test]
+    fn unrecognized_lines_never_filter_anything() {
+        let lines = vec![
+            // 后缀不全。
+            r"C:\ws\readme.txt - ignored".to_owned(),
+            // 后缀对，但路径不在请求集合里。
+            r"C:\ws\other.txt - ignored file can't be added.".to_owned(),
+        ];
+        let requested: HashSet<String> =
+            [local_path_key(r"C:\ws\readme.txt")].into_iter().collect();
+
+        let (refused, unrecognized) = parse_ignored_refusals(&lines, &requested);
+
+        assert!(refused.is_empty());
+        assert_eq!(unrecognized, 2);
     }
 
     #[test]
