@@ -630,7 +630,21 @@ mod tests {
             }
             // p4 查询失败时只回退，绝不中止整个协调
             "gate-failure" => {
-                // 这个客户端名会被 p4 当成通配符拒绝（非零退出），用来制造真实的查询失败。
+                // 用客户端名 `*` 制造一次真实的查询失败：Windows 上 p4 把命令行解析两遍
+                // （宽字符一遍、ANSI 一遍）再比对参数个数，`*` 在两遍里展开成不同个数，
+                // p4 报 `Argument parsing ambiguity.` 并以 -1 退出（见 `command_line_safe`）。
+                //
+                // Unix 上没有这道转换，`p4 ignores` 也压根不看客户端名——空串、引号、换行、
+                // 超长名字实测都照样退出 0，而忽略文件读不出来时 p4 只当没有规则。这条失败
+                // 在 Unix 上造不出来，所以这一段只在 Windows 上跑；Err → 回退那几行映射
+                // 本身与平台无关（`plan_directory_pruning` 里那个 match）。
+                if !cfg!(windows) {
+                    eprintln!(
+                        "skipping: the `p4 -c '*'` failure injection only reproduces on Windows"
+                    );
+                    return;
+                }
+
                 // 前提先确认真实成立：换成不再失败的 p4 时这里会明确报错，而不是让断言失效。
                 let options = Options::parse_from(["p4delta", "-w", "*"]);
                 assert!(
