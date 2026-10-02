@@ -152,17 +152,20 @@ mod tests {
     use crate::test_util::TempTree;
 
     /// 造一份假 p4。探测只看它是不是文件，内容无所谓。
-    fn fake_p4(tree: &TempTree, relative: &str) -> PathBuf {
-        tree.file(relative, "")
+    ///
+    /// 文件名走生产代码的 `exe_name()`：Unix 上没有 `.exe` 后缀，写死会让
+    /// `find_in_path` 与安装目录两处找不到自己刚造出来的文件。
+    fn fake_p4(tree: &TempTree, dir_relative: &str) -> PathBuf {
+        tree.file(&format!("{dir_relative}/{}", exe_name()), "")
     }
 
     #[test]
     fn an_explicit_p4_exe_wins_over_everything_else() {
         let tree = TempTree::new("locate-explicit");
-        let explicit = fake_p4(&tree, "explicit/p4.exe");
-        fake_p4(&tree, "on-path/p4.exe");
+        let explicit = fake_p4(&tree, "explicit");
+        fake_p4(&tree, "on-path");
         let install = tree.dir("installed");
-        fake_p4(&tree, "installed/p4.exe");
+        fake_p4(&tree, "installed");
 
         let resolved = resolve_p4_exe(
             Some(explicit.as_os_str().to_owned()),
@@ -176,9 +179,9 @@ mod tests {
     #[test]
     fn path_is_preferred_over_the_p4v_install_directories() {
         let tree = TempTree::new("locate-path");
-        let from_path = fake_p4(&tree, "bin/p4.exe");
+        let from_path = fake_p4(&tree, "bin");
         let install = tree.dir("installed");
-        fake_p4(&tree, "installed/p4.exe");
+        fake_p4(&tree, "installed");
 
         let resolved = resolve_p4_exe(None, Some(tree.dir("bin").into_os_string()), &[install]);
 
@@ -192,7 +195,7 @@ mod tests {
         let tree = TempTree::new("locate-install");
         let missing = tree.dir("missing");
         let install = tree.dir("installed");
-        let expected = fake_p4(&tree, "installed/p4.exe");
+        let expected = fake_p4(&tree, "installed");
 
         let resolved = resolve_p4_exe(
             None,
@@ -208,7 +211,7 @@ mod tests {
     fn a_missing_path_variable_falls_through_to_the_install_directories() {
         let tree = TempTree::new("locate-no-path");
         let install = tree.dir("installed");
-        let expected = fake_p4(&tree, "installed/p4.exe");
+        let expected = fake_p4(&tree, "installed");
 
         assert_eq!(resolve_p4_exe(None, None, &[install]).unwrap(), expected);
     }
@@ -217,7 +220,7 @@ mod tests {
     #[test]
     fn an_explicit_path_that_does_not_exist_is_an_error() {
         let tree = TempTree::new("locate-missing-explicit");
-        fake_p4(&tree, "on-path/p4.exe");
+        fake_p4(&tree, "on-path");
         let missing = tree.root.join("nope").join(exe_name());
 
         let reason = resolve_p4_exe(
@@ -235,7 +238,7 @@ mod tests {
     #[test]
     fn an_empty_explicit_path_means_unset() {
         let tree = TempTree::new("locate-empty-explicit");
-        let expected = fake_p4(&tree, "bin/p4.exe");
+        let expected = fake_p4(&tree, "bin");
 
         let resolved = resolve_p4_exe(
             Some(OsString::new()),
