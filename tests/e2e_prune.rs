@@ -52,6 +52,51 @@ fn ignored_directories_are_pruned() {
     );
 }
 
+/// 工作区里有一个 p4 在命令行上读不出的名字时，同批 ASCII 文件的忽略判断不能被它带走。
+///
+/// Windows 上 p4 会把命令行解析两遍——宽字符一遍、ANSI 一遍——ANSI 那遍把代码页表示不了
+/// 的字符换成 `?`，而 `?` 在文件名匹配里能匹**零个**字符：同一个参数在两遍里展开成不同
+/// 个数，p4 报 `Argument parsing ambiguity.` 并以 -1 退出。宽松模式把它吞成一行警告，
+/// 于是**一个都过滤不掉**：`.p4ignore` 与 build/ 下的噪音全成了新增文件。
+///
+/// emoji 在 CP1252 与 CP936 下都表示不出来，所以这条用例在 CI 的 en-US 机器与本机
+/// 中文 Windows 上都能复现旧行为。放在 `src/` 下是让被吃成通配符的名字有东西可多匹：
+/// 那里有 `lib.txt` 与 `使用说明.txt`。
+#[test]
+fn an_unreadable_name_does_not_take_the_whole_ignore_query_down() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox.write(".p4ignore", P4IGNORE);
+    sandbox.write("build/noise0.txt", "ignored\n");
+    // 四个 emoji：代码页里各退化成一个 `?`，合起来是 `????.txt`。
+    sandbox.write("src/📁📁📁📁.txt", "a name p4 cannot read\n");
+
+    let output = sandbox
+        .cli()
+        .args(["-l", "-v"])
+        .arg(".")
+        .output()
+        .expect("run tool");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // 剪枝照常生效：目录名是全 ASCII 的，不受影响。
+    assert!(!stdout.contains("Not pruning"), "{stdout}");
+
+    // 唯一该报的就是那个读不出名字的文件——它交不到 p4 手上，只能保守地当新增。
+    // `.p4ignore` 被自己的规则挡下、build/ 的噪音被剪掉，两者都靠同一次查询。
+    let changes = support::listed_changes(&stdout);
+    assert_eq!(
+        changes.len(),
+        1,
+        "expected only the unreadable name: {changes:?}"
+    );
+    assert_eq!(changes[0].0, "Add", "{changes:?}");
+    assert!(changes[0].1.contains("📁"), "{changes:?}");
+}
+
 /// 关掉剪枝后结论必须一模一样——剪枝只该省查询，不该改语义。
 #[test]
 fn the_no_prune_flag_scans_everything() {

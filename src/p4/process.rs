@@ -199,6 +199,53 @@ fn takes_paths_from_stdin(always_args: &[&str]) -> bool {
     !always_args.contains(&"ignores")
 }
 
+/// 已经提醒过「有路径交不到 p4 手上」。同一轮里文件级过滤与目录级剪枝会各问一次，
+/// 同一个问题重复出现，刷屏没有信息量。
+static WARNED_UNSENDABLE_PATHS: AtomicBool = AtomicBool::new(false);
+
+/// 该路径能不能安全地挂在 p4 命令行上。
+///
+/// 只有 Windows 需要这道限制。p4 在 Windows 上把命令行解析**两遍**——宽字符一遍
+/// （`GetCommandLineW`）、ANSI 一遍（`GetCommandLineA`）——再比对两遍得到的参数**个数**，
+/// 不一致就报 `Argument parsing ambiguity.` 并以 -1 退出（`clientmain.cc` 里
+/// `n_argc != w_argc` 那条检查）。ANSI 那一遍会把当前代码页表示不了的字符换成 `?`，
+/// 而 Win32 的文件名匹配里 `?` 可以匹**零个**字符：实测 `????.txt` 会同时匹到
+/// `c.txt`、`lib.txt` 与 `使用说明.txt`。p4 自己还会展开通配符，于是同一个参数在两遍里
+/// 展开成不同个数，**整批**查询直接失败——一个中文名足以让同批所有 ASCII 路径的忽略
+/// 判断一起失效（CI 的 windows-latest 是 en-US，CP1252 下 `使用说明.txt` 必然变成
+/// `????.txt`，`tests/e2e_prune.rs` 的三个用例因此全红）。
+///
+/// 代码页里表示得出来的非 ASCII 字符同样不该送进去：p4 拿到的是代码页字节，却按命令
+/// 字符集（P4COMMANDCHARSET，缺省随 P4CHARSET）解释，两边不一致时照样失配——那正是
+/// 路径参数改走 stdin 的原因（见 [`argument_payload`]）。ASCII 是唯一在两处都是同一串
+/// 字节的集合。
+///
+/// Unix 上没有这道转换，路径照常交给 p4。
+pub(crate) fn command_line_safe(path: &str) -> bool {
+    !cfg!(windows) || path.is_ascii()
+}
+
+/// 从一批路径里挑出能交给 p4 命令行的那些。剩下的保守地按「p4 判断不了」处理——
+/// 宁可多报一个变更，也不能把交不出去的路径当成「未被忽略」以外的结论。
+pub(crate) fn command_line_ready_paths(paths: &[String]) -> Vec<String> {
+    let (ready, dropped): (Vec<String>, Vec<String>) = paths
+        .iter()
+        .cloned()
+        .partition(|path| command_line_safe(path));
+
+    if !dropped.is_empty() && !WARNED_UNSENDABLE_PATHS.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "Warning: {} of {} path(s) contain characters p4 cannot read from the command line \
+             on this platform; their ignored state is left undecided, so they are never treated \
+             as ignored.",
+            dropped.len(),
+            paths.len()
+        );
+    }
+
+    ready
+}
+
 /// 组装一次「一批路径参数」的 p4 调用，返回命令与要写进 stdin 的载荷。
 ///
 /// 命令行形状（顺序即下面的构造顺序；全局选项必须排在命令之前，已实测）：
@@ -536,6 +583,37 @@ mod tests {
         let (payload, unrepresentable) = argument_payload(&args, WINDOWS_1252);
         assert_eq!(payload, [fallback.as_ref(), b"\nreadme.txt\n"].concat());
         assert_eq!(unrepresentable, 1, "只有中文名写不进 winansi");
+    }
+
+    /// Windows 上非 ASCII 的名字不能挂在 p4 命令行上：ANSI 那一遍会把它变成 `?`，
+    /// 而 `?` 能匹零个字符，两遍解析的参数个数就对不上，p4 报
+    /// `Argument parsing ambiguity.` 并以 -1 退出，整批查询作废。
+    /// Unix 没有这道转换，照常交出去。
+    #[test]
+    fn non_ascii_paths_are_kept_off_the_windows_command_line() {
+        assert!(command_line_safe(r"C:\ws\readme.txt"));
+        assert!(command_line_safe("/ws/readme.txt"));
+
+        assert_eq!(command_line_safe(r"C:\ws\使用说明.txt"), !cfg!(windows));
+        assert_eq!(command_line_safe("/ws/使用说明.txt"), !cfg!(windows));
+    }
+
+    /// 挑剩下的路径交给调用方按「未被忽略」处理，顺序保持不变。
+    #[test]
+    fn command_line_ready_paths_drop_only_what_p4_cannot_read() {
+        let paths = vec![
+            r"C:\ws\readme.txt".to_owned(),
+            r"C:\ws\使用说明.txt".to_owned(),
+            r"C:\ws\build".to_owned(),
+        ];
+
+        let ready = command_line_ready_paths(&paths);
+
+        if cfg!(windows) {
+            assert_eq!(ready, [paths[0].clone(), paths[2].clone()]);
+        } else {
+            assert_eq!(ready, paths);
+        }
     }
 
     /// 没有参数时不能加 `-x -`：那会让 p4 去读一个空的 stdin，一个参数都拿不到。

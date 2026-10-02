@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 
 use crate::cli::Options;
 use crate::model::{DepotState, WorkspaceFile, WorkspaceState};
-use crate::p4::process::run_p4_command_batched;
+use crate::p4::process::{command_line_ready_paths, run_p4_command_batched};
 use crate::path::{local_path_key, normalize_local_path_owned, path_is_under_key};
 use crate::prune::{
     IGNORES_ARGS, PrunePlan, has_pruned_ancestor, parse_ignores_output, plan_directory_pruning,
@@ -73,7 +73,18 @@ pub(crate) async fn apply_file_ignores(
         return Ok(0);
     }
 
-    let ignores_paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+    // p4 在命令行上认不出的名字整个不进查询：一条这样的路径就足以让**整批**失败，
+    // 同批里 ASCII 文件的忽略判断会被一起带走（见 [`command_line_safe`]）。
+    let ignores_paths = command_line_ready_paths(
+        &files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>(),
+    );
+    if ignores_paths.is_empty() {
+        return Ok(0);
+    }
+
     let requested: HashSet<String> = ignores_paths.iter().cloned().collect();
 
     // 文件级过滤沿用旧行为：p4 报错只告警，不改变已有结果。

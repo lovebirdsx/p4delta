@@ -13,7 +13,9 @@ use walkdir::WalkDir;
 
 use crate::charset::query_p4_variable;
 use crate::cli::Options;
-use crate::p4::process::{compute_batches, run_p4_command_batched, run_p4_command_slice};
+use crate::p4::process::{
+    command_line_ready_paths, compute_batches, run_p4_command_batched, run_p4_command_slice,
+};
 use crate::path::{local_path_key, normalize_local_path_owned, path_is_under_key};
 
 /// P4IGNORE 必须恰好解析成这个名字，才允许用目录级判断剪枝。
@@ -165,6 +167,11 @@ pub(crate) async fn query_ignored_dirs(
     work_dir: &str,
     dirs: &[String],
 ) -> Result<DirQueryResult> {
+    // 目录名里也可能有 p4 在命令行上认不出的字符（见 [`command_line_safe`]）。它们
+    // 不进查询，于是也剪不掉——这是一条保守的回退：那些目录照常完整扫描，
+    // 由文件级过滤接手。留在查询里的话，一个这样的名字会让**整批**失败。
+    let dirs = command_line_ready_paths(dirs);
+
     if dirs.is_empty() {
         return Ok(DirQueryResult {
             prunable: Some(Vec::new()),
@@ -174,7 +181,7 @@ pub(crate) async fn query_ignored_dirs(
 
     // 目录里的内容是否被忽略无法直接查询，用一个不会落盘的合成子路径代替：p4 只做规则匹配。
     let mut arguments = Vec::with_capacity(dirs.len() * 2);
-    for dir in dirs {
+    for dir in &dirs {
         arguments.push(dir.clone());
         arguments.push(ignore_probe_path(dir));
     }
