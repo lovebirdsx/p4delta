@@ -42,12 +42,14 @@ P4V 里的 `Reconcile Offline Work` 慢得令人抓狂，本程序是它的替�
 重写。写之前会备份一份（`customtools.xml.p4delta-backup-<时间戳>`）。P4V 正在运行时会拒绝
 写入（`-Force` 可以强行继续）——P4V 退出时可能用它内存里的列表覆盖这次改动。
 
-默认注册 `p4delta Reconcile` 与 `p4delta Clean (preview)` 两个，都进右键菜单。不可逆的
-「clean 实际清理」不注册，需要时用 `-WithCleanApply` 再跑一次。
+默认注册三个：`p4delta Reconcile` 与 `p4delta Clean (preview)` 都进右键菜单，不可逆的
+`p4delta Clean (APPLY - irreversible)` 单独放在 `p4delta (irreversible)` 子菜单里，免得和安全的
+那个挨着被误点。不想要它就在安装时加 `-WithoutCleanApply`：既不注册，以前注册过的也会被
+摘掉（只认自己那几个节点的名字，别人的工具不碰）。
 
 | 参数 | 作用 |
 | --- | --- |
-| `-WithCleanApply` | 额外注册不可逆的 clean 实际清理（单独放在一个子菜单里） |
+| `-WithoutCleanApply` | 不注册不可逆的 clean 实际清理；已经注册过的会被摘掉（默认注册，放在单独的子菜单里） |
 | `-Uninstall` | 卸载：摘掉工具定义、删安装目录；摘要缓存留着 |
 | `-AddToPath` | 把安装目录加进用户级 PATH，方便在命令行里直接敲 `p4delta` |
 | `-InstallDir`、`-CustomToolsPath` | 换安装位置 / 换 P4V 配置文件位置 |
@@ -71,7 +73,7 @@ Get-FileHash .\p4delta-<版本>-x86_64-pc-windows-msvc.zip -Algorithm SHA256
 - `p4delta Reconcile`：默认模式，等价于依次执行 "Reconcile Offline Work" 和 "Revert Unchanged"。
 - `p4delta Clean (preview)`：clean 模式的预演，只打印不动作。
 - `p4delta Clean (APPLY - irreversible)`：clean 模式的实际清理，**不可逆**，先看「clean 模式」
-  一节。这一条默认不注册（装的时候加 `-WithCleanApply`）。
+  一节。默认注册在 `p4delta (irreversible)` 子菜单里；不想要就在装的时候加 `-WithoutCleanApply`。
 
 去掉 `-a` 就是预演（dry run）：照常扫描比对并打印结果，但不向 p4 应用任何变更。
 
@@ -95,6 +97,7 @@ Arguments 里的 `$c` 是 P4V 展开的当前 workspace，`%D` 是右键选中�
 
 想从 P4V 里清理工作区的话，再建一个自定义工具：Arguments 填 `--clean -w $c -l %D` 做预演，
 填 `-a --clean -w $c -l %D` 做实际清理。它的动作**不可逆**，先看「clean 模式」一节。
+安装脚本会把实际清理那条放进单独的 `p4delta (irreversible)` 文件夹，手工建的话也建议这么摆。
 
 配置完成后，在工作区里右键一个目录，选最下面的这个自定义工具。
 

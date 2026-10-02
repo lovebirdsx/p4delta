@@ -51,6 +51,16 @@ function Assert-Equal($Expected, $Actual, [string] $Message) {
     }
 }
 
+# 逐字节比较两份快照。长度相同不代表内容相同，而「文件不该被重写」的断言要的正是内容一致。
+function Assert-BytesEqual([byte[]] $Expected, [byte[]] $Actual, [string] $Message) {
+    Assert-Equal $Expected.Length $Actual.Length "$Message（长度）"
+    for ($i = 0; $i -lt $Expected.Length; $i++) {
+        if ($Expected[$i] -ne $Actual[$i]) {
+            throw "断言失败：$Message（偏移 $i）"
+        }
+    }
+}
+
 function Write-Utf8NoBom([string] $Path, [string] $Content) {
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
@@ -179,11 +189,11 @@ function Test-FreshInstall {
     Assert-True (Test-Path -LiteralPath $ToolsPath) '应当新建自定义工具文件'
 
     $doc = Read-ToolsDocument
-    Assert-Equal 2 $doc.SelectNodes('//CustomToolDef').Count '默认应当注册两个工具'
+    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '默认应当注册三个工具'
     Assert-Equal 'customtooldeflist' $doc.DocumentElement.GetAttribute('varName') '根元素属性'
     Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
     Assert-OurTool $doc $CleanPreviewTool '--clean -w $c -l %D'
-    Assert-True ($null -eq (Get-Tool $doc $CleanApplyTool)) '不可逆的 clean 默认不该注册'
+    Assert-OurTool $doc $CleanApplyTool '-a --clean -w $c -l %D'
 
     # 编码：P4V 自己导出的文件没有 BOM，这里也不该有。
     $head = [System.IO.File]::ReadAllBytes($ToolsPath)[0..2]
@@ -197,10 +207,11 @@ function Test-KeepsForeignToolsAndIsIdempotent {
     Invoke-Installer
     $doc = Read-ToolsDocument
     Assert-OtherToolIntact $doc
-    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '别人的工具加上我们的两个'
+    Assert-Equal 4 $doc.SelectNodes('//CustomToolDef').Count '别人的工具加上我们的三个'
     Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
 
-    # 幂等：再跑一次，内容一字不差，也不该多出备份。
+    # 幂等：再跑一次，内容一字不差，也不该多出备份。默认注册现在含 APPLY 及其子菜单，
+    # 这一段顺带覆盖了「连着装两次子菜单」的幂等。
     $before = [System.IO.File]::ReadAllBytes($ToolsPath)
     $backupsBefore = Get-BackupCount
 
@@ -208,14 +219,8 @@ function Test-KeepsForeignToolsAndIsIdempotent {
     # 「备份数没变」这条断言就会在真的重写时也通过——这里跨过一秒，让它真的能拦住。
     Start-Sleep -Seconds 1
     Invoke-Installer
-    $after = [System.IO.File]::ReadAllBytes($ToolsPath)
 
-    Assert-Equal $before.Length $after.Length '第二次运行不该改动文件长度'
-    for ($i = 0; $i -lt $before.Length; $i++) {
-        if ($before[$i] -ne $after[$i]) {
-            throw "断言失败：第二次运行改动了文件（偏移 $i）"
-        }
-    }
+    Assert-BytesEqual $before ([System.IO.File]::ReadAllBytes($ToolsPath)) '第二次运行改动了文件'
     Assert-Equal $backupsBefore (Get-BackupCount) '内容没变就不该产生新的备份'
     Assert-OtherToolIntact (Read-ToolsDocument)
 }
@@ -263,22 +268,33 @@ function Test-UpdatesATamperedDefinition {
     $tool = Get-Tool $doc $ReconcileTool
     $tool.SelectSingleNode('Definition/Arguments').InnerText = '--stale'
     $tool.SelectSingleNode('Definition/Command').InnerText = 'C:\old\p4delta.exe'
+
+    # APPLY 顺带加码：参数改坏**并且**挪出子菜单。重装要连位置一起修回来，
+    # 这条覆盖 Update-ToolList 里按位置比对的 $inRightFolder 分支。
+    $apply = Get-Tool $doc $CleanApplyTool
+    $apply.SelectSingleNode('Definition/Arguments').InnerText = '--stale'
+    [void]$apply.ParentNode.RemoveChild($apply)
+    [void]$doc.DocumentElement.AppendChild($apply)
     $doc.Save($ToolsPath)
 
     Invoke-Installer
 
     $doc = Read-ToolsDocument
-    Assert-Equal 2 $doc.SelectNodes('//CustomToolDef').Count '改回来时不该多出节点'
+    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '改回来时不该多出节点'
     Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
-    Assert-True ($null -eq (Get-Tool $doc $CleanApplyTool)) '没要 clean 实际清理时不该冒出来'
+    Assert-OurTool $doc $CleanApplyTool '-a --clean -w $c -l %D'
+    Assert-Equal 1 $doc.SelectNodes('//CustomToolFolder').Count '子菜单不该被重复创建'
+    $inFolder = $doc.SelectSingleNode(
+        "//CustomToolFolder[Name='$CleanApplyFolder']//CustomToolDef[Definition/Name='$CleanApplyTool']")
+    Assert-True ($null -ne $inFolder) '被挪出去的 APPLY 应当被放回子菜单里'
 }
 
-function Test-WithCleanApplyUsesASubmenu {
+function Test-CleanApplyUsesASubmenu {
     Reset-Root
-    Invoke-Installer @('-WithCleanApply')
+    Invoke-Installer
 
     $doc = Read-ToolsDocument
-    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '-WithCleanApply 时三个工具'
+    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '默认三个工具'
     Assert-OurTool $doc $CleanApplyTool '-a --clean -w $c -l %D'
 
     $folders = $doc.SelectNodes('//CustomToolFolder')
@@ -286,13 +302,84 @@ function Test-WithCleanApplyUsesASubmenu {
     Assert-Equal $CleanApplyFolder (Get-ChildText $folders[0] 'Name') '子菜单名'
     $inFolder = $folders[0].SelectSingleNode(".//CustomToolDef[Definition/Name='$CleanApplyTool']")
     Assert-True ($null -ne $inFolder) '不可逆的工具应当在这个子菜单里'
-    Assert-True ($null -eq (Get-Tool $doc $ReconcileTool).SelectSingleNode('ancestor::CustomToolFolder')) '安全的那两个不该被塞进子菜单'
+    Assert-True ($null -eq (Get-Tool $doc $ReconcileTool).SelectSingleNode('ancestor::CustomToolFolder')) 'Reconcile 不该被塞进子菜单'
+    Assert-True ($null -eq (Get-Tool $doc $CleanPreviewTool).SelectSingleNode('ancestor::CustomToolFolder')) 'clean 预演也不该被塞进子菜单'
+}
+
+function Test-WithoutCleanApplySkipsCleanApply {
+    Reset-Root
+    Invoke-Installer @('-WithoutCleanApply')
+
+    $doc = Read-ToolsDocument
+    Assert-Equal 2 $doc.SelectNodes('//CustomToolDef').Count '-WithoutCleanApply 时只有两个工具'
+    Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
+    Assert-OurTool $doc $CleanPreviewTool '--clean -w $c -l %D'
+    Assert-True ($null -eq (Get-Tool $doc $CleanApplyTool)) '不可逆的 clean 不该注册'
+    # 全新机器上跑退出口，不该凭空造出（或留下）子菜单目录。
+    Assert-Equal 0 $doc.SelectNodes('//CustomToolFolder').Count '不该有子菜单目录'
+}
+
+function Test-WithoutCleanApplyRemovesRegisteredCleanApply {
+    Reset-Root
+    Write-Utf8NoBom $ToolsPath $OtherToolXml
+    Invoke-Installer
+    Assert-Equal 4 (Read-ToolsDocument).SelectNodes('//CustomToolDef').Count '先按默认装齐：别人的一个加我们的三个'
+
+    # -WhatIf：移除只发生在内存里，文件一字不动，也不该产生备份。
+    $before = [System.IO.File]::ReadAllBytes($ToolsPath)
+    $backupsBefore = Get-BackupCount
+    Invoke-Installer @('-WithoutCleanApply', '-WhatIf')
+    Assert-BytesEqual $before ([System.IO.File]::ReadAllBytes($ToolsPath)) '-WhatIf 改动了文件'
+    Assert-Equal $backupsBefore (Get-BackupCount) '-WhatIf 不该产生备份'
+
+    # 真摘：APPLY 与空掉的子菜单都没了，别人的工具与安全的两条原样。
+    # 备份文件名只精确到秒，先跨过一秒——否则这次的备份会覆盖掉上面安装时那份，
+    # 「多出一份备份」的断言就会假失败（pwsh 跑得快时真的撞上过）。
+    Start-Sleep -Seconds 1
+    Invoke-Installer @('-WithoutCleanApply')
+    $doc = Read-ToolsDocument
+    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '别人的一个加我们的两个'
+    Assert-True ($null -eq (Get-Tool $doc $CleanApplyTool)) 'APPLY 条目应当被摘掉'
+    Assert-Equal 0 $doc.SelectNodes('//CustomToolFolder').Count '空掉的子菜单目录应当被清掉'
+    Assert-OtherToolIntact $doc
+    Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
+    Assert-OurTool $doc $CleanPreviewTool '--clean -w $c -l %D'
+    Assert-Equal ($backupsBefore + 1) (Get-BackupCount) '真摘掉了就该走一次备份 + 保存'
+
+    # 退出口自身幂等：再跑一次，字节不变、不多出备份。跨过一秒的理由同上一条用例。
+    $before = [System.IO.File]::ReadAllBytes($ToolsPath)
+    Start-Sleep -Seconds 1
+    Invoke-Installer @('-WithoutCleanApply')
+    Assert-BytesEqual $before ([System.IO.File]::ReadAllBytes($ToolsPath)) '第二次退出口改动了文件'
+    Assert-Equal ($backupsBefore + 1) (Get-BackupCount) '没变化就不该产生新的备份'
+}
+
+function Test-WithoutCleanApplyKeepsFolderWithForeignTools {
+    Reset-Root
+    Invoke-Installer
+
+    # 用户往我们的子菜单里塞了自己的工具：退出口只摘 APPLY，子菜单得留着。
+    $doc = Read-ToolsDocument
+    $folderList = $doc.SelectSingleNode("//CustomToolFolder[Name='$CleanApplyFolder']/CustomToolDefList")
+    Assert-True ($null -ne $folderList) '默认安装应当建出子菜单'
+    $otherDoc = New-Object System.Xml.XmlDocument
+    $otherDoc.LoadXml($OtherToolXml)
+    [void]$folderList.AppendChild($doc.ImportNode($otherDoc.SelectSingleNode('//CustomToolDef'), $true))
+    $doc.Save($ToolsPath)
+
+    Invoke-Installer @('-WithoutCleanApply')
+
+    $doc = Read-ToolsDocument
+    Assert-True ($null -eq (Get-Tool $doc $CleanApplyTool)) 'APPLY 仍然要被摘掉'
+    Assert-True ($null -ne (Get-Tool $doc $OtherTool)) '塞进去的工具不该被动'
+    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '我们的两条加塞进来的一条'
+    Assert-Equal 1 $doc.SelectNodes('//CustomToolFolder').Count '子菜单里还有别人的工具，就该留着'
 }
 
 function Test-Uninstall {
     Reset-Root
     Write-Utf8NoBom $ToolsPath $OtherToolXml
-    Invoke-Installer @('-WithCleanApply')
+    Invoke-Installer
     Assert-Equal 4 (Read-ToolsDocument).SelectNodes('//CustomToolDef').Count '装完应当是他们的一个加我们的三个'
 
     Invoke-Installer @('-Uninstall')
@@ -323,7 +410,10 @@ $cases = @(
     'Test-MissingExePathFails',
     'Test-KeepsForeignToolsAndIsIdempotent',
     'Test-UpdatesATamperedDefinition',
-    'Test-WithCleanApplyUsesASubmenu',
+    'Test-CleanApplyUsesASubmenu',
+    'Test-WithoutCleanApplySkipsCleanApply',
+    'Test-WithoutCleanApplyRemovesRegisteredCleanApply',
+    'Test-WithoutCleanApplyKeepsFolderWithForeignTools',
     'Test-Uninstall',
     'Test-WhatIfChangesNothing'
 )

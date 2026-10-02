@@ -23,9 +23,10 @@
     自编译的产物用它可以指到别处，例如 target\release\p4delta.exe；scripts\install-local.ps1
     走的就是这条路。
 
-.PARAMETER WithCleanApply
-    额外注册「clean 实际清理」。它**不可逆**（删 depot 里没有的文件、丢弃未打开文件的
-    本地改动），所以默认不注册，注册了也会放进单独的子菜单里，免得和安全的那个挨着被误点。
+.PARAMETER WithoutCleanApply
+    不注册「clean 实际清理」。它**不可逆**（删 depot 里没有的文件、丢弃未打开文件的
+    本地改动），默认会注册，但放在单独的子菜单里，免得和安全的那个挨着被误点；
+    用这个开关时，以前注册过的会被摘掉。
 
 .PARAMETER Uninstall
     卸载：摘掉工具定义、清掉安装目录。不会动摘要缓存（%LOCALAPPDATA%\FastReconcile）。
@@ -45,7 +46,11 @@
 
 .EXAMPLE
     .\install.ps1
-    装到默认位置，注册两个工具（reconcile + clean 预演）。
+    装到默认位置，注册三个工具（reconcile + clean 预演 + clean 实际清理）。
+
+.EXAMPLE
+    .\install.ps1 -WithoutCleanApply
+    不注册不可逆的「clean 实际清理」；以前注册过的会被摘掉。
 
 .EXAMPLE
     .\install.ps1 -Uninstall
@@ -56,7 +61,7 @@ param(
     [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\p4delta'),
     [string] $CustomToolsPath = (Join-Path $env:USERPROFILE '.p4qt\customtools.xml'),
     [string] $ExePath,
-    [switch] $WithCleanApply,
+    [switch] $WithoutCleanApply,
     [switch] $Uninstall,
     [switch] $Force,
     [switch] $AddToPath,
@@ -70,7 +75,8 @@ $ExeName = 'p4delta.exe'
 $ScriptName = 'install.ps1'
 
 # 工具的显示名。它们是幂等写入的**识别键**：改了名字，下次安装会变成「新增」而不是
-# 「更新」，旧节点会留在菜单里。全部用 ASCII，免得菜单字体出意外。
+# 「更新」，旧节点会留在菜单里；删除（-WithoutCleanApply、卸载）也按这套名字找节点。
+# 全部用 ASCII，免得菜单字体出意外。
 $ReconcileTool = 'p4delta Reconcile'
 $CleanPreviewTool = 'p4delta Clean (preview)'
 $CleanApplyTool = 'p4delta Clean (APPLY - irreversible)'
@@ -287,12 +293,14 @@ function Test-SameNode($Expected, $Actual) {
     return $true
 }
 
-function Get-DesiredTools([switch] $WithCleanApply) {
+# 默认注册三条；-WithoutCleanApply 只把不可逆的那条从注册列表里去掉——已经注册过的
+# 旧条目由 Remove-CleanApplyTool 在调用点摘掉。
+function Get-DesiredTools([switch] $WithoutCleanApply) {
     $specs = @(
         @{ Name = $ReconcileTool; Arguments = '-a -w $c -l %D'; Folder = $null },
         @{ Name = $CleanPreviewTool; Arguments = '--clean -w $c -l %D'; Folder = $null }
     )
-    if ($WithCleanApply) {
+    if (-not $WithoutCleanApply) {
         $specs += @{ Name = $CleanApplyTool; Arguments = '-a --clean -w $c -l %D'; Folder = $CleanApplyFolder }
     }
     return $specs
@@ -334,16 +342,48 @@ function Test-PathUnder([string] $Path, [string] $Dir) {
     }
 }
 
-function Remove-OurTools($doc, [string] $InstallDir) {
+# 按显示名删工具节点。返回是否真删了。
+#
+# 只按名字认人是刻意的：三条工具的 Command 完全一样（都指向安装目录里的 exe），
+# 拿 Command 区分不出该删哪条。
+function Remove-ToolsByName($doc, [string[]] $Names) {
     $changed = $false
 
     foreach ($tool in @($doc.SelectNodes('//CustomToolDef'))) {
-        $name = Get-ChildText $tool 'Definition/Name'
+        if ($Names -contains (Get-ChildText $tool 'Definition/Name')) {
+            [void]$tool.ParentNode.RemoveChild($tool)
+            $changed = $true
+        }
+    }
+
+    return $changed
+}
+
+# -WithoutCleanApply 的退出口：摘掉 APPLY 那条，并清掉因此变空的子菜单目录。
+#
+# 子菜单只在名字对上、且里面一条工具都不剩时才删：用户往里放了自己的东西就留着，
+# 别的空目录也一概不碰——这条路径只该动我们自己的节点。
+function Remove-CleanApplyTool($doc) {
+    $changed = Remove-ToolsByName $doc @($CleanApplyTool)
+
+    foreach ($folder in @($doc.SelectNodes('//CustomToolFolder'))) {
+        if ((Get-ChildText $folder 'Name') -eq $CleanApplyFolder -and
+                $folder.SelectNodes('.//CustomToolDef').Count -eq 0) {
+            [void]$folder.ParentNode.RemoveChild($folder)
+            $changed = $true
+        }
+    }
+
+    return $changed
+}
+
+function Remove-OurTools($doc, [string] $InstallDir) {
+    $changed = Remove-ToolsByName $doc $OurToolNames
+
+    # Command 落在安装目录下是兜底，用户改过名字时也能删掉。
+    foreach ($tool in @($doc.SelectNodes('//CustomToolDef'))) {
         $command = Get-ChildText $tool 'Definition/Command'
-        # 名字是主要依据；Command 落在安装目录下是兜底，用户改过名字时也能删掉。
-        $ours = ($OurToolNames -contains $name) -or
-            ($command -and (Test-PathUnder $command $InstallDir))
-        if ($ours) {
+        if ($command -and (Test-PathUnder $command $InstallDir)) {
             [void]$tool.ParentNode.RemoveChild($tool)
             $changed = $true
         }
@@ -480,7 +520,17 @@ function Invoke-Install {
     }
 
     $doc = Read-CustomToolsDocument $CustomToolsPath
-    $changed = Update-ToolList $doc (Get-DesiredTools -WithCleanApply:$WithCleanApply) $targetExe
+    $changed = Update-ToolList $doc (Get-DesiredTools -WithoutCleanApply:$WithoutCleanApply) $targetExe
+
+    # 退出口：以前注册过 APPLY 的话把它摘掉。结果要并进 $changed——只删不加时，
+    # 下面那扇保存的门只认 $changed。
+    $removedCleanApply = $false
+    if ($WithoutCleanApply) {
+        $removedCleanApply = Remove-CleanApplyTool $doc
+        if ($removedCleanApply) {
+            $changed = $true
+        }
+    }
 
     if (-not $changed) {
         Write-Info '工具定义已经是最新的，未改动。'
@@ -488,6 +538,9 @@ function Invoke-Install {
         $backup = Backup-CustomToolsFile $CustomToolsPath
         Save-CustomToolsDocument $doc $CustomToolsPath
         Write-Info "已更新 $CustomToolsPath"
+        if ($removedCleanApply) {
+            Write-Info "已摘掉不可逆的「$CleanApplyTool」条目。"
+        }
         if ($backup) {
             Write-Info "改动前的备份：$backup"
         }
@@ -523,8 +576,10 @@ function Invoke-Install {
         # 绝对路径，P4V 每次点菜单都新起一个进程。
         Write-Info '装好了。工具定义没变，P4V 不用重启：下次点菜单用的就是这份 exe。'
     }
-    if (-not $WithCleanApply) {
-        Write-Info '（「clean 实际清理」不可逆，默认没注册；需要的话用 -WithCleanApply 再跑一次。）'
+    if ($WithoutCleanApply) {
+        Write-Info '（按 -WithoutCleanApply 没注册「clean 实际清理」；它不可逆，以前装过的话这次已经摘掉。）'
+    } else {
+        Write-Info "（「clean 实际清理」不可逆，放在「$CleanApplyFolder」子菜单里；动手前先跑一遍预演。）"
     }
 }
 

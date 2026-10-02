@@ -32,8 +32,8 @@
 .PARAMETER CustomToolsPath
     P4V 自定义工具文件，默认与 install.ps1 一致。
 
-.PARAMETER WithCleanApply
-    透传给 install.ps1：额外注册不可逆的「clean 实际清理」。
+.PARAMETER WithoutCleanApply
+    透传给 install.ps1：不注册不可逆的「clean 实际清理」（默认注册；以前装过的会被摘掉）。
 
 .PARAMETER Quiet
     透传给 install.ps1：只输出警告与错误。
@@ -47,6 +47,10 @@
     装 debug 构建，快速迭代时省编译时间。
 
 .EXAMPLE
+    .\scripts\install-local.ps1 -WithoutCleanApply
+    不注册不可逆的「clean 实际清理」；以前装过的会被摘掉。
+
+.EXAMPLE
     .\scripts\install-local.ps1 -Restore
     把本地安装之前的那份 exe 放回去。
 #>
@@ -57,7 +61,7 @@ param(
     [switch] $Restore,
     [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\p4delta'),
     [string] $CustomToolsPath = (Join-Path $env:USERPROFILE '.p4qt\customtools.xml'),
-    [switch] $WithCleanApply,
+    [switch] $WithoutCleanApply,
     [switch] $Quiet
 )
 
@@ -209,8 +213,8 @@ function Invoke-LocalInstall {
         InstallDir      = $InstallDir
         CustomToolsPath = $CustomToolsPath
     }
-    if ($WithCleanApply) {
-        $installArgs.WithCleanApply = $true
+    if ($WithoutCleanApply) {
+        $installArgs.WithoutCleanApply = $true
     }
     if ($Quiet) {
         $installArgs.Quiet = $true
