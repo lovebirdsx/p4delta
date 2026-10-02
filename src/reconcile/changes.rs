@@ -8,7 +8,7 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 
 use crate::cli::Options;
-use crate::p4::process::run_p4_command_batched;
+use crate::p4::process::{FailureMode, run_p4_command_batched};
 
 /// 一次 reconcile 找出的全部变更，按处理方式分类。
 /// 每个文件最多只落在其中一类里。
@@ -194,9 +194,19 @@ pub(crate) async fn apply_changes(
                 // 这一支只在 -a 时走到，所以永远是「真改状态」：任何一批失败都必须让整轮失败。
                 // 以前这里是宽松模式，p4 拒绝开文件时只留一行 stderr 警告，程序照样打印
                 // "Inconsistencies fixed." 并退出 0——把失败伪装成了成功。
-                let result =
-                    run_p4_command_batched(options, work_dir, args, files, *use_changelist, true)
-                        .await;
+                //
+                // 判据要比退出码更严：p4 对逐文件错误（protections 拒绝 open、"not on
+                // client"）返回的退出码是 0，只用 ExitCode 仍会把「一个文件都没打开」报成
+                // 成功，见 [FailureMode::ExitCodeOrStderr]。
+                let result = run_p4_command_batched(
+                    options,
+                    work_dir,
+                    args,
+                    files,
+                    *use_changelist,
+                    FailureMode::ExitCodeOrStderr,
+                )
+                .await;
 
                 if let Err(error) = result {
                     // 这一组剩下的命令不再执行：「先 revert 再重开」这类组合半途而废没有意义。

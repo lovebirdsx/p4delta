@@ -18,6 +18,11 @@
 .PARAMETER CustomToolsPath
     P4V 的自定义工具文件，默认 %USERPROFILE%\.p4qt\customtools.xml。
 
+.PARAMETER ExePath
+    要安装的 p4delta.exe。默认取与本脚本同目录的那一份（release 包解压出来就是这个布局）。
+    自编译的产物用它可以指到别处，例如 target\release\p4delta.exe；scripts\install-local.ps1
+    走的就是这条路。
+
 .PARAMETER WithCleanApply
     额外注册「clean 实际清理」。它**不可逆**（删 depot 里没有的文件、丢弃未打开文件的
     本地改动），所以默认不注册，注册了也会放进单独的子菜单里，免得和安全的那个挨着被误点。
@@ -50,6 +55,7 @@
 param(
     [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\p4delta'),
     [string] $CustomToolsPath = (Join-Path $env:USERPROFILE '.p4qt\customtools.xml'),
+    [string] $ExePath,
     [switch] $WithCleanApply,
     [switch] $Uninstall,
     [switch] $Force,
@@ -441,9 +447,12 @@ function Test-PathEntry($Entries, [string] $Dir) {
 # ---- 主流程 ----
 
 function Invoke-Install {
-    $sourceExe = Join-Path $PSScriptRoot $ExeName
+    $sourceExe = if ($ExePath) { $ExePath } else { Join-Path $PSScriptRoot $ExeName }
     if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
-        throw "没找到 $ExeName，它应当和本脚本在同一个目录（$PSScriptRoot）。请从解压出来的目录里运行。"
+        if ($ExePath) {
+            throw "-ExePath 指向的 $sourceExe 不存在。"
+        }
+        throw "没找到 $ExeName，它应当和本脚本在同一个目录（$PSScriptRoot）。请从解压出来的目录里运行，或用 -ExePath 指向别处的那一份。"
     }
 
     $version = Get-ExeVersion $sourceExe
@@ -507,7 +516,13 @@ function Invoke-Install {
     }
 
     Write-Info ''
-    Write-Info '装好了。重启 P4V，然后在工作区里右键一个目录，菜单里就有 p4delta 了。'
+    if ($changed) {
+        Write-Info '装好了。工具定义有改动，重启 P4V 后生效——它只在启动时读那个文件。'
+    } else {
+        # 只换 exe（scripts\install-local.ps1 装本地构建就是这种）时不必重启：Command 是
+        # 绝对路径，P4V 每次点菜单都新起一个进程。
+        Write-Info '装好了。工具定义没变，P4V 不用重启：下次点菜单用的就是这份 exe。'
+    }
     if (-not $WithCleanApply) {
         Write-Info '（「clean 实际清理」不可逆，默认没注册；需要的话用 -WithCleanApply 再跑一次。）'
     }

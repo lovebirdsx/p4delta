@@ -34,7 +34,7 @@ use crate::cache::{CacheWriter, save_cache};
 use crate::charset::init_p4_encoding;
 use crate::locate::check_p4_exe_env;
 use crate::model::WorkspaceCache;
-use crate::p4::process::run_p4_command_slice;
+use crate::p4::process::{FailureMode, run_p4_command_slice};
 use crate::path::{absolute_local_path, normalize_local_path_owned, strip_depot_wildcard_suffix};
 use crate::reconcile::reconcile_dir;
 
@@ -153,7 +153,7 @@ pub fn run(mut options: Options) -> Result<()> {
                 &args,
                 &paths,
                 false,
-                false,
+                FailureMode::Warn,
             ))?;
             for record_result in result
                 .into_iter()

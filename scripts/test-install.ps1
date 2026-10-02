@@ -71,9 +71,13 @@ function Reset-Root {
 }
 
 function Invoke-Installer([string[]] $ExtraArguments = @()) {
+    # -NoP4Check 与 -Force 都是**消除机器状态**，不是被测对象：这几条用例测的是写文件的
+    # 行为。前者跳过 p4 可用性检查；后者跳过「P4V 正在运行」那道守卫——开发机上 P4V 常驻
+    # 是常态，而那道守卫的判据（Get-Process p4v）在别处没有用例覆盖，不该让它把整套用例
+    # 拦在门外。
     $arguments = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $DistDir 'install.ps1'),
-        '-InstallDir', $InstallDir, '-CustomToolsPath', $ToolsPath, '-NoP4Check', '-Quiet'
+        '-InstallDir', $InstallDir, '-CustomToolsPath', $ToolsPath, '-NoP4Check', '-Force', '-Quiet'
     ) + $ExtraArguments
 
     & $HostExe @arguments
@@ -216,6 +220,39 @@ function Test-KeepsForeignToolsAndIsIdempotent {
     Assert-OtherToolIntact (Read-ToolsDocument)
 }
 
+function Test-ExePathInstallsThatExe {
+    Reset-Root
+
+    # 换一处 exe：真实场景是 target\release\p4delta.exe（scripts\install-local.ps1 装本地构建
+    # 走的就是这条路）。内容与同目录那份不同，装错了看得出来。
+    $elsewhere = Join-Path $Root 'elsewhere'
+    New-Item -ItemType Directory -Force -Path $elsewhere | Out-Null
+    $otherExe = Join-Path $elsewhere 'p4delta.exe'
+    Write-Utf8NoBom $otherExe "another fake executable$([Environment]::NewLine)"
+
+    Invoke-Installer @('-ExePath', $otherExe)
+
+    $installed = Join-Path $InstallDir 'p4delta.exe'
+    Assert-True (Test-Path -LiteralPath $installed) 'exe 应当被铺到安装目录'
+    Assert-Equal ([System.IO.File]::ReadAllText($otherExe)) ([System.IO.File]::ReadAllText($installed)) '-ExePath 指定的那份才该被装上'
+    Assert-OurTool (Read-ToolsDocument) $ReconcileTool '-a -w $c -l %D'
+}
+
+function Test-MissingExePathFails {
+    Reset-Root
+
+    $missing = Join-Path $Root 'nope\p4delta.exe'
+    $failed = $false
+    try {
+        Invoke-Installer @('-ExePath', $missing)
+    } catch {
+        $failed = $true
+    }
+
+    Assert-True $failed '-ExePath 指向不存在的文件时 install.ps1 应当失败'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $InstallDir 'p4delta.exe'))) '失败时不该铺出 exe'
+}
+
 function Test-UpdatesATamperedDefinition {
     Reset-Root
     Invoke-Installer
@@ -282,6 +319,8 @@ function Test-WhatIfChangesNothing {
 $cases = @(
     'Test-InstallLayoutIsSelfContained',
     'Test-FreshInstall',
+    'Test-ExePathInstallsThatExe',
+    'Test-MissingExePathFails',
     'Test-KeepsForeignToolsAndIsIdempotent',
     'Test-UpdatesATamperedDefinition',
     'Test-WithCleanApplyUsesASubmenu',

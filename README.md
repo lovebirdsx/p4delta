@@ -51,6 +51,7 @@ P4V 里的 `Reconcile Offline Work` 慢得令人抓狂，本程序是它的替�
 | `-Uninstall` | 卸载：摘掉工具定义、删安装目录；摘要缓存留着 |
 | `-AddToPath` | 把安装目录加进用户级 PATH，方便在命令行里直接敲 `p4delta` |
 | `-InstallDir`、`-CustomToolsPath` | 换安装位置 / 换 P4V 配置文件位置 |
+| `-ExePath` | 装指定路径的那份 exe（默认取与本脚本同目录的），自编译的产物走这里 |
 | `-WhatIf` | 只说要做什么，不落盘 |
 
 ### 未签名的 exe
@@ -225,6 +226,26 @@ pwsh -File scripts/test-install.ps1        # 或 powershell -File ...
 
 CI 用 Windows PowerShell 5.1 与 PowerShell 7 各跑一遍。两个脚本都**必须带 UTF-8 BOM**：5.1 对没有 BOM 的文件按系统 ANSI 代码页解析，里面的中文会全变乱码（`test-install.ps1` 有一条断言拦着）。
 
+### 装本地构建到 P4V 里验证
+
+改完代码想在 P4V 里点一遍——别手工拷 exe，用 `scripts/install-local.ps1`：它构建 → 跑一次
+`--version` 冒烟 → 把安装目录里现有的 exe 备份下来 → 调 `install.ps1` 铺好并注册工具。
+
+```powershell
+pwsh -File scripts/install-local.ps1              # cargo build --release 后装上
+pwsh -File scripts/install-local.ps1 -DebugBuild  # 装 debug 构建，反复改代码时省编译时间
+pwsh -File scripts/install-local.ps1 -NoBuild     # 只装已有的产物
+pwsh -File scripts/install-local.ps1 -Restore     # 把本地安装之前的那份 exe 放回去
+```
+
+备份只做一次（`p4delta.exe.p4delta-backup-<时间戳>`）：连装几次本地构建，能还原回去的「原件」
+不会被自己的中间产物顶掉；`-Restore` 放回去之后把它删掉，下次本地安装重新捕捉。P4V 正开着时
+会自动带 `-Force`。
+
+装完**不用重启 P4V**：工具定义没变，而 Command 写的是绝对路径，P4V 每次点菜单都新起一个进程。
+脚本会打印本地构建的版本号和 git 修订号（有未提交改动会标出来）——本地构建与发布版版本号相同，
+装的是哪份代码只能靠它分辨。
+
 发布脚本也有黑盒测试，它在一次性 git 仓库里真跑一遍改版本号、提交、打附注 tag、推送，只把 `cargo` 换成垫片：
 
 ```bash
@@ -299,6 +320,7 @@ tests/
 install.ps1            安装脚本：铺 exe + 注册 P4V 自定义工具
 scripts/
   fetch-p4-tools.sh    下载 p4/p4d 到 vendor/（开发与 e2e 用）
+  install-local.ps1    构建本地 exe 并装进安装目录，供在 P4V 里验证
   release.sh           发布：改版本号 → 本地门禁 → 提交 → 打 tag → 推送
   test-install.ps1     install.ps1 的黑盒测试
   test-release.sh      release.sh 的黑盒测试
@@ -342,6 +364,11 @@ scripts/
 - `p4 clean -K`（抑制 ktext 关键字展开）没有暴露，clean 始终按 p4 的默认行为展开关键字。
 - `--clean` 与 `-c` 同时给出时 `-c` 被忽略（会打印一行告警）。
 - depot 路径里含 `#`、`%`、`@`、`*`，或以 `...` 结尾的文件名会被 p4 当成通配符解析，既有的转交路径和 clean 的还原规格都受影响。
+- p4 对**逐文件**错误（protections 拒绝 open、路径不在 client view）返回的退出码是 **0**，错误只出现在 stderr 上。
+  工具因此把改状态命令（add / edit / delete / revert / sync）的 stderr 非空也判为失败，p4 的原话会进错误信息——
+  「p4 一个文件都没接受、工具却报 `Inconsistencies fixed.`」不会再发生。反过来说，如果你的 p4 在**成功**时
+  也往 stderr 写提示，那一轮会被判失败（`Failed to apply N change group(s)`），把那条提示加进 `FailureMode`
+  的例外即可。转交 `p4 reconcile` / `p4 clean` 的兜底路径不受这条影响：p4 对「无事可做」也写 stderr。
 - 安装脚本写出的工具定义里，**「Run tool in terminal window」与「Ignore P4CONFIG files」两项没有对应元素**——
   它们在 P4V 自定义工具 XML 里的元素名没查到官方文档，也没实测过，所以没有臆造。不勾「终端窗口」时
   输出会进 P4V 自己的输出窗格，工具照常可用；确实需要这两项的话，在 `Manage Tools` 里手工补勾一次并

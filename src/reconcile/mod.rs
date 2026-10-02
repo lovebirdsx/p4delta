@@ -20,7 +20,7 @@ use crate::cli::Options;
 use crate::digest::{is_unchanged_since_sync, parallel_compute_digests};
 use crate::model::{DepotState, HaveRecord, WorkspaceCache, WorkspaceState};
 use crate::p4::fstat::run_p4_fstat_all;
-use crate::p4::process::{run_p4_command_batched, run_p4_have};
+use crate::p4::process::{FailureMode, run_p4_command_batched, run_p4_have};
 use crate::prune::PrunePlan;
 use crate::workspace::{filter_unmapped_paths, gather_workspace, rescan_tracked_pruned_dirs};
 
@@ -361,13 +361,22 @@ pub(crate) async fn reconcile_dir(
 
         // clean 的两支不能带 changelist：`p4 clean` 不接受 `-c`。
         // 预演（`-n`）沿用宽松契约——它不改状态，报错只告警；真跑时失败就是失败。
+        //
+        // 真跑时用 ExitCode 而不是 ExitCodeOrStderr：这里是 p4delta 把文件**转交**给 p4
+        // 自己做，而 p4 对「这批文件没什么可做的」也往 stderr 写
+        // `<path> - no file(s) to reconcile.`（退出码 0），那是正常结果而不是失败。
+        let mode = if options.apply {
+            FailureMode::ExitCode
+        } else {
+            FailureMode::Warn
+        };
         run_p4_command_batched(
             options,
             work_dir,
             args,
             &unsupported_paths,
             !options.clean,
-            options.apply,
+            mode,
         )
         .await?;
     }

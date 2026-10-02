@@ -14,7 +14,8 @@ use walkdir::WalkDir;
 use crate::charset::query_p4_variable;
 use crate::cli::Options;
 use crate::p4::process::{
-    command_line_ready_paths, compute_batches, run_p4_command_batched, run_p4_command_slice,
+    FailureMode, command_line_ready_paths, compute_batches, run_p4_command_batched,
+    run_p4_command_slice,
 };
 use crate::path::{local_path_key, normalize_local_path_owned, path_is_under_key};
 
@@ -189,8 +190,15 @@ pub(crate) async fn query_ignored_dirs(
     let batches = compute_batches(&arguments).len();
     let requested: HashSet<String> = arguments.iter().cloned().collect();
 
-    let lines =
-        run_p4_command_batched(options, work_dir, &IGNORES_ARGS, &arguments, false, true).await?;
+    let lines = run_p4_command_batched(
+        options,
+        work_dir,
+        &IGNORES_ARGS,
+        &arguments,
+        false,
+        FailureMode::ExitCode,
+    )
+    .await?;
     let (ignored, unrecognized) = parse_ignores_output(&lines, &requested);
 
     if unrecognized > 0 {
@@ -399,7 +407,15 @@ pub(crate) async fn run_p4_ignores_verbose(
     work_dir: &str,
 ) -> Result<Vec<String>> {
     // 目录级剪枝依赖 -v 的完整输出，p4 报错时必须失败，交给调用方回退到完整扫描。
-    run_p4_command_slice(options, work_dir, &["ignores", "-v"], &[], false, true).await
+    run_p4_command_slice(
+        options,
+        work_dir,
+        &["ignores", "-v"],
+        &[],
+        false,
+        FailureMode::ExitCode,
+    )
+    .await
 }
 
 #[cfg(test)]

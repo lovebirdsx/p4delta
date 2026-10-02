@@ -354,6 +354,52 @@ fn warn_p4_could_not_start(command: &str, reason: &dyn std::fmt::Display) {
     eprintln!("Warning: p4 {command} could not be started: {reason}");
 }
 
+/// 一次 p4 调用失败与否的判据。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureMode {
+    /// 只告警，不失败。查询与预演用它。
+    Warn,
+    /// 退出码非零即失败，stderr 上的提示不算失败。
+    ExitCode,
+    /// 退出码非零，**或退出码为 0 但 stderr 有输出**，都算失败。
+    ///
+    /// p4 把逐文件错误写在 stderr 上，退出码却仍是 0：实测
+    /// `no permission for operation on file(s).`（protections 拒绝 open）与
+    /// `file(s) not on client.` 都是 exit 0。p4delta 自己点数的改状态命令必须用它，
+    /// 否则「一个文件都没打开」会被报成 "Applied N changes / Inconsistencies fixed."。
+    ///
+    /// 反例是转交 p4 reconcile/clean 的兜底路径：p4 对「无事可做」也往 stderr 写
+    /// `<path> - no file(s) to reconcile.`（同样 exit 0），那里只能用 [Self::ExitCode]。
+    ExitCodeOrStderr,
+}
+
+impl FailureMode {
+    /// 只告警不失败。
+    fn is_lenient(self) -> bool {
+        self == Self::Warn
+    }
+}
+
+/// 依退出状态与 stderr 判断一次 p4 调用是否失败，失败时给出可直接上报的消息。
+///
+/// `success` 与 `status` 分开传是为了让判据脱离真实子进程也能单测：`ExitStatus`
+/// 没有跨平台的构造函数。`status` 只在真要报错时才被格式化。
+fn p4_failure_message(
+    command: &str,
+    success: bool,
+    status: impl std::fmt::Display,
+    stderr: &str,
+    mode: FailureMode,
+) -> Option<String> {
+    if !success {
+        return Some(format!("p4 {command} exited with {status}: {stderr}"));
+    }
+
+    // 退出码为 0 也可能是失败，见 [FailureMode::ExitCodeOrStderr]。
+    (mode == FailureMode::ExitCodeOrStderr && !stderr.is_empty())
+        .then(|| format!("p4 {command} reported: {stderr}"))
+}
+
 /// Runs one slice of a batched p4 command (eg. p4 stuff a100 a101 ... a198 a199)
 pub(crate) async fn run_p4_command_slice(
     options: &Options,
@@ -361,7 +407,7 @@ pub(crate) async fn run_p4_command_slice(
     always_args: &[&'static str],
     batched_args_slice: &[String],
     use_changelist: bool,
-    strict: bool,
+    mode: FailureMode,
 ) -> Result<Vec<String>> {
     // `-c` 是二义的：作为全局选项是客户端，作为命令选项是 changelist。
     let changelist = (use_changelist && options.changelist != 0).then_some(options.changelist);
@@ -373,7 +419,7 @@ pub(crate) async fn run_p4_command_slice(
     // 真实问题。
     let program = match crate::locate::p4_exe() {
         Ok(program) => program,
-        Err(reason) if !strict => {
+        Err(reason) if mode.is_lenient() => {
             warn_p4_could_not_start(always_args[0], &reason);
             return Ok(Vec::new());
         }
@@ -393,7 +439,7 @@ pub(crate) async fn run_p4_command_slice(
         Ok(child) => child,
         // 定位到 spawn 之间文件被删掉或换成不可执行这一小段窗口，以及其它启动失败。
         // 上面那道 locate 已经拦住了「根本没装」，这里只剩真正的启动问题。
-        Err(error) if !strict && error.kind() == io::ErrorKind::NotFound => {
+        Err(error) if mode.is_lenient() && error.kind() == io::ErrorKind::NotFound => {
             warn_p4_could_not_start(always_args[0], &error);
             return Ok(Vec::new());
         }
@@ -417,20 +463,20 @@ pub(crate) async fn run_p4_command_slice(
 
     let status = child.status().await?;
     // 非零状态不一定说明输出不可用：`p4 ignores` 有没有匹配都返回 0，其他命令的
-    // 普通 warning 也可能带非零状态。但目录级剪枝不能拿半截输出做判断，strict 时直接失败。
-    if !status.success() {
-        let message = format!(
-            "p4 {} exited with {}: {}",
-            always_args[0],
-            status,
-            String::from_utf8_lossy(&stderr_bytes).trim()
-        );
-
-        if strict {
+    // 普通 warning 也可能带非零状态。但目录级剪枝不能拿半截输出做判断，严格时直接失败。
+    let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+    if let Some(message) = p4_failure_message(
+        always_args[0],
+        status.success(),
+        status,
+        stderr_text.trim(),
+        mode,
+    ) {
+        if mode.is_lenient() {
+            eprintln!("Warning: {message}");
+        } else {
             bail!("{message}");
         }
-
-        eprintln!("Warning: {message}");
     }
 
     Ok(lines)
@@ -509,14 +555,14 @@ pub(crate) fn compute_batches(batched_args: &[String]) -> Vec<std::ops::Range<us
 }
 
 /// 把成千上万个参数分批交给 p4：每一批是一个独立的进程，参数从它的 stdin 送进去。
-/// `strict` 为真时任何一批非零退出都算失败，调用方必须放弃基于输出的判断。
+/// `mode` 不是 [FailureMode::Warn] 时任何一批失败都算失败，调用方必须放弃基于输出的判断。
 pub(crate) async fn run_p4_command_batched(
     options: &Options,
     work_dir: &str,
     always_args: &[&'static str],
     batched_args: &[String],
     use_changelist: bool,
-    strict: bool,
+    mode: FailureMode,
 ) -> Result<Vec<String>> {
     let batches = compute_batches(batched_args);
 
@@ -538,7 +584,7 @@ pub(crate) async fn run_p4_command_batched(
                 always_args,
                 &batched_args[range],
                 use_changelist,
-                strict,
+                mode,
             )
         })
         .buffered(MAX_PARALLEL_P4_COMMANDS);
@@ -784,7 +830,7 @@ mod tests {
             &unknown,
             &[],
             false,
-            false,
+            FailureMode::Warn,
         ));
         assert!(
             lenient.is_ok(),
@@ -798,11 +844,73 @@ mod tests {
             &unknown,
             &[],
             false,
-            true,
+            FailureMode::ExitCode,
         ));
         assert!(
             strict.is_err(),
             "a failed p4 query must not be usable for pruning"
+        );
+    }
+
+    /// p4 对**逐文件**错误返回的退出码是 0（实测 `no permission for operation on file(s).`
+    /// 与 `file(s) not on client.` 都是 exit 0）。判据必须把「退出码 0 但 stderr 有输出」
+    /// 也算失败，否则会出现「一个文件都没打开，却打印 Applied N changes /
+    /// Inconsistencies fixed.」——用户报的就是这一例。
+    #[test]
+    fn stderr_output_fails_a_call_that_p4_exited_zero_on() {
+        let all_modes = [
+            FailureMode::Warn,
+            FailureMode::ExitCode,
+            FailureMode::ExitCodeOrStderr,
+        ];
+
+        // 退出码 0 且 p4 没说话：成功。
+        for mode in all_modes {
+            assert_eq!(
+                p4_failure_message("edit", true, "exit status: 0", "", mode),
+                None
+            );
+        }
+
+        // 退出码 0，但 p4 把逐文件错误写到了 stderr：只有改状态命令用的判据拦得住。
+        let reported = p4_failure_message(
+            "edit",
+            true,
+            "exit status: 0",
+            "E:\\ws\\a.js - no permission for operation on file(s).",
+            FailureMode::ExitCodeOrStderr,
+        )
+        .expect("exit 0 with stderr output must be a failure");
+        assert_eq!(
+            reported,
+            "p4 edit reported: E:\\ws\\a.js - no permission for operation on file(s)."
+        );
+
+        // 转交 p4 reconcile/clean 的兜底路径必须放过同样的形状：
+        // p4 对「无事可做」也往 stderr 写，那是正常结果而不是失败。
+        assert_eq!(
+            p4_failure_message(
+                "reconcile",
+                true,
+                "exit status: 0",
+                "E:\\ws\\a.js - no file(s) to reconcile.",
+                FailureMode::ExitCode,
+            ),
+            None
+        );
+
+        // 非零退出：两种严格判据都失败，消息里带退出状态与 p4 原文。
+        for mode in [FailureMode::ExitCode, FailureMode::ExitCodeOrStderr] {
+            let message = p4_failure_message("edit", false, "exit status: 1", "boom", mode)
+                .expect("non-zero exit must be a failure");
+            assert_eq!(message, "p4 edit exited with exit status: 1: boom");
+        }
+
+        // 宽松模式也拿得到消息，只是调用方把它降级成一行 warning，不中断整轮。
+        assert!(
+            p4_failure_message("edit", false, "exit status: 1", "boom", FailureMode::Warn)
+                .is_some(),
+            "Warn 模式仍要给出消息，由调用方决定怎么处置"
         );
     }
 }

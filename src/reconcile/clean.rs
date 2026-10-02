@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use super::changes::{Changes, render_title, report_group};
 use crate::cli::Options;
 use crate::model::DepotState;
-use crate::p4::process::run_p4_command_batched;
+use crate::p4::process::{FailureMode, run_p4_command_batched};
 use crate::path::local_path_key;
 
 /// 把文件还原到 have revision 时下发的 p4 命令。
@@ -268,8 +268,17 @@ async fn restore_to_have(options: &Options, work_dir: &str, files: &[RestoreFile
     // 不带 changelist：clean 不产生 changelist，`p4 sync` 也没有意义。
     // 只在 -a 时被调用，所以永远是「真改状态」：sync 失败必须让整轮失败，
     // 否则工作区会停在一个既没还原干净、也没人知道的状态上。
+    // 判据同 [`crate::reconcile::changes::apply_changes`]：p4 的逐文件错误不改退出码。
     // 错误由 [`apply_clean`] 收集，等其余各类做完再一起报。
-    run_p4_command_batched(options, work_dir, RESTORE_ARGS, &specs, false, true).await?;
+    run_p4_command_batched(
+        options,
+        work_dir,
+        RESTORE_ARGS,
+        &specs,
+        false,
+        FailureMode::ExitCodeOrStderr,
+    )
+    .await?;
 
     Ok(())
 }

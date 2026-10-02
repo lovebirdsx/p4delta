@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 
 use crate::cli::Options;
 use crate::model::{DepotState, WorkspaceFile, WorkspaceState};
-use crate::p4::process::{command_line_ready_paths, run_p4_command_batched};
+use crate::p4::process::{FailureMode, command_line_ready_paths, run_p4_command_batched};
 use crate::path::{local_path_key, normalize_local_path_owned, path_is_under_key};
 use crate::prune::{
     IGNORES_ARGS, PrunePlan, has_pruned_ancestor, parse_ignores_output, plan_directory_pruning,
@@ -94,7 +94,7 @@ pub(crate) async fn apply_file_ignores(
         &IGNORES_ARGS,
         &ignores_paths,
         false,
-        false,
+        FailureMode::Warn,
     )
     .await?;
 
@@ -178,7 +178,15 @@ pub(crate) async fn filter_unmapped_paths(
         return Ok(Vec::new());
     }
 
-    let lines = run_p4_command_batched(options, work_dir, &WHERE_ARGS, files, false, false).await?;
+    let lines = run_p4_command_batched(
+        options,
+        work_dir,
+        &WHERE_ARGS,
+        files,
+        false,
+        FailureMode::Warn,
+    )
+    .await?;
 
     Ok(drop_unmapped(files, &unmapped_path_keys(&lines)))
 }
