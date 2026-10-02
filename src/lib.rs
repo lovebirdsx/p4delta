@@ -97,7 +97,7 @@ pub fn run(mut options: Options) -> Result<()> {
 
     let mut cache: WorkspaceCache = Default::default();
 
-    let cache_path = ProjectDirs::from("com", "", "FastReconcile").map(|proj_dirs| {
+    let cache_path = ProjectDirs::from("com", "", "p4delta").map(|proj_dirs| {
         proj_dirs
             .cache_dir()
             .join("digests_".to_owned() + workspace_name + ".bin")

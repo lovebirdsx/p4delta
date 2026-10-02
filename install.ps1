@@ -29,7 +29,7 @@
     用这个开关时，以前注册过的会被摘掉。
 
 .PARAMETER Uninstall
-    卸载：摘掉工具定义、清掉安装目录。不会动摘要缓存（%LOCALAPPDATA%\FastReconcile）。
+    卸载：摘掉工具定义、清掉安装目录。不会动摘要缓存（%LOCALAPPDATA%\p4delta）。
 
 .PARAMETER Force
     P4V 正在运行时也照样写。默认中止——P4V 退出时可能用它内存里的工具列表覆盖这次写入。
@@ -635,7 +635,7 @@ function Invoke-Uninstall {
 
     Write-Info ''
     Write-Info '卸载完成。重启 P4V 后菜单项就没了。'
-    Write-Info '摘要缓存留在 %LOCALAPPDATA%\FastReconcile，下次装回来还能直接用；要清掉请手工删。'
+    Write-Info '摘要缓存留在 %LOCALAPPDATA%\p4delta，下次装回来还能直接用；要清掉请手工删。'
 }
 
 function Get-ExeVersion([string] $Path) {

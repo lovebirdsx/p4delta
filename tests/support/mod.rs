@@ -460,7 +460,7 @@ impl Sandbox {
             let local = std::env::var_os("LOCALAPPDATA")?;
             Some(
                 PathBuf::from(local)
-                    .join("FastReconcile")
+                    .join("p4delta")
                     .join("cache")
                     .join(name),
             )
@@ -468,11 +468,11 @@ impl Sandbox {
             Some(
                 self.paths
                     .home
-                    .join("Library/Caches/com.FastReconcile")
+                    .join("Library/Caches/com.p4delta")
                     .join(name),
             )
         } else {
-            Some(self.paths.cache.join("fastreconcile").join(name))
+            Some(self.paths.cache.join("p4delta").join(name))
         }
     }
 }
