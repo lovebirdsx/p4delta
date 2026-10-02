@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::cli::Options;
 use crate::p4::process::run_p4_command_batched;
@@ -175,6 +175,7 @@ pub(crate) async fn apply_changes(
     }
 
     let start_time = Instant::now();
+    let mut failures: Vec<String> = Vec::new();
 
     for (spec, files) in changes.groups() {
         if files.is_empty() {
@@ -190,14 +191,34 @@ pub(crate) async fn apply_changes(
 
         if options.apply {
             for (args, use_changelist) in spec.commands {
-                run_p4_command_batched(options, work_dir, args, files, *use_changelist, false)
-                    .await?;
+                // 这一支只在 -a 时走到，所以永远是「真改状态」：任何一批失败都必须让整轮失败。
+                // 以前这里是宽松模式，p4 拒绝开文件时只留一行 stderr 警告，程序照样打印
+                // "Inconsistencies fixed." 并退出 0——把失败伪装成了成功。
+                let result =
+                    run_p4_command_batched(options, work_dir, args, files, *use_changelist, true)
+                        .await;
+
+                if let Err(error) = result {
+                    // 这一组剩下的命令不再执行：「先 revert 再重开」这类组合半途而废没有意义。
+                    // 但**其余各组照跑**：一个文件名被 p4 拒掉（名字里有 `@`、`#`、`%` 的那类）
+                    // 不该让整轮停摆，把能做的都做完再一起报错。
+                    failures.push(format!("{} ({} files): {error}", spec.label, files.len()));
+                    break;
+                }
             }
         }
     }
 
     let total = changes.total();
     if options.apply {
+        if !failures.is_empty() {
+            bail!(
+                "Failed to apply {} change group(s):\n  {}",
+                failures.len(),
+                failures.join("\n  ")
+            );
+        }
+
         println!(
             "      Applied {} changes in {} seconds.",
             total,

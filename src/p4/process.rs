@@ -3,22 +3,111 @@
 use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Error, Result, anyhow, bail};
-use async_process::Command;
-use futures::io::AsyncBufReadExt;
+use async_process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use encoding_rs::Encoding;
+use futures::io::{AsyncBufReadExt, AsyncWriteExt};
 use futures::{AsyncReadExt, StreamExt};
 
 use crate::READ_BUFFER_SIZE;
-use crate::charset::{decode_p4_bytes, p4_encoding, strip_bom, trim_line_ending};
+use crate::charset::{
+    decode_p4_bytes, p4_command_encoding, p4_encoding, strip_bom, trim_line_ending,
+};
 use crate::cli::Options;
 use crate::model::HaveRecord;
 use crate::p4::marshal::MarshalStreamParser;
 
-// The Win32 limit is 32767 characters (https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/command-line-string-limitation)
-// Leave 2k characters for whatever else is in the command line.
+// 参数改成从 stdin 交给 p4 之后（见 [`argument_payload`]），这个数字不再是 Win32 命令行
+// 长度上限（32767 字符，https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/command-line-string-limitation）。
+// 保留原值有两个理由：一是让分片粒度不变（片数也就是 [`run_p4_command_batched`] 的并发度），
+// 二是 [`takes_paths_from_stdin`] 说不认 `-x` 的命令（`p4 ignores`）仍把路径挂在命令行上，
+// 它们依旧受那个上限约束。
 pub(crate) const ARGUMENT_LENGTH_MAX: usize = 32767 - 2048;
+
+/// 交给 p4 的参数载荷：一行一个参数，按 `encoding`（p4 的命令字符集）编码。
+/// 同时数出多少个参数在这个字符集里表达不了，供调用方提醒一次。
+///
+/// 路径参数刻意不走命令行。p4 把命令行参数当**字节流**、按命令字符集解码（见 `p4 help charset`），
+/// 而 Windows 会先把 UTF-16 命令行按系统 ANSI 代码页转成字节：en-US 机器是 1252，
+/// 中文名在那一步就变成 `?????.txt`，p4 拿到的路径与磁盘上的对不上。`-x -` 绕开命令行，
+/// 字节由 p4delta 按 p4 将要用的字符集写出，中间不再有操作系统插手。
+///
+/// 代价：`-x` 是「一行一个参数」，路径里含换行符时会被拆成两条。含换行的路径在 Windows 上
+/// 本来就建不出来，在 Unix 上也是极少见的病态输入；换掉的是「非 ASCII 路径在 Windows 上
+/// 完全不可用」。
+pub(crate) fn argument_payload(args: &[String], encoding: &'static Encoding) -> (Vec<u8>, usize) {
+    let mut payload = Vec::new();
+    let mut unrepresentable = 0;
+
+    for arg in args {
+        // 字符集表达不了的字符会退化成 `&#NNNN;` 形式的数字引用：那种配置下 p4 也无法
+        // 表示这个名字，让它去报「找不到文件」，比自己在这里猜一个名字更诚实。
+        let (bytes, _, had_errors) = encoding.encode(arg);
+        if had_errors {
+            unrepresentable += 1;
+        }
+
+        payload.extend_from_slice(&bytes);
+        payload.push(b'\n');
+    }
+
+    (payload, unrepresentable)
+}
+
+/// 已经提醒过「有路径写不进当前字符集」。
+/// 载荷按分片各算一次，同一个问题会重复出现，刷屏没有信息量。
+static WARNED_UNREPRESENTABLE: AtomicBool = AtomicBool::new(false);
+
+/// 提醒一次：这些路径 p4 一定匹配不上。它是「p4 报 no such file(s)」的原因，
+/// 不说的话用户只会看到一串语焉不详的失败。
+fn warn_unrepresentable_paths(unrepresentable: usize, total: usize) {
+    if unrepresentable == 0 || WARNED_UNREPRESENTABLE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    eprintln!(
+        "Warning: {unrepresentable} of {total} path(s) cannot be written in {}; \
+         p4 will not match them. Point P4CHARSET/P4COMMANDCHARSET at a charset that can.",
+        p4_command_encoding().name()
+    );
+}
+
+/// 把这一批参数改成从 stdin 传（`p4 -x - -b <个数>`），返回要写进 stdin 的载荷。
+///
+/// 全局选项必须排在命令之前，所以调用方要在加命令之前调用它（[`build_p4_command`] 已经这样做了）。
+/// 参数为空时什么都不做并返回 `None`：`-x -` 配上空的 stdin 会让 p4 一个参数都拿不到。
+/// `-b` 是 p4 内部把参数分组处理的大小（`p4 help usage`），给足本批的参数个数可以让这一批
+/// 一次收完，不必按 p4 的默认值再来回几趟。
+pub(crate) fn feed_arguments_via_stdin(cmd: &mut Command, args: &[String]) -> Option<Vec<u8>> {
+    if args.is_empty() {
+        return None;
+    }
+
+    let (payload, unrepresentable) = argument_payload(args, p4_command_encoding());
+    warn_unrepresentable_paths(unrepresentable, args.len());
+
+    cmd.arg("-x").arg("-").arg("-b").arg(args.len().to_string());
+    cmd.stdin(Stdio::piped());
+
+    Some(payload)
+}
+
+/// 把载荷写进 p4 的 stdin，然后关掉管道让它读到 EOF。
+///
+/// 写入失败不上报：p4 可能在读完全部参数之前就退出（比如整批失败），那时写入拿到的是
+/// EPIPE，它不是新信息——p4 自己的退出状态才是结论。
+pub(crate) async fn write_p4_arguments(arguments: Option<(ChildStdin, Vec<u8>)>) {
+    let Some((mut stdin, payload)) = arguments else {
+        return;
+    };
+
+    let _ = stdin.write_all(&payload).await;
+    // 关掉管道，p4 才读得到 EOF；只 drop 也行，但显式关掉更清楚。
+    let _ = stdin.close().await;
+}
 
 /// Run `p4 -G have` and parse the binary marshal output to get sync timestamps
 pub(crate) async fn run_p4_have(
@@ -51,14 +140,8 @@ pub(crate) async fn run_p4_have(
     cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture p4 stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture p4 stderr"))?;
+    // 参数是 `...`，用不上 stdin。
+    let P4Pipes { stdout, stderr, .. } = take_p4_pipes(&mut child, None)?;
 
     // Parse while reading: the raw response is several GB on a large workspace, so buffering
     // it whole before parsing is what made this run out of memory.
@@ -78,12 +161,7 @@ pub(crate) async fn run_p4_have(
         Ok::<_, Error>(parser.finish())
     };
 
-    let read_stderr = async move {
-        let mut buffer = Vec::new();
-        let mut stderr = stderr;
-        let _ = stderr.read_to_end(&mut buffer).await;
-        buffer
-    };
+    let read_stderr = read_p4_stderr(stderr);
 
     let (records, stderr_bytes) = futures::join!(read_stdout, read_stderr);
     let records = records?;
@@ -104,6 +182,120 @@ pub(crate) async fn run_p4_have(
     Ok(records)
 }
 
+/// p4 是否接受从 stdin（`-x -`）送来的路径参数。
+///
+/// `p4 ignores` 不接受：`-i` 只数命令行上的参数，`-x` 送来的一个都看不见，直接报
+/// `At least one file path must provided.` 并退出 1（p4 r24.1 实测；同一批路径挂在命令行上
+/// 就正常，`ignores -v` 反倒认 `-x`）。整个 `ignores` 家族一律按不认处理：`-v` 目前只会
+/// 被无参数调用，用不上 stdin，而少记一条「哪个变体认 `-x`」的例外更不容易出错。
+///
+/// 代价有两条，都指向同一个后果——非 ASCII 的路径名在 Windows 上失配：
+///
+/// - 这些名字只能挂在命令行上，在 ANSI 代码页表达不了它们的机器上会被转换吃掉（p4 侧的硬限制）；
+/// - 被忽略的文件名因此过滤不掉：`workspace.rs` 的文件级忽略拿不到结果，非 ASCII 的
+///   被忽略文件会一路走到 Add 类，最后由 `p4 add` 以「拒绝忽略文件」报错退场。
+///   `tests/e2e_prune.rs` 里盯着这条回退路径的用例是这里的守门人。
+fn takes_paths_from_stdin(always_args: &[&str]) -> bool {
+    !always_args.contains(&"ignores")
+}
+
+/// 组装一次「一批路径参数」的 p4 调用，返回命令与要写进 stdin 的载荷。
+///
+/// 命令行形状（顺序即下面的构造顺序；全局选项必须排在命令之前，已实测）：
+///
+/// ```text
+/// p4 -x - -b <本批参数个数> [-c <client>] <命令...> [-c <changelist>]
+///         └─ stdin：一行一个参数，按 p4 的命令字符集编码
+/// ```
+///
+/// 路径参数怎么送只在这里决定：默认走 stdin（载荷由调用方写进去），只有
+/// [`takes_paths_from_stdin`] 说不认的命令才留在命令行上——那时返回的载荷是 `None`，
+/// 一个字节都不该往 stdin 写。
+///
+/// 已知的缺口：`-c <client>` 是全局选项，必须排在命令之前，所以客户端名仍留在命令行上，
+/// 非 ASCII 的客户端名同样会被 ANSI 代码页转换吃掉。这一条 p4delta 目前无解。
+pub(crate) fn build_p4_command(
+    work_dir: &str,
+    always_args: &[&str],
+    batched_args: &[String],
+    client: Option<&str>,
+    changelist: Option<u32>,
+) -> (Command, Option<Vec<u8>>) {
+    let mut cmd = Command::new("p4");
+    cmd.current_dir(work_dir);
+    // p4 在 Windows 上按继承来的 PWD 找 .p4config，显式指定 cwd 时必须同时清掉 PWD。
+    cmd.env_remove("PWD");
+
+    let from_stdin = takes_paths_from_stdin(always_args);
+    let payload = if from_stdin {
+        feed_arguments_via_stdin(&mut cmd, batched_args)
+    } else {
+        None
+    };
+
+    if let Some(client) = client {
+        cmd.arg("-c");
+        cmd.arg(client);
+    }
+
+    cmd.args(always_args);
+
+    if let Some(changelist) = changelist {
+        cmd.arg("-c");
+        cmd.arg(changelist.to_string());
+    }
+
+    if !from_stdin {
+        // 只认命令行路径的命令，见 [`takes_paths_from_stdin`]。
+        cmd.args(batched_args);
+    }
+
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    (cmd, payload)
+}
+
+/// 一次 p4 调用的三条管道。
+pub(crate) struct P4Pipes {
+    /// 要写进 stdin 的参数：句柄与载荷。`None` 表示这一批没有参数要送。
+    pub(crate) arguments: Option<(ChildStdin, Vec<u8>)>,
+    pub(crate) stdout: ChildStdout,
+    pub(crate) stderr: ChildStderr,
+}
+
+/// 取走子进程的三条管道。
+///
+/// `payload` 非空时 stdin 由 [`feed_arguments_via_stdin`] 提前开了管道，取不到就是这一对
+/// 不变量被破坏，报错而不是 panic。
+pub(crate) fn take_p4_pipes(child: &mut Child, payload: Option<Vec<u8>>) -> Result<P4Pipes> {
+    let arguments = payload
+        .map(|payload| {
+            child
+                .stdin
+                .take()
+                .map(|stdin| (stdin, payload))
+                .ok_or_else(|| anyhow!("Failed to capture p4 stdin"))
+        })
+        .transpose()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture p4 stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture p4 stderr"))?;
+
+    Ok(P4Pipes {
+        arguments,
+        stdout,
+        stderr,
+    })
+}
+
 /// Runs one slice of a batched p4 command (eg. p4 stuff a100 a101 ... a198 a199)
 pub(crate) async fn run_p4_command_slice(
     options: &Options,
@@ -113,28 +305,15 @@ pub(crate) async fn run_p4_command_slice(
     use_changelist: bool,
     strict: bool,
 ) -> Result<Vec<String>> {
-    let mut cmd = Command::new("p4");
-    cmd.current_dir(work_dir);
-    // p4 在 Windows 上按继承来的 PWD 找 .p4config，显式指定 cwd 时必须同时清掉 PWD。
-    cmd.env_remove("PWD");
-
-    if let Some(workspace) = &options.workspace {
-        cmd.arg("-c");
-        cmd.arg(workspace);
-    }
-
-    cmd.args(always_args);
-
-    if use_changelist && options.changelist != 0 {
-        cmd.arg("-c");
-        cmd.arg(options.changelist.to_string());
-    }
-
-    cmd.args(batched_args_slice);
-
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
+    // `-c` 是二义的：作为全局选项是客户端，作为命令选项是 changelist。
+    let changelist = (use_changelist && options.changelist != 0).then_some(options.changelist);
+    let (mut cmd, payload) = build_p4_command(
+        work_dir,
+        always_args,
+        batched_args_slice,
+        options.workspace.as_deref(),
+        changelist,
+    );
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -151,26 +330,20 @@ pub(crate) async fn run_p4_command_slice(
         }
         Err(error) => return Err(error.into()),
     };
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture p4 stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture p4 stderr"))?;
 
-    // Both pipes must be drained concurrently. A child that fills its stderr pipe blocks
-    // forever if we only read stdout.
+    let P4Pipes {
+        arguments,
+        stdout,
+        stderr,
+    } = take_p4_pipes(&mut child, payload)?;
+
+    // 三条管道必须并发推：只读 stdout 时，塞满 stderr 管道的子进程会永远阻塞；
+    // 参数那一侧同理——写不完的大载荷会把 p4 堵在读取上，而它又在等我们读输出。
+    let write_args = write_p4_arguments(arguments);
     let read_stdout = read_p4_lines(stdout);
-    let read_stderr = async move {
-        let mut buffer = Vec::new();
-        let mut stderr = stderr;
-        let _ = stderr.read_to_end(&mut buffer).await;
-        buffer
-    };
+    let read_stderr = read_p4_stderr(stderr);
 
-    let (lines, stderr_bytes) = futures::join!(read_stdout, read_stderr);
+    let (_, lines, stderr_bytes) = futures::join!(write_args, read_stdout, read_stderr);
     let lines = lines?;
 
     let status = child.status().await?;
@@ -228,13 +401,22 @@ pub(crate) async fn read_p4_lines(stream: async_process::ChildStdout) -> io::Res
     Ok(result)
 }
 
+/// 收完 p4 的 stderr。它只在退出状态非零时才被读作错误消息，所以这里只管把字节收干净
+/// （管道不读完，子进程可能永远阻塞在写上）。
+pub(crate) async fn read_p4_stderr(stream: ChildStderr) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let mut stream = stream;
+    let _ = stream.read_to_end(&mut buffer).await;
+    buffer
+}
+
 /// Maximum number of concurrent p4 processes. The server is configured with maxParallel=8, and
 /// running more clients than that only adds process startup overhead and memory pressure.
 /// Unbounded spawning previously put tens of thousands of p4.exe processes in flight at once.
 pub(crate) const MAX_PARALLEL_P4_COMMANDS: usize = 8;
 
-/// Splits arguments into batches that fit within the Windows command line limit.
-/// An argument longer than the limit gets a batch of its own rather than an empty one.
+/// 按参数长度把参数切成若干片：每片交给一个 p4 进程，片数也就是并发度。
+/// 单个参数超过上限时自己独占一批，而不是切出一个空批。
 pub(crate) fn compute_batches(batched_args: &[String]) -> Vec<std::ops::Range<usize>> {
     let mut batches = Vec::new();
     let mut batch_start = 0;
@@ -257,7 +439,7 @@ pub(crate) fn compute_batches(batched_args: &[String]) -> Vec<std::ops::Range<us
     batches
 }
 
-/// Runs a p4 command with thousands of arguments in multiple batches to bypass windows input limit
+/// 把成千上万个参数分批交给 p4：每一批是一个独立的进程，参数从它的 stdin 送进去。
 /// `strict` 为真时任何一批非零退出都算失败，调用方必须放弃基于输出的判断。
 pub(crate) async fn run_p4_command_batched(
     options: &Options,
@@ -325,10 +507,80 @@ mod tests {
 
     use async_global_executor as task;
     use clap::Parser;
+    use encoding_rs::{UTF_8, WINDOWS_1252};
+
+    use crate::prune::IGNORES_ARGS;
 
     #[test]
     fn empty_arguments_produce_no_batches() {
         assert!(compute_batches(&[]).is_empty());
+    }
+
+    /// p4 按命令字符集解码 stdin 上的参数（实测：非法字节会换来
+    /// `No Translation for parameter`），所以载荷必须用同一个字符集编码。
+    /// 这正是整个改动的要点——名字挂在命令行上会被 Windows 的 ANSI 代码页转换吃掉。
+    #[test]
+    fn arguments_are_encoded_in_the_p4_charset_one_per_line() {
+        let args = vec!["使用说明.txt".to_owned(), "readme.txt".to_owned()];
+
+        let expected = [CHINESE_NAME_UTF8, b"\nreadme.txt\n"].concat();
+        let (payload, unrepresentable) = argument_payload(&args, UTF_8);
+        assert_eq!(payload, expected);
+        assert_eq!(unrepresentable, 0);
+
+        // winansi 里没有汉字：退化成数字引用，而不是丢字节或 panic。
+        // 这种配置下 p4 本来也认不出这个名字，让它去报「找不到文件」比猜一个名字诚实；
+        // 数出来的那一条会让调用方提醒用户一次。
+        let (fallback, _, had_errors) = WINDOWS_1252.encode("使用说明.txt");
+        assert!(had_errors, "汉字在 winansi 里没有对应字符");
+        let (payload, unrepresentable) = argument_payload(&args, WINDOWS_1252);
+        assert_eq!(payload, [fallback.as_ref(), b"\nreadme.txt\n"].concat());
+        assert_eq!(unrepresentable, 1, "只有中文名写不进 winansi");
+    }
+
+    /// 没有参数时不能加 `-x -`：那会让 p4 去读一个空的 stdin，一个参数都拿不到。
+    #[test]
+    fn empty_arguments_do_not_switch_to_stdin() {
+        let mut cmd = Command::new("p4");
+
+        assert!(feed_arguments_via_stdin(&mut cmd, &[]).is_none());
+        assert!(
+            cmd.get_args().next().is_none(),
+            "空参数不该往命令行上加东西"
+        );
+    }
+
+    fn argv_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// 参数走 stdin 时，`-x -b` 必须排在命令之前，命令行上不能再出现那些路径
+    /// （重复一遍就等于把它们又送回 ANSI 代码页去转换）。
+    #[test]
+    fn build_p4_command_moves_paths_to_stdin_ahead_of_the_command() {
+        let paths = vec!["使用说明.txt".to_owned(), "b.txt".to_owned()];
+
+        let (cmd, payload) = build_p4_command("/ws", &["edit"], &paths, Some("ws"), Some(7));
+
+        assert_eq!(
+            argv_of(&cmd),
+            ["-x", "-", "-b", "2", "-c", "ws", "edit", "-c", "7"]
+        );
+        assert!(payload.is_some(), "这一批的参数该从 stdin 走");
+    }
+
+    /// `p4 ignores` 不认 `-x`（见 [`takes_paths_from_stdin`]）：路径留在命令行上，
+    /// 载荷必须是空的——给它开一条没人读的 stdin，p4 会连命令行上的参数一起忽略掉。
+    #[test]
+    fn build_p4_command_keeps_ignores_paths_on_the_command_line() {
+        let paths = vec!["./a.txt".to_owned()];
+
+        let (cmd, payload) = build_p4_command("/ws", &IGNORES_ARGS, &paths, None, None);
+
+        assert_eq!(argv_of(&cmd), ["ignores", "-i", "./a.txt"]);
+        assert!(payload.is_none());
     }
 
     #[test]

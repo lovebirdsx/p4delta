@@ -360,13 +360,14 @@ pub(crate) async fn reconcile_dir(
         };
 
         // clean 的两支不能带 changelist：`p4 clean` 不接受 `-c`。
+        // 预演（`-n`）沿用宽松契约——它不改状态，报错只告警；真跑时失败就是失败。
         run_p4_command_batched(
             options,
             work_dir,
             args,
             &unsupported_paths,
             !options.clean,
-            false,
+            options.apply,
         )
         .await?;
     }

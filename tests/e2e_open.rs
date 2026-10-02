@@ -257,6 +257,42 @@ fn dry_run_leaves_the_workspace_untouched() {
     assert!(!sandbox.exists("src/lib.txt"));
 }
 
+/// 一个 p4 收不下的文件名不该让整轮停摆：其余各类照做，最后统一报错并非零退出。
+///
+/// `@` 在 p4 的参数语法里是版本说明符（`file@rev`、`@2024/01/01`），名字里带它的路径
+/// p4 一律拒收——这是用户改不动、p4delta 也无解的一类文件。以前它只换到一行 stderr 警告，
+/// 程序照样打印 "Inconsistencies fixed." 并退出 0；收紧成 strict 之后也必须只失败这一组，
+/// 不能让另外几百个文件陪着一起不做。
+#[test]
+fn a_rejected_file_name_fails_the_run_without_stopping_the_other_groups() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // Add 类：p4 收不下这个名字。
+    sandbox.write("report@2024.txt", "bad name\n");
+    // Edit 类：与它无关，必须照常完成。
+    sandbox.write("readme.txt", "changed locally\n");
+
+    sandbox
+        .cli()
+        .args(["-a", "-l"])
+        .arg(".")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Adding 1 files"))
+        .stdout(predicate::str::contains("Editing 1 files"))
+        .stderr(predicate::str::contains(
+            "Failed to apply 1 change group(s)",
+        ))
+        .stderr(predicate::str::contains("Add (1 files)"));
+
+    let opened = sandbox.opened();
+    assert_eq!(opened.len(), 1, "Edit 类必须照做：{opened:?}");
+    assert!(opened[0].contains("readme.txt"), "{opened:?}");
+    assert!(opened[0].contains(" - edit "), "{opened:?}");
+}
+
 /// 与 p4 自己的判定对照：同一组离线改动，两边找出的变更集合必须一致。
 ///
 /// 只用「没有打开过任何文件」的场景，这样八类标签与 p4 的四个动作名一一对应，

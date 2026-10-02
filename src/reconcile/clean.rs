@@ -266,7 +266,10 @@ async fn restore_to_have(options: &Options, work_dir: &str, files: &[RestoreFile
     let specs = restore_specs(files);
 
     // 不带 changelist：clean 不产生 changelist，`p4 sync` 也没有意义。
-    run_p4_command_batched(options, work_dir, RESTORE_ARGS, &specs, false, false).await?;
+    // 只在 -a 时被调用，所以永远是「真改状态」：sync 失败必须让整轮失败，
+    // 否则工作区会停在一个既没还原干净、也没人知道的状态上。
+    // 错误由 [`apply_clean`] 收集，等其余各类做完再一起报。
+    run_p4_command_batched(options, work_dir, RESTORE_ARGS, &specs, false, true).await?;
 
     Ok(())
 }
@@ -288,6 +291,7 @@ pub(crate) async fn apply_clean(
     }
 
     let start_time = Instant::now();
+    let mut failures: Vec<String> = Vec::new();
 
     for (spec, files) in clean.groups() {
         if files.is_empty() {
@@ -305,12 +309,14 @@ pub(crate) async fn apply_clean(
             continue;
         }
 
-        match (spec.action, &files) {
+        // 一类失败不拦下其余的类：一个文件删不掉（编辑器占着、权限不对）或还原不了，
+        // 不该让另外几百个留在原地。做完能做的，最后一起报。
+        let result = match (spec.action, &files) {
             (CleanAction::DeleteFromDisk, CleanGroupFiles::Delete(files)) => {
-                delete_workspace_files(files)?
+                delete_workspace_files(files)
             }
             (CleanAction::RestoreToHave, CleanGroupFiles::Restore(files)) => {
-                restore_to_have(options, work_dir, files).await?
+                restore_to_have(options, work_dir, files).await
             }
             // 表与字段的配对由 `every_group_is_paired_with_the_matching_action` 钉死，
             // 走不到这里；真走到了说明表被改坏了，不能静默按其中一边执行。
@@ -318,11 +324,24 @@ pub(crate) async fn apply_clean(
                 "Mispaired clean group \"{}\" with action {action:?}",
                 spec.label
             ),
+        };
+
+        if let Err(error) = result {
+            failures.push(format!("{} ({} files): {error}", spec.label, files.len()));
         }
     }
 
     let total = clean.total();
     if options.apply {
+        // 有失败就绝不打印 "Workspace matches the depot."——那是这个工具唯一的安全承诺。
+        if !failures.is_empty() {
+            bail!(
+                "Failed to clean {} change group(s):\n  {}",
+                failures.len(),
+                failures.join("\n  ")
+            );
+        }
+
         println!(
             "      Cleaned {total} files in {} seconds.",
             start_time.elapsed().as_secs_f32()

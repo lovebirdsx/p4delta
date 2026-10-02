@@ -1,21 +1,22 @@
 //! `p4 fstat` 查询与流式解析。
 
 use std::collections::HashSet;
-use std::process::Stdio;
 use std::time::Instant;
 
 use anyhow::{Error, Result, anyhow, bail};
-use async_process::Command;
 use encoding_rs::Encoding;
+use futures::StreamExt;
 use futures::io::AsyncBufReadExt;
-use futures::{AsyncReadExt, StreamExt};
 use hex::FromHex;
 
 use crate::READ_BUFFER_SIZE;
 use crate::charset::{decode_p4_bytes, p4_encoding, strip_bom, trim_line_ending};
 use crate::cli::Options;
 use crate::model::{DepotFileRecord, DepotState, FileAction};
-use crate::p4::process::{MAX_PARALLEL_P4_COMMANDS, compute_batches};
+use crate::p4::process::{
+    MAX_PARALLEL_P4_COMMANDS, P4Pipes, build_p4_command, compute_batches, read_p4_stderr,
+    take_p4_pipes, write_p4_arguments,
+};
 use crate::path::{local_path_key, normalize_local_path_owned};
 
 /// Streaming parser for `p4 fstat` text output.
@@ -119,32 +120,23 @@ pub(crate) async fn run_p4_fstat_slice(
     paths: &[String],
     strict: bool,
 ) -> Result<Vec<DepotFileRecord>> {
-    let mut cmd = Command::new("p4");
-    cmd.current_dir(work_dir);
-    // p4 在 Windows 上按继承来的 PWD 找 .p4config，显式指定 cwd 时必须同时清掉 PWD。
-    cmd.env_remove("PWD");
-
-    if let Some(workspace) = &options.workspace {
-        cmd.arg("-c");
-        cmd.arg(workspace);
-    }
-
-    cmd.args(fstat_args);
-    cmd.args(paths);
-
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
+    // 路径从 stdin 走：补查传的是 depot 路径，里面同样可能有非 ASCII 字符名，
+    // 挂在命令行上会被 Windows 的 ANSI 代码页转换吃掉（见 [`build_p4_command`]）。
+    let (mut cmd, payload) = build_p4_command(
+        work_dir,
+        fstat_args,
+        paths,
+        options.workspace.as_deref(),
+        // fstat 不改状态，不属于任何 changelist。
+        None,
+    );
 
     let mut child = cmd.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture p4 stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture p4 stderr"))?;
+    let P4Pipes {
+        arguments,
+        stdout,
+        stderr,
+    } = take_p4_pipes(&mut child, payload)?;
 
     let encoding = p4_encoding();
     let verbose = options.verbose;
@@ -179,14 +171,12 @@ pub(crate) async fn run_p4_fstat_slice(
         Ok::<_, Error>(parser.finish())
     };
 
-    let read_stderr = async move {
-        let mut buffer = Vec::new();
-        let mut stderr = stderr;
-        let _ = stderr.read_to_end(&mut buffer).await;
-        buffer
-    };
+    let read_stderr = read_p4_stderr(stderr);
 
-    let (records, stderr_bytes) = futures::join!(read_stdout, read_stderr);
+    // 三条管道必须并发推：只读 stdout 时，塞满 stderr 管道的子进程会永远阻塞；
+    // 参数那一侧同理——写不完的大载荷会把 p4 堵在读取上，而它又在等我们读输出。
+    let write_args = write_p4_arguments(arguments);
+    let (_, records, stderr_bytes) = futures::join!(write_args, read_stdout, read_stderr);
     let records = records?;
 
     let status = child.status().await?;

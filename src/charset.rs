@@ -20,23 +20,80 @@ pub(crate) fn p4_encoding() -> &'static Encoding {
     P4_ENCODING.get().copied().unwrap_or(UTF_8)
 }
 
-/// Resolves and caches the p4 charset. Idempotent; the first caller wins.
+/// p4 解码命令行参数（包括 `-x` 送上来的那一批）用的字符集，同样只在启动时解析一次。
+///
+/// 它未必等于内容字符集：设了 `P4COMMANDCHARSET` 时 p4 用它解参数、用 `P4CHARSET` 译文件内容。
+/// 按内容字符集编码参数会让非 ASCII 路径变成谁也匹配不上的乱码，所以参数必须按这一个来编。
+/// （不用 `p4 -Q` 把两者强行统一：`-Q` 改的是 p4 生效的命令字符集，输出编码会跟着变，
+/// 而输出仍按内容字符集解码——那等于把问题从参数搬到输出上。）
+static P4_COMMAND_ENCODING: OnceLock<&'static Encoding> = OnceLock::new();
+
+/// The charset p4 decodes arguments with. Falls back to the content charset, which is what
+/// p4 itself does when `P4COMMANDCHARSET` is unset.
+pub(crate) fn p4_command_encoding() -> &'static Encoding {
+    P4_COMMAND_ENCODING
+        .get()
+        .copied()
+        .unwrap_or_else(|| p4_encoding())
+}
+
+/// Resolves and caches the p4 charsets. Idempotent; the first caller wins.
 /// `cwd` matters because p4 looks for a `.p4config` in its working directory.
 pub(crate) fn init_p4_encoding(explicit: Option<&str>, cwd: &Path) -> &'static Encoding {
     if let Some(encoding) = P4_ENCODING.get() {
         return encoding;
     }
 
-    let (encoding, source) = resolve_p4_charset(explicit, cwd);
+    let env_charset = non_empty_env("P4CHARSET");
+    let env_command_charset = non_empty_env("P4COMMANDCHARSET");
+
+    // 环境变量已经给出答案时不去跑 `p4 set`：它要起一个 p4 进程。p4 的参数优先级里
+    // .p4config 能盖过环境变量，这条兜底路径由这个查询负责。
+    let settings = if (explicit.is_some() || env_charset.is_some()) && env_command_charset.is_some()
+    {
+        P4SetCharsets::default()
+    } else {
+        query_p4_set_charsets(cwd)
+    };
+
+    let (encoding, source) = resolve_p4_charset(explicit, env_charset.as_deref(), &settings);
     let _ = P4_ENCODING.set(encoding);
     println!("Using p4 charset {} ({}).", encoding.name(), source);
+
+    let (command_encoding, command_source) =
+        resolve_command_charset(env_command_charset.as_deref(), &settings, encoding);
+    let _ = P4_COMMAND_ENCODING.set(command_encoding);
+    // 两者一致时不打第二行：这是绝大多数情况，多说一句只是噪音。
+    if command_encoding != encoding {
+        println!(
+            "Using p4 command charset {} ({}).",
+            command_encoding.name(),
+            command_source
+        );
+    }
+
     p4_encoding()
+}
+
+/// 读环境变量，空串按「没设」处理——p4 对空值的处理和未设一样。
+/// 值取不到（非 UTF-8）时也当没设，与遍历字符集表达不了的字符时同一个态度：宁可回落。
+fn non_empty_env(name: &str) -> Option<String> {
+    let value = env::var(name).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 /// Picks the charset p4 is using, in the order p4 itself resolves its own settings:
 /// explicit option, environment, then `p4 set`. Port-level variables are only consulted
 /// when the general one is absent, which matches the observed behavior.
-fn resolve_p4_charset(explicit: Option<&str>, cwd: &Path) -> (&'static Encoding, String) {
+///
+/// 环境变量与 `p4 set` 的值都由调用方传进来，不是为了好看：单元测试里改进程环境是全局操作，
+/// 会和并行跑的用例互相踩。
+fn resolve_p4_charset(
+    explicit: Option<&str>,
+    from_env: Option<&str>,
+    settings: &P4SetCharsets,
+) -> (&'static Encoding, String) {
     if let Some(name) = explicit {
         return match p4_charset_to_encoding(name) {
             Some(encoding) => (encoding, format!("--charset {}", name)),
@@ -47,18 +104,17 @@ fn resolve_p4_charset(explicit: Option<&str>, cwd: &Path) -> (&'static Encoding,
         };
     }
 
-    let from_env = env::var("P4CHARSET").unwrap_or_default();
-    if !from_env.trim().is_empty()
-        && let Some(encoding) = p4_charset_to_encoding(&from_env)
+    if let Some(name) = from_env
+        && let Some(encoding) = p4_charset_to_encoding(name)
     {
         return (
             encoding,
-            format!("P4CHARSET environment variable: {}", from_env),
+            format!("P4CHARSET environment variable: {}", name),
         );
     }
 
-    if let Some(name) = query_p4_set_charset(cwd)
-        && let Some(encoding) = p4_charset_to_encoding(&name)
+    if let Some(name) = &settings.charset
+        && let Some(encoding) = p4_charset_to_encoding(name)
     {
         return (encoding, format!("p4 set P4CHARSET={}", name));
     }
@@ -66,32 +122,83 @@ fn resolve_p4_charset(explicit: Option<&str>, cwd: &Path) -> (&'static Encoding,
     (UTF_8, "default utf8, P4CHARSET is not set".to_owned())
 }
 
-/// Reads the charset from `p4 set`. Values configured that way live in the registry rather
+/// 参数与输出的字符集。p4 自己的规则是「`P4COMMANDCHARSET` 缺省跟随 `P4CHARSET`」，
+/// 这里照抄：所以回落到内容字符集，而不是再读一遍 P4CHARSET，
+/// 用户用 `--charset` 显式告诉我们的值也能一并生效。
+fn resolve_command_charset(
+    from_env: Option<&str>,
+    settings: &P4SetCharsets,
+    content: &'static Encoding,
+) -> (&'static Encoding, String) {
+    if let Some(name) = from_env
+        && let Some(encoding) = p4_charset_to_encoding(name)
+    {
+        return (
+            encoding,
+            format!("P4COMMANDCHARSET environment variable: {}", name),
+        );
+    }
+
+    if let Some(name) = &settings.command_charset
+        && let Some(encoding) = p4_charset_to_encoding(name)
+    {
+        return (encoding, format!("p4 set P4COMMANDCHARSET={}", name));
+    }
+
+    (content, "defaults to the content charset".to_owned())
+}
+
+/// `p4 set` 里与字符集有关的两个变量。
+#[derive(Default)]
+struct P4SetCharsets {
+    /// `P4CHARSET`，或端口级的 `P4_<port>_CHARSET` 兜底。
+    charset: Option<String>,
+
+    /// `P4COMMANDCHARSET`：p4 用来解码参数、编码输出的字符集。
+    command_charset: Option<String>,
+}
+
+/// Reads the charsets from `p4 set`. Values configured that way live in the registry rather
 /// than the environment, so `env::var` cannot see them.
-/// p4 prints "P4CHARSET=utf8 (set)", or nothing at all when the variable is unset.
-fn query_p4_set_charset(cwd: &Path) -> Option<String> {
+fn query_p4_set_charsets(cwd: &Path) -> P4SetCharsets {
     let output = std::process::Command::new("p4")
         .arg("set")
         .current_dir(cwd)
         // p4 会用继承来的 PWD 而不是真实 cwd 找配置文件，必须清掉。
         .env_remove("PWD")
-        .output()
-        .ok()?;
+        .output();
+
+    let Ok(output) = output else {
+        return P4SetCharsets::default();
+    };
 
     let text = String::from_utf8_lossy(&output.stdout);
+
+    parse_p4_set_charsets(&text)
+}
+
+/// 从 `p4 set` 输出里取两个字符集变量。
+fn parse_p4_set_charsets(text: &str) -> P4SetCharsets {
+    P4SetCharsets {
+        // 端口级的变量只在通用变量缺席时兜底，与观察到的行为一致。
+        charset: parse_p4_set_value(text, "P4CHARSET").or_else(|| port_level_charset(text)),
+        command_charset: parse_p4_set_value(text, "P4COMMANDCHARSET"),
+    }
+}
+
+/// 取端口级 `P4_<port>_CHARSET`（例如 `P4_1666_CHARSET`）的值。
+fn port_level_charset(text: &str) -> Option<String> {
     let mut port_level = None;
 
     for line in text.lines() {
         let Some((key, rest)) = line.split_once('=') else {
             continue;
         };
-        // "utf8 (set)" or "auto (config '...')" - the source annotation is not part of the value.
-        let value = rest.split(" (").next().unwrap_or("").trim().to_owned();
 
-        match key.trim() {
-            "P4CHARSET" => return Some(value),
-            key if key.starts_with("P4_") && key.ends_with("_CHARSET") => port_level = Some(value),
-            _ => {}
+        let key = key.trim();
+        if key.starts_with("P4_") && key.ends_with("_CHARSET") {
+            // "utf8 (set)" 这样的来源说明不属于变量值。
+            port_level = Some(rest.split(" (").next().unwrap_or("").trim().to_owned());
         }
     }
 
@@ -357,6 +464,112 @@ mod tests {
         assert_eq!(
             p4_charset_to_encoding("gb18030"),
             Some(encoding_rs::GB18030)
+        );
+    }
+
+    // ---- 生效字符集的解析 ----
+
+    /// 优先级照抄 p4：命令行 > 环境变量 > `p4 set` > 默认 utf8。
+    #[test]
+    fn charset_resolution_follows_p4s_own_precedence() {
+        use encoding_rs::*;
+
+        let settings = P4SetCharsets {
+            charset: Some("cp936".to_owned()),
+            command_charset: None,
+        };
+
+        assert_eq!(
+            resolve_p4_charset(Some("shiftjis"), Some("eucjp"), &settings).0,
+            SHIFT_JIS
+        );
+        assert_eq!(resolve_p4_charset(None, Some("eucjp"), &settings).0, EUC_JP);
+        assert_eq!(resolve_p4_charset(None, None, &settings).0, GBK);
+        assert_eq!(
+            resolve_p4_charset(None, None, &P4SetCharsets::default()).0,
+            UTF_8
+        );
+    }
+
+    /// 认不出的名字不猜：显式指定的退回 utf8，其余来源继续往下找。
+    /// `auto` 由 p4 按系统区域决定，我们无从知道真实字节编码。
+    #[test]
+    fn unknown_charset_names_do_not_stop_the_search() {
+        use encoding_rs::*;
+
+        let settings = P4SetCharsets {
+            charset: Some("cp936".to_owned()),
+            command_charset: None,
+        };
+
+        assert_eq!(resolve_p4_charset(Some("auto"), None, &settings).0, UTF_8);
+        assert_eq!(resolve_p4_charset(None, Some("auto"), &settings).0, GBK);
+    }
+
+    /// 命令字符集缺省跟随内容字符集（p4 自己的规则），设了 `P4COMMANDCHARSET` 则它优先。
+    /// 用内容字符集编码、命令字符集解码时，非 ASCII 路径会变成谁也匹配不上的乱码。
+    #[test]
+    fn command_charset_defaults_to_the_content_charset() {
+        use encoding_rs::*;
+
+        let none = P4SetCharsets::default();
+
+        assert_eq!(resolve_command_charset(None, &none, GBK).0, GBK);
+        // 环境变量压过 `p4 set`，与 p4 的优先级一致。
+        assert_eq!(resolve_command_charset(Some("cp950"), &none, GBK).0, BIG5);
+
+        let from_set = P4SetCharsets {
+            charset: None,
+            command_charset: Some("shiftjis".to_owned()),
+        };
+        assert_eq!(resolve_command_charset(None, &from_set, GBK).0, SHIFT_JIS);
+    }
+
+    /// 端口级 `P4_<port>_CHARSET` 只在通用变量缺席时兜底，且来源说明不属于变量值。
+    #[test]
+    fn port_level_charset_is_the_last_resort() {
+        use encoding_rs::*;
+
+        let text = "P4_1666_CHARSET=cp936 (set)\nP4CHARSET=utf8 (config 'C:/ws/.p4config')\n";
+        assert_eq!(
+            parse_p4_set_value(text, "P4CHARSET"),
+            Some("utf8".to_owned())
+        );
+        assert_eq!(port_level_charset(text), Some("cp936".to_owned()));
+
+        // 通用变量缺席时才轮到它。
+        assert_eq!(
+            resolve_p4_charset(
+                None,
+                None,
+                &P4SetCharsets {
+                    charset: port_level_charset(text),
+                    command_charset: None,
+                }
+            )
+            .0,
+            GBK
+        );
+
+        assert_eq!(port_level_charset("P4CHARSET=utf8 (set)\n"), None);
+    }
+
+    /// `p4 set` 的两个变量从同一份输出里取回：每跑一次就是一个 p4 进程。
+    #[test]
+    fn p4_set_query_collects_both_charsets() {
+        let both = parse_p4_set_charsets("P4CHARSET=utf8 (set)\nP4COMMANDCHARSET=cp936 (set)\n");
+        assert_eq!(both.charset, Some("utf8".to_owned()));
+        assert_eq!(both.command_charset, Some("cp936".to_owned()));
+
+        // `P4COMMANDCHARSET` 缺席时不拿端口级变量顶替：那个兜底是给内容字符集的。
+        let content_only = parse_p4_set_charsets("P4_1666_CHARSET=cp936 (set)\n");
+        assert_eq!(content_only.charset, Some("cp936".to_owned()));
+        assert_eq!(content_only.command_charset, None);
+
+        assert_eq!(
+            parse_p4_set_charsets("P4CHARSET=\n").charset,
+            None,
+            "空值等于没设"
         );
     }
 
