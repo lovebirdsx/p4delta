@@ -2,7 +2,14 @@ name: CI
 
 on:
   push:
+    # branches 必须写：GitHub 只在定义了 branches/tags 的**那一类** ref 上触发，
+    # 只写 tags-ignore 会让分支推送也不再跑 CI。这里要的是「分支照跑、tag 不跑」——
+    # tag 推送交给 release.yml，它会把下面三个 job 当门禁复用一遍，不必跑两回。
+    branches: ["**"]
+    tags-ignore: ["**"]
   pull_request:
+  # 供 release.yml 当发布门禁复用。
+  workflow_call:
 
 # 同一分支连续推送时取消尚未跑完的旧运行。
 concurrency:
@@ -58,3 +65,27 @@ jobs:
         env:
           P4_E2E_REQUIRED: "1"
         run: cargo test --all-targets --all-features --locked
+
+  # 安装脚本的黑盒测试：把 install.ps1 与一个人造 exe 拷进临时目录再跑，
+  # 断言生成的 customtools.xml 与幂等/卸载行为。不需要构建产物，所以独立于 test。
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 用户机器上的默认解释器是 Windows PowerShell 5.1，开发机上多半是 7。
+      # 两边都跑：install.ps1 要同时兼容（比如 5.1 没有 ?? 和 utf8NoBOM），
+      # 而它对中文输出的依赖（脚本必须带 UTF-8 BOM）只有 5.1 这一遍能验出来。
+      - name: install.ps1 under Windows PowerShell 5.1
+        shell: powershell
+        run: ./scripts/test-install.ps1
+      - name: install.ps1 under PowerShell 7
+        shell: pwsh
+        run: ./scripts/test-install.ps1
+
+  # release.sh 的黑盒测试：在一次性 git 仓库里真跑一遍改版本号、提交、打附注 tag、推送，
+  # 只有 cargo 换成垫片——所以不需要构建产物，也不联网。
+  release-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/test-release.sh

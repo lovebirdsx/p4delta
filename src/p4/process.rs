@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -117,7 +118,7 @@ pub(crate) async fn run_p4_have(
     println!("   Querying file sync timestamps.");
     let start_time = Instant::now();
 
-    let mut cmd = Command::new("p4");
+    let mut cmd = Command::new(crate::locate::p4_exe()?);
     cmd.current_dir(work_dir);
     // p4 在 Windows 上按继承来的 PWD 找 .p4config，显式指定 cwd 时必须同时清掉 PWD。
     cmd.env_remove("PWD");
@@ -261,14 +262,18 @@ pub(crate) fn command_line_ready_paths(paths: &[String]) -> Vec<String> {
 ///
 /// 已知的缺口：`-c <client>` 是全局选项，必须排在命令之前，所以客户端名仍留在命令行上，
 /// 非 ASCII 的客户端名同样会被 ANSI 代码页转换吃掉。这一条 p4delta 目前无解。
+///
+/// `program` 由调用方给（见 [`crate::locate::p4_exe`]）而不是在这里现找：这样本函数只
+/// 负责拼命令行，纯 argv 的用例不必依赖跑测试的机器上有没有 p4。
 pub(crate) fn build_p4_command(
+    program: &Path,
     work_dir: &str,
     always_args: &[&str],
     batched_args: &[String],
     client: Option<&str>,
     changelist: Option<u32>,
 ) -> (Command, Option<Vec<u8>>) {
-    let mut cmd = Command::new("p4");
+    let mut cmd = Command::new(program);
     cmd.current_dir(work_dir);
     // p4 在 Windows 上按继承来的 PWD 找 .p4config，显式指定 cwd 时必须同时清掉 PWD。
     cmd.env_remove("PWD");
@@ -343,6 +348,12 @@ pub(crate) fn take_p4_pipes(child: &mut Child, payload: Option<Vec<u8>>) -> Resu
     })
 }
 
+/// p4 起不来时给 lenient 调用方的告警。定位失败与 spawn 失败都走这里，
+/// 免得同一句话在两处各写一遍、日后改一处漏一处。
+fn warn_p4_could_not_start(command: &str, reason: &dyn std::fmt::Display) {
+    eprintln!("Warning: p4 {command} could not be started: {reason}");
+}
+
 /// Runs one slice of a batched p4 command (eg. p4 stuff a100 a101 ... a198 a199)
 pub(crate) async fn run_p4_command_slice(
     options: &Options,
@@ -354,7 +365,23 @@ pub(crate) async fn run_p4_command_slice(
 ) -> Result<Vec<String>> {
     // `-c` 是二义的：作为全局选项是客户端，作为命令选项是 changelist。
     let changelist = (use_changelist && options.changelist != 0).then_some(options.changelist);
+
+    // 定位不到 p4（没装、不在 PATH、P4V 目录里也没有）与原来 spawn 拿到 NotFound 是
+    // 同一件事，降级策略照旧：strict 调用方必须失败，但文件级过滤这类 lenient 调用方
+    // 沿用「p4 报错只告警，不改变已有结果」的契约，返回空结果而不是中断整轮。
+    // 真实运行时 p4 缺失早在 fstat/have 阶段就退出，走不到这里，因此这个降级掩盖不了
+    // 真实问题。
+    let program = match crate::locate::p4_exe() {
+        Ok(program) => program,
+        Err(reason) if !strict => {
+            warn_p4_could_not_start(always_args[0], &reason);
+            return Ok(Vec::new());
+        }
+        Err(reason) => return Err(reason),
+    };
+
     let (mut cmd, payload) = build_p4_command(
+        program,
         work_dir,
         always_args,
         batched_args_slice,
@@ -364,15 +391,10 @@ pub(crate) async fn run_p4_command_slice(
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        // p4 起不来（通常是没装、不在 PATH 里）：strict 调用方必须失败，但文件级
-        // 过滤这类 lenient 调用方沿用「p4 报错只告警，不改变已有结果」的契约，
-        // 返回空结果而不是中断整轮。真实运行时 p4 缺失早在 fstat/have 阶段就退出，
-        // 走不到这里，因此这个降级掩盖不了真实问题。
+        // 定位到 spawn 之间文件被删掉或换成不可执行这一小段窗口，以及其它启动失败。
+        // 上面那道 locate 已经拦住了「根本没装」，这里只剩真正的启动问题。
         Err(error) if !strict && error.kind() == io::ErrorKind::NotFound => {
-            eprintln!(
-                "Warning: p4 {} could not be started: {}",
-                always_args[0], error
-            );
+            warn_p4_could_not_start(always_args[0], &error);
             return Ok(Vec::new());
         }
         Err(error) => return Err(error.into()),
@@ -640,7 +662,14 @@ mod tests {
     fn build_p4_command_moves_paths_to_stdin_ahead_of_the_command() {
         let paths = vec!["使用说明.txt".to_owned(), "b.txt".to_owned()];
 
-        let (cmd, payload) = build_p4_command("/ws", &["edit"], &paths, Some("ws"), Some(7));
+        let (cmd, payload) = build_p4_command(
+            Path::new("p4"),
+            "/ws",
+            &["edit"],
+            &paths,
+            Some("ws"),
+            Some(7),
+        );
 
         assert_eq!(
             argv_of(&cmd),
@@ -655,7 +684,8 @@ mod tests {
     fn build_p4_command_keeps_ignores_paths_on_the_command_line() {
         let paths = vec!["./a.txt".to_owned()];
 
-        let (cmd, payload) = build_p4_command("/ws", &IGNORES_ARGS, &paths, None, None);
+        let (cmd, payload) =
+            build_p4_command(Path::new("p4"), "/ws", &IGNORES_ARGS, &paths, None, None);
 
         assert_eq!(argv_of(&cmd), ["ignores", "-i", "./a.txt"]);
         assert!(payload.is_none());

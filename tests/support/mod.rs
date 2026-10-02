@@ -388,8 +388,11 @@ impl Sandbox {
         env
     }
 
-    /// p4 的目录插到 PATH 最前面：生产代码里 `Command::new("p4")` 是硬编码的，
-    /// PATH 是唯一的注入点。
+    /// p4 的目录插到 PATH 最前面。
+    ///
+    /// 生产代码的定位顺序是 `P4_EXE` → `PATH` → P4V 安装目录，沙箱刻意只走 `PATH`
+    /// 这一段：tools 目录排在 `PATH` 最前，第 2 步必定命中沙箱这一份，**跑测试的机器上
+    /// 就算装了 P4V 也不会串味**。（`env()` 会把父进程的 `P4_EXE` 一并剥掉，见 `is_p4_var`。）
     fn path_with_tools(&self) -> String {
         let existing = std::env::var_os("PATH").unwrap_or_default();
         let mut entries = vec![self.tools.bin_dir()];

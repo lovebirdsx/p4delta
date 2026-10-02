@@ -8,9 +8,11 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 /// 起一个命令行。清掉 P4CLIENT，否则本机的值会让「没有工作区」的用例失真。
+/// P4_EXE 同理：它是生产代码定位 p4 的第一顺位，本机残留一个值会改变下面每条用例的走向。
 fn cli() -> Command {
     let mut cmd = Command::cargo_bin("p4delta").expect("binary must build");
     cmd.env_remove("P4CLIENT");
+    cmd.env_remove("P4_EXE");
     cmd
 }
 
@@ -101,4 +103,19 @@ fn a_path_that_does_not_exist_is_skipped() {
         .assert()
         .success()
         .stdout(predicate::str::contains("doesn't exist."));
+}
+
+/// `P4_EXE` 指到不存在的文件是**配置错误**，不是「这台机器没有 p4」：后者由各调用点
+/// 降级处理（比如路径不存在就跳过），前者必须在做任何事之前就报出来——否则这个开关
+/// 会悄悄回落到系统里另一份 p4，等于没设。
+#[test]
+fn a_p4_exe_that_does_not_exist_is_a_config_error() {
+    cli()
+        .env("P4_EXE", "this-p4-exe-does-not-exist-4b8d2a")
+        .args(["--charset", "utf8"])
+        .arg("this-path-does-not-exist-9f3c1e")
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("P4_EXE"))
+        .stdout(predicate::str::contains("doesn't exist.").not());
 }

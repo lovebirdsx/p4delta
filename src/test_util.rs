@@ -82,14 +82,19 @@ pub(crate) const TEST_P4_ENV: [(&str, &str); 2] = [
     ("P4IGNORE", P4IGNORE_FILE_NAME),
 ];
 
-/// 运行 p4 子进程。只有 p4 不存在（NotFound）才返回 None 让调用方跳过；
+/// 运行 p4 子进程。只有 p4 不存在才返回 None 让调用方跳过；
 /// 其他启动错误一律失败，不能把真实的 p4 问题伪装成「环境不支持」。
+///
+/// 定位走生产代码那一套（`P4_EXE` → `PATH` → P4V 安装目录）：装了 P4V 但 p4 没进
+/// `PATH` 的机器上这些用例照样能真跑，而不是无声地跳过。
 pub(crate) fn p4_output(
     root: &Path,
     args: &[&str],
     env: &[(&str, &str)],
 ) -> Option<std::process::Output> {
-    match std::process::Command::new("p4")
+    let program = crate::locate::p4_exe().ok()?;
+
+    match std::process::Command::new(program)
         .args(args)
         .current_dir(root)
         // 与生产代码一致：p4 会用继承来的 PWD 找配置，必须清掉。
@@ -105,7 +110,11 @@ pub(crate) fn p4_output(
 
 /// p4 是否可用。不可用时测试显式跳过并打印一行说明，而不是静默通过。
 pub(crate) fn p4_available() -> bool {
-    match std::process::Command::new("p4").arg("-V").output() {
+    let Ok(program) = crate::locate::p4_exe() else {
+        return false;
+    };
+
+    match std::process::Command::new(program).arg("-V").output() {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => panic!("p4 -V could not be started: {error}"),

@@ -25,15 +25,64 @@ P4V 里的 `Reconcile Offline Work` 慢得令人抓狂，本程序是它的替�
 
 `Reconcile Offline Work` 的性能随改动文件数增加会迅速劣化，`p4delta` 不会——它始终更快、更跟手。
 
+## 安装
+
+从 [Releases](https://github.com/lovebirdsx/p4delta/releases) 下载最新的
+`p4delta-<版本>-x86_64-pc-windows-msvc.zip`，解压后在这个目录里跑：
+
+```powershell
+.\install.ps1
+```
+
+它做三件事：把 `p4delta.exe` 铺到 `%LOCALAPPDATA%\Programs\p4delta\`、把工具定义写进
+`%USERPROFILE%\.p4qt\customtools.xml`（P4V 的自定义工具文件）、检查机器上有没有 `p4`。
+**装完要重启 P4V**——它只在启动时读那个文件。
+
+写入是幂等的：只动它自己那几个节点，你已有的其它自定义工具原样保留；内容没变时整个文件都不
+重写。写之前会备份一份（`customtools.xml.p4delta-backup-<时间戳>`）。P4V 正在运行时会拒绝
+写入（`-Force` 可以强行继续）——P4V 退出时可能用它内存里的列表覆盖这次改动。
+
+默认注册 `p4delta Reconcile` 与 `p4delta Clean (preview)` 两个，都进右键菜单。不可逆的
+「clean 实际清理」不注册，需要时用 `-WithCleanApply` 再跑一次。
+
+| 参数 | 作用 |
+| --- | --- |
+| `-WithCleanApply` | 额外注册不可逆的 clean 实际清理（单独放在一个子菜单里） |
+| `-Uninstall` | 卸载：摘掉工具定义、删安装目录；摘要缓存留着 |
+| `-AddToPath` | 把安装目录加进用户级 PATH，方便在命令行里直接敲 `p4delta` |
+| `-InstallDir`、`-CustomToolsPath` | 换安装位置 / 换 P4V 配置文件位置 |
+| `-WhatIf` | 只说要做什么，不落盘 |
+
+### 未签名的 exe
+
+发布产物没有代码签名，首次运行可能出现 SmartScreen 的「Windows 已保护你的电脑」，点「更多信息」
+→「仍要运行」即可。想先核对再运行的话，下载目录里有 `SHA256SUMS`：
+
+```powershell
+Get-FileHash .\p4delta-<版本>-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+```
+
 ## 用法
 
-程序作为 P4V 的自定义工具运行。在 P4V 里打开 `Tools > Manage Custom Tools`，新建一个 Local Tool，按下表填写：
+程序作为 P4V 的自定义工具运行。安装脚本已经把它注册好了——重启 P4V，在工作区里右键一个目录，
+选菜单里的条目：
+
+- `p4delta Reconcile`：默认模式，等价于依次执行 "Reconcile Offline Work" 和 "Revert Unchanged"。
+- `p4delta Clean (preview)`：clean 模式的预演，只打印不动作。
+- `p4delta Clean (APPLY - irreversible)`：clean 模式的实际清理，**不可逆**，先看「clean 模式」
+  一节。这一条默认不注册（装的时候加 `-WithCleanApply`）。
+
+去掉 `-a` 就是预演（dry run）：照常扫描比对并打印结果，但不向 p4 应用任何变更。
+
+### 手工安装（备选）
+
+不用安装脚本的话，在 P4V 里打开 `Tools > Manage Custom Tools`，新建一个 Local Tool，按下表填写：
 
 | 字段 | 值 |
 | --- | --- |
 | Name | `p4delta`（只是菜单里的显示名，取什么都行） |
 | Placement | `Custom Tools` |
-| Application | release 目录下 `p4delta.exe` 的完整路径 |
+| Application | `p4delta.exe` 的完整路径（安装脚本用的是 `%LOCALAPPDATA%\Programs\p4delta\p4delta.exe`） |
 | Arguments | `-a -w $c -l %D` |
 | Start in | `$r` |
 | Add to applicable context menus | 勾选 |
@@ -43,10 +92,24 @@ P4V 里的 `Reconcile Offline Work` 慢得令人抓狂，本程序是它的替�
 
 Arguments 里的 `$c` 是 P4V 展开的当前 workspace，`%D` 是右键选中的目录，`$r` 是 client 根目录，原样照抄即可。
 
-- 去掉 `-a` 就是预演（dry run）：照常扫描比对并打印结果，但不向 p4 应用任何变更。
-- 想从 P4V 里清理工作区的话，再建一个自定义工具：Arguments 填 `--clean -w $c -l %D` 做预演，填 `-a --clean -w $c -l %D` 做实际清理。它的动作**不可逆**，先看「clean 模式」一节。
+想从 P4V 里清理工作区的话，再建一个自定义工具：Arguments 填 `--clean -w $c -l %D` 做预演，
+填 `-a --clean -w $c -l %D` 做实际清理。它的动作**不可逆**，先看「clean 模式」一节。
 
 配置完成后，在工作区里右键一个目录，选最下面的这个自定义工具。
+
+### p4 从哪来
+
+工具要调用 `p4`（命令行客户端），按这个顺序找：
+
+1. `P4_EXE` 环境变量。设了就以它为准；指向不存在的文件是配置错误，直接报错，不会回退到别的 p4。
+2. `PATH`。
+3. P4V 的安装目录（`%ProgramFiles%\Perforce`、`%ProgramFiles%\Perforce\DVCS`，x86 同理）。
+
+第 3 条是必要的兜底：P4V 的安装器把命令行客户端列为**可选组件**，没勾那一项的机器上 `PATH`
+里没有 p4。找不到时的报错会列出找过哪些地方。
+
+> `P4_EXE` 在 e2e 测试里还有另一层含义（指到不存在的路径等于强制跳过），与生产代码不同，
+> 见「开发与验证」。
 
 ### 非 ASCII 文件名
 
@@ -154,6 +217,20 @@ CI 以 `-D warnings` 为硬门禁，clippy 有任何警告都算失败。
 
 测试分三处：单元测试跟着被测代码放在各模块的 `#[cfg(test)] mod tests` 里，跨模块复用的测试基建在 `src/test_util.rs`；`tests/` 下是黑盒用例，通过进程边界观察，不引用 crate 内部符号；`tests/support/` 是 e2e 沙箱框架。
 
+安装脚本另有黑盒测试，不需要构建产物（它用一个人造 exe 复刻「从 release 包解压出来直接跑」的布局）：
+
+```powershell
+pwsh -File scripts/test-install.ps1        # 或 powershell -File ...
+```
+
+CI 用 Windows PowerShell 5.1 与 PowerShell 7 各跑一遍。两个脚本都**必须带 UTF-8 BOM**：5.1 对没有 BOM 的文件按系统 ANSI 代码页解析，里面的中文会全变乱码（`test-install.ps1` 有一条断言拦着）。
+
+发布脚本也有黑盒测试，它在一次性 git 仓库里真跑一遍改版本号、提交、打附注 tag、推送，只把 `cargo` 换成垫片：
+
+```bash
+bash scripts/test-release.sh
+```
+
 部分用例需要机器上有 `p4`（用来读 `.p4ignore`、跑真实 marshal 输出）。缺失时它们会打印一行 `skipping: p4 is not available` 后跳过，而不是静默通过——在 CI 日志里看到这一行，说明那次运行并没有覆盖到这些路径。
 
 ### e2e：真实 p4d 沙箱
@@ -169,6 +246,8 @@ bash scripts/fetch-p4-tools.sh
 ```
 
 探测顺序是 `vendor/` → `<target>/e2e/tools/` → P4V 的安装目录 → `PATH`；一个都找不到时打印一行 `skipping: p4d or p4 is not available` 后跳过，而不是静默通过。`P4D_EXE` / `P4_EXE` 可以直接指定二进制，指定了就以它为准：指到不存在的路径等于强制跳过（想跳过 e2e 只跑单元测试时好用），指到一个跑不起来的文件则直接失败——「这台机器没有 p4d」和「p4d 起不来」是两回事，后者不该被伪装成前者。
+
+这套探测与生产代码的 `src/locate.rs` 是**两套独立的实现**，刻意不合并：这里要的是配套的一对 p4 + p4d（客户端与服务端主版本必须匹配），顺序也相反（生产的 `PATH` 优先）。沙箱只往 `PATH` 里注入，走的是生产探测的第 2 步；`P4_EXE` 在两边含义不同——测试里指错是强制跳过，生产里是配置错误。
 
 **CI 上不允许跳过**：test job 设了 `P4_E2E_REQUIRED=1`，找不到 p4d/p4 时用例直接失败而不是跳过。光有 `fetch-p4-tools.sh` 的硬失败不够——那只保证下载没出错，保证不了二进制真的能用；靠 grep 日志也不行，`skipping:` 走的是 stderr，libtest 默认连同测试输出一起把它捕获了，根本不会出现在 CI 日志里。
 
@@ -192,6 +271,7 @@ src/
   lib.rs               pub fn run()，把各模块串起来
   cli.rs               命令行参数（clap derive）
   charset.rs           p4 输出字符集的解析、缓存与解码
+  locate.rs            p4 可执行文件的定位（P4_EXE → PATH → P4V 安装目录）
   model.rs             领域数据模型：depot 记录、工作区文件、摘要缓存
   path.rs              本地路径规范化与路径键
   cache.rs             摘要缓存的落盘（增量保存 + 临时文件改名）
@@ -211,22 +291,46 @@ src/
 tests/
   support/             e2e 沙箱框架：p4d 生命周期、数据库模板、环境隔离
   cli.rs               黑盒 CLI 测试（不起服务器，只覆盖参数解析与跳过路径）
-  e2e_open.rs          八类变更（10 个用例）
+  e2e_open.rs          八类变更（11 个用例）
   e2e_clean.rs         --clean 的三类动作（6 个用例）
   e2e_prune.rs         忽略目录剪枝（4 个用例）
   e2e_paths.rs         路径形式 / changelist / 缓存复用 / unmap（4 个用例）
   e2e_charset.rs       非 ASCII 文件名与输出契约（2 个用例）
+install.ps1            安装脚本：铺 exe + 注册 P4V 自定义工具
+scripts/
+  fetch-p4-tools.sh    下载 p4/p4d 到 vendor/（开发与 e2e 用）
+  release.sh           发布：改版本号 → 本地门禁 → 提交 → 打 tag → 推送
+  test-install.ps1     install.ps1 的黑盒测试
+  test-release.sh      release.sh 的黑盒测试
 ```
 
-依赖方向自下而上、无环：`cli` / `model` / `path` / `charset` 不依赖 crate 内其他模块；`p4/*` 依赖它们；`prune` / `workspace` / `cache` / `digest` 再往上一层；`reconcile/*` 在最上面。`lib.rs` 只做模块声明，不反向依赖任何模块。
+依赖方向自下而上、无环：`cli` / `model` / `path` / `charset` / `locate` 不依赖 crate 内其他模块；`p4/*` 依赖它们；`prune` / `workspace` / `cache` / `digest` 再往上一层；`reconcile/*` 在最上面。`lib.rs` 只做模块声明，不反向依赖任何模块。
 
 ## 发布检查清单
 
-1. 改 `Cargo.toml` 的 `version`（`--version` 输出的就是它）。
-2. 同步 `p4delta.exe.manifest` 里的 `version="X.Y.Z.0"`。这是 Win32 程序集版本，与 Cargo 的包版本是两套编号，无法自动同步，漏改不会导致构建失败，只会让文件属性里显示旧版本。
-3. `cargo test --all-targets --all-features`
-4. `cargo build --release`
-5. 在一个真实工作区跑 `-v -l`，确认输出与预期一致。
+1. 跑 `bash scripts/release.sh`。**不写版本号就自动升**：默认补丁号 +1（0.1.3 → 0.1.4），
+   升次版本号用 `--minor`（0.1.3 → 0.2.0），主版本号用 `--major`（0.1.3 → 1.0.0）；也可以
+   直接写死一个，`bash scripts/release.sh 0.2.0`。想先看一遍加 `--dry-run`。
+
+   它把版本号写进三处——`Cargo.toml` 的 `version`、`p4delta.exe.manifest` 的四段程序集版本、
+   `Cargo.lock` 里 `p4delta` 的条目——再跑一遍本地门禁（fmt / clippy / test），然后提交、
+   打附注 tag、推送。exe 里的 VERSIONINFO 由 `build.rs` 从 `Cargo.toml` 现算，不用管。门禁想
+   跳过用 `--skip-check`，只想在本地备好、暂不推送用 `--no-push`。
+
+   推之前它会先检查：工作区干净、当前在 `main` 上、新版本确实比当前大、tag 本地与远端都
+   不存在、本地不落后远端。任何一条不满足都当场拒绝——这些正是「推出去才发现」的坑，
+   而 tag 推出去就收不回来了（同一版本号不能发两次，自动升号也一样受这条约束）。
+
+   Git Bash 里直接跑就行；PowerShell 与 cmd 里也可以，只要 PATH 里的 `bash` 是 Git 自带的
+   那个（`where bash` 的第一条应当是 `...\Git\usr\bin\bash.exe`）。若第一条是
+   `C:\Windows\System32\bash.exe`，那是 WSL，脚本会在另一个文件系统视图里跑，不是你要的——
+   这种情况用绝对路径调 Git 自带的那个（路径随你的 Git 安装位置，默认在
+   `C:\Program Files\Git\bin\bash.exe`）：`& "<Git>\bin\bash.exe" scripts/release.sh`。
+2. 剩下的交给 `.github/workflows/release.yml`：复用 CI 当门禁，构建，断言产物里的版本与 tag
+   一致、CRT 是静态链接的，打包 zip 与 `SHA256SUMS`，建 release。盯进度用 `gh run watch`。
+3. release 建好后，在一台装了 P4V 的机器上核对一遍：从 zip 跑 `install.ps1` → 重启 P4V →
+   `Tools > Manage Tools` 里应出现对应条目 → 右键一个无关紧要的目录跑预演确认输出正常。
+   生成 XML 与 P4V 自己 `Export tools...` 的差异也在这里对（见「已知问题」里两条未经实测的选项）。
 
 ## 已知问题
 
@@ -238,3 +342,9 @@ tests/
 - `p4 clean -K`（抑制 ktext 关键字展开）没有暴露，clean 始终按 p4 的默认行为展开关键字。
 - `--clean` 与 `-c` 同时给出时 `-c` 被忽略（会打印一行告警）。
 - depot 路径里含 `#`、`%`、`@`、`*`，或以 `...` 结尾的文件名会被 p4 当成通配符解析，既有的转交路径和 clean 的还原规格都受影响。
+- 安装脚本写出的工具定义里，**「Run tool in terminal window」与「Ignore P4CONFIG files」两项没有对应元素**——
+  它们在 P4V 自定义工具 XML 里的元素名没查到官方文档，也没实测过，所以没有臆造。不勾「终端窗口」时
+  输出会进 P4V 自己的输出窗格，工具照常可用；确实需要这两项的话，在 `Manage Tools` 里手工补勾一次并
+  `Export tools...`，对照生成的文件把元素名补进 `install.ps1`。
+- 安装路径里含空格时（用户名带空格就会），`<Command>` 能否被 P4V 正确解析尚未实测。安装脚本会在
+  这时打印警告；真出问题就用 `-InstallDir` 换一个不含空格的目录。

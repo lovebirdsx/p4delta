@@ -12,8 +12,8 @@ pub struct Tools {
 }
 
 impl Tools {
-    /// p4 所在的目录。沙箱会把它插到 PATH 最前面，因为生产代码里
-    /// `Command::new("p4")` 是硬编码的，PATH 是唯一的注入点。
+    /// p4 所在的目录。沙箱会把它插到 PATH 最前面——生产代码的定位顺序是
+    /// `P4_EXE` → `PATH` → P4V 安装目录，插在最前就能让第 2 步稳定命中这一份。
     pub fn bin_dir(&self) -> PathBuf {
         self.p4
             .parent()
@@ -28,6 +28,12 @@ impl Tools {
 /// `P4D_EXE` / `P4_EXE` 是**独占**的：指定了就不再往下翻。否则设一个不存在的
 /// 路径仍然会去用系统安装的那一份，既违背意图，也让「强制跳过 e2e」
 /// （比如机器上的 p4d 版本不对）没有开关可用。
+///
+/// 与 `src/locate.rs` 是两套独立的实现，刻意不合并：这里要的是**配套的一对**
+/// p4 + p4d（客户端与服务端主版本必须匹配），顺序是 vendor/ → target/e2e/tools →
+/// P4V 目录 → PATH；生产只要 p4 一个，且 `PATH` 优先。合并只会为了共用函数堆参数。
+/// 两边对「`P4_EXE` 指到不存在的路径」也有不同处置：这里是强制跳过，
+/// 生产是配置错误（见 `locate::check_p4_exe_env`）。
 pub fn discover() -> Option<Tools> {
     let p4d = match env::var_os("P4D_EXE") {
         Some(path) => existing(PathBuf::from(path))?,

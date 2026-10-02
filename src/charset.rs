@@ -161,7 +161,13 @@ struct P4SetCharsets {
 /// Reads the charsets from `p4 set`. Values configured that way live in the registry rather
 /// than the environment, so `env::var` cannot see them.
 fn query_p4_set_charsets(cwd: &Path) -> P4SetCharsets {
-    let output = std::process::Command::new("p4")
+    // 定位不到 p4 与起不来是同一件事，都退回默认字符集——这里不该打断整轮，
+    // P4_EXE 配错由入口处的前置校验负责报出来。
+    let Ok(program) = crate::locate::p4_exe() else {
+        return P4SetCharsets::default();
+    };
+
+    let output = std::process::Command::new(program)
         .arg("set")
         .current_dir(cwd)
         // p4 会用继承来的 PWD 而不是真实 cwd 找配置文件，必须清掉。
@@ -320,7 +326,9 @@ pub(crate) fn parse_p4_set_value(text: &str, name: &str) -> Option<String> {
 /// 直接读环境变量会在配置被 .p4config 覆盖时拿到错误的值。
 /// （`p4 set` 也会打印只由环境变量提供的值，所以不需要再单独读环境变量。）
 pub(crate) fn query_p4_variable(cwd: &Path, name: &str) -> Option<String> {
-    let output = std::process::Command::new("p4")
+    let program = crate::locate::p4_exe().ok()?;
+
+    let output = std::process::Command::new(program)
         .arg("set")
         .current_dir(cwd)
         // p4 会用继承来的 PWD 而不是真实 cwd 找配置文件，必须清掉。

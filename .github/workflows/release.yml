@@ -1,0 +1,106 @@
+name: Release
+
+# 打一个 vX.Y.Z 的 tag 就发一版。版本号只有 Cargo.toml 一个来源，
+# p4delta.exe.manifest 与 VERSIONINFO 的副本分别由测试和 build.rs 管着，
+# 这里只负责断言 tag 与它们对得上。
+on:
+  push:
+    tags: ["v*"]
+
+# 默认只读，写权限单独给发布那一个 job。
+permissions:
+  contents: read
+
+jobs:
+  # tag 必须站在一次全绿上：直接把 ci.yml 的 fmt/clippy/test 当门禁复用一遍，
+  # 而不是指望「main 上那一次是绿的」这种记忆。代价是 tag 推送会再跑一遍三平台矩阵。
+  gate:
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    needs: gate
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 从 tag 构建，不是默认分支的 HEAD。
+          ref: ${{ github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 校验 tag 与 Cargo.toml 的版本一致
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "tag $tag 不是 vX.Y.Z 形式"
+          }
+          $version = $tag.Substring(1)
+
+          $declared = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($version -ne $declared) {
+            throw "tag $tag 与 Cargo.toml 的 version $declared 不一致"
+          }
+
+          "P4DELTA_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: 构建
+        # --locked 与 CI 一致：Cargo.lock 变了而没提交，这里就该红。
+        # 不要设 RUSTFLAGS：它会整份覆盖 .cargo/config.toml 里的 rustflags，
+        # 把静态 CRT 悄悄关掉（下面有断言兜着）。
+        run: cargo build --release --locked
+
+      - name: 校验产物
+        shell: pwsh
+        run: |
+          $exe = '.\target\release\p4delta.exe'
+          $expected = $env:P4DELTA_VERSION
+
+          $printed = (& $exe --version) -join ' '
+          if ($printed -notmatch [regex]::Escape($expected)) {
+            throw "--version 输出 '$printed'，与 tag $expected 不符"
+          }
+
+          $info = (Get-Item $exe).VersionInfo
+          if ($info.ProductVersion -notlike "$expected*") {
+            throw "VERSIONINFO ProductVersion '$($info.ProductVersion)' 与 tag $expected 不符"
+          }
+          if (-not $info.ProductName) {
+            throw "VERSIONINFO 里没有 ProductName，资源没嵌进去"
+          }
+
+          # +crt-static 生效时导入表里不该再出现 VCRUNTIME140；命中说明静态链接没生效，
+          # 目标机器没装 VC++ 可再发行组件就会起不来。不解析 PE，够用且零依赖。
+          $ascii = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $exe)))
+          if ($ascii.Contains('VCRUNTIME140')) {
+            throw "exe 仍动态链接 VCRUNTIME140.dll：.cargo/config.toml 的 +crt-static 没生效"
+          }
+
+      - name: 打包
+        shell: pwsh
+        run: |
+          $name = "p4delta-$env:P4DELTA_VERSION-x86_64-pc-windows-msvc"
+          $stage = "stage/$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          # 四个文件平铺在 zip 根：解压出来直接 .\install.ps1。
+          Copy-Item target/release/p4delta.exe, install.ps1, README.md, LICENSE $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "stage/$name.zip"
+
+          $hash = (Get-FileHash "stage/$name.zip" -Algorithm SHA256).Hash
+          "$hash *$name.zip" | Set-Content -Path SHA256SUMS -Encoding ascii
+          "P4DELTA_ARCHIVE=stage/$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: 发布
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # --verify-tag：tag 不在远端就拒绝发，防手滑。
+          # 自动生成的 release notes 是英文的；想手写中文说明就换成 --notes-file。
+          gh release create $env:GITHUB_REF_NAME `
+            --title $env:GITHUB_REF_NAME `
+            --verify-tag `
+            --generate-notes `
+            $env:P4DELTA_ARCHIVE SHA256SUMS

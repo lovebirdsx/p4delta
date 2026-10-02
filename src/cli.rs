@@ -79,4 +79,18 @@ mod tests {
         let without_flag = Options::parse_from(["p4delta", "-w", "ws"]);
         assert!(!without_flag.no_prune_ignored_dirs);
     }
+
+    /// `p4delta.exe.manifest` 的程序集版本是仓库里唯一没法自动生成的一处版本号
+    /// （VERSIONINFO 走 build.rs 注入，XML 属性不行）。这条用例把它变成门禁：
+    /// 漏改即失败，而不是等到有人翻开 exe 属性页才发现那是旧版本。
+    #[test]
+    fn manifest_assembly_version_matches_the_crate_version() {
+        let manifest = include_str!("../p4delta.exe.manifest");
+        let expected = format!("version=\"{}.0\"", env!("CARGO_PKG_VERSION"));
+
+        assert!(
+            manifest.contains(&expected),
+            "p4delta.exe.manifest 里需要 {expected}"
+        );
+    }
 }

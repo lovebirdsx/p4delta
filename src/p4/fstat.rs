@@ -122,7 +122,10 @@ pub(crate) async fn run_p4_fstat_slice(
 ) -> Result<Vec<DepotFileRecord>> {
     // 路径从 stdin 走：补查传的是 depot 路径，里面同样可能有非 ASCII 字符名，
     // 挂在命令行上会被 Windows 的 ANSI 代码页转换吃掉（见 [`build_p4_command`]）。
+    // 定位不到 p4 在这里是硬失败：fstat 是整轮比对的第一步，没有它后面什么都做不了，
+    // 与下面 `spawn()?` 对启动失败的态度一致（`strict` 只管 p4 的**退出状态**）。
     let (mut cmd, payload) = build_p4_command(
+        crate::locate::p4_exe()?,
         work_dir,
         fstat_args,
         paths,

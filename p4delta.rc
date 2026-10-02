@@ -1,2 +1,36 @@
 #define RT_MANIFEST 24
 1 RT_MANIFEST "p4delta.exe.manifest"
+
+// 版本号由 build.rs 从 Cargo.toml 注入（VER_FILE 是四段数字，VER_STRING 是字符串），
+// 这里不写死——写死就又成了一处需要手工同步的副本。
+//
+// 这里必须写 `1` 而不是常见的 `VS_VERSION_INFO`：后者是 winver.h 里的宏（值就是 1），
+// 不 include 那个头文件时它会被当成字面量**资源名**，而 Windows 的版本 API 只认 ID 为 1
+// 的 RT_VERSION——资源照样在 exe 里、结构也合法，但属性页和 FileVersionInfo 一律读不到。
+1 VERSIONINFO
+ FILEVERSION VER_FILE
+ PRODUCTVERSION VER_FILE
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "FileDescription", "A fast replacement for P4V's Reconcile Offline Work\0"
+      VALUE "FileVersion", VER_STRING
+      VALUE "InternalName", "p4delta\0"
+      VALUE "LegalCopyright", "MIT License\0"
+      VALUE "OriginalFilename", "p4delta.exe\0"
+      VALUE "ProductName", "p4delta\0"
+      VALUE "ProductVersion", VER_STRING
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

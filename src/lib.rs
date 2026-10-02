@@ -19,6 +19,7 @@ mod cache;
 mod charset;
 mod cli;
 mod digest;
+mod locate;
 mod model;
 mod p4;
 mod path;
@@ -31,6 +32,7 @@ mod test_util;
 
 use crate::cache::{CacheWriter, save_cache};
 use crate::charset::init_p4_encoding;
+use crate::locate::check_p4_exe_env;
 use crate::model::WorkspaceCache;
 use crate::p4::process::run_p4_command_slice;
 use crate::path::{absolute_local_path, normalize_local_path_owned, strip_depot_wildcard_suffix};
@@ -45,6 +47,10 @@ pub(crate) const READ_BUFFER_SIZE: usize = 128 * 1024;
 /// 参数由调用方（二进制入口）解析后传入，这样库本身不依赖进程级的参数解析。
 pub fn run(mut options: Options) -> Result<()> {
     let start_time = Instant::now();
+
+    // 配置错误要在任何输出之前报出来。只校验 P4_EXE 设了的那种情况：
+    // 「这台机器没有 p4」由各个调用点的 strict / lenient 策略分别处理。
+    check_p4_exe_env()?;
 
     // Resolve the charset p4 writes its output in before anything reads that output.
     // Probing from inside the workspace lets a P4CHARSET defined in its .p4config take effect.

@@ -36,3 +36,10 @@ embed-resource = "2.5"
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+
+[profile.release]
+# 发布的是单个 exe：LTO 与单 codegen unit 换体积和运行速度。strip 只去 debuginfo，
+# 不去符号表——anyhow 的 backtrace 还要靠函数名，出问题时用户才能给出可读的调用栈。
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

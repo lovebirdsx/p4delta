@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<!-- 注意：这里的 version 是 Win32 程序集版本，与 Cargo.toml 的 version 是两套
-     编号，无法自动同步（package version 是 "0.1.3"，这里是四段的 "0.1.3.0"）。
-     发版时请按 README 的发布检查清单手工同步，漏改不会导致构建失败。 -->
+<!-- 注意：这里的 version 是 Win32 程序集版本，与 Cargo.toml 的 version 是两套编号
+     （包版本是 "X.Y.Z"，这里是四段的 "X.Y.Z.0"）。XML 属性注入不了 C 宏，所以这一份
+     不像 VERSIONINFO 那样能自动生成，改 Cargo.toml 的 version 时要手工同步。漏改由
+     src/cli.rs 的 manifest_assembly_version_matches_the_crate_version 拦下。 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
     type="win32"
