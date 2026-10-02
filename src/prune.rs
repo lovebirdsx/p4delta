@@ -415,6 +415,7 @@ mod tests {
     use clap::Parser;
 
     use crate::charset::parse_p4_set_value;
+    use crate::p4::process::command_line_safe;
     #[test]
     fn pruned_ancestors_are_found_by_component() {
         let sep = std::path::MAIN_SEPARATOR;
@@ -654,6 +655,10 @@ mod tests {
     }
 
     /// 用真实 p4 查询哪些路径被忽略；p4 不存在时返回 None 让调用方跳过。
+    ///
+    /// 路径先过 [`command_line_ready_paths`]：`p4 ignores` 不认 `-x`，路径只能挂在命令行上，
+    /// 生产会把送不进命令行的那些挑掉（见 `src/p4/process.rs` 里那段说明）。这里照做，
+    /// 否则用例会去断言一个生产根本不会发出的请求。
     fn p4_ignored_paths(
         root: &Path,
         paths: &[PathBuf],
@@ -663,8 +668,9 @@ mod tests {
             .iter()
             .map(|path| path.display().to_string())
             .collect();
+        let ready = command_line_ready_paths(&path_strings);
         let mut args: Vec<&str> = vec!["ignores", "-i"];
-        args.extend(path_strings.iter().map(String::as_str));
+        args.extend(ready.iter().map(String::as_str));
 
         let output = p4_output(root, &args, env)?;
 
@@ -699,16 +705,21 @@ mod tests {
     #[test]
     fn real_p4_agrees_on_directory_and_file_level_judgment() {
         let tree = TempTree::new("dir-ignores");
-        tree.file(".p4ignore", "node_modules/\n*.log\n空格 目录/\n");
+        tree.file(
+            ".p4ignore",
+            "node_modules/\n*.log\nsp ace dir/\n空格 目录/\n",
+        );
         tree.dir("node_modules/sub");
         tree.dir("node_modules2");
         tree.dir("src");
+        tree.dir("sp ace dir");
         tree.dir("空格 目录");
 
         let node_modules = tree.dir("node_modules");
         let node_modules2 = tree.dir("node_modules2");
         let src = tree.dir("src");
-        let space_dir = tree.dir("空格 目录");
+        let spaced = tree.dir("sp ace dir");
+        let unreadable = tree.dir("空格 目录");
 
         let Some(ignored) = p4_ignored_paths(
             &tree.root,
@@ -717,8 +728,10 @@ mod tests {
                 ignore_probe_path(&node_modules.display().to_string()).into(),
                 node_modules2.clone(),
                 src.clone(),
-                space_dir.clone(),
-                ignore_probe_path(&space_dir.display().to_string()).into(),
+                spaced.clone(),
+                ignore_probe_path(&spaced.display().to_string()).into(),
+                unreadable.clone(),
+                ignore_probe_path(&unreadable.display().to_string()).into(),
             ],
             &TEST_P4_ENV,
         ) else {
@@ -738,11 +751,28 @@ mod tests {
         // 没被规则覆盖的目录不参与剪枝
         assert!(!ignored.contains(&local_path_key(&src.display().to_string())));
 
-        // 带空格的路径同样按目录级判断
-        assert!(ignored.contains(&local_path_key(&space_dir.display().to_string())));
+        // 名字里带空格的目录同样按目录级判断——规则里的空格是名字的一部分，不是分隔符
+        assert!(ignored.contains(&local_path_key(&spaced.display().to_string())));
         assert!(ignored.contains(&local_path_key(&ignore_probe_path(
-            &space_dir.display().to_string()
+            &spaced.display().to_string()
         ))));
+
+        // 非 ASCII 的目录名在 Windows 上送不进 p4 的命令行（生产的
+        // `command_line_ready_paths` 会把它挑掉，见 `src/p4/process.rs`），那时它只能保守地
+        // 按「未被忽略」处理；Unix 上没有这道转换，必须命中。
+        let key = local_path_key(&unreadable.display().to_string());
+        let probe = local_path_key(&ignore_probe_path(&unreadable.display().to_string()));
+        let sendable = command_line_safe(&unreadable.display().to_string());
+        assert_eq!(
+            ignored.contains(&key),
+            sendable,
+            "{unreadable:?} 的判断与可送性不符"
+        );
+        assert_eq!(
+            ignored.contains(&probe),
+            sendable,
+            "{unreadable:?} 的判断与可送性不符"
+        );
     }
 
     #[test]
