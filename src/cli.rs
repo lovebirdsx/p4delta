@@ -3,7 +3,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-// 版本号取自 Cargo.toml，不再手写副本，见 README 的发布检查清单。
+// 版本号取自 Cargo.toml，不再手写副本，见 CONTRIBUTING.md 的发布检查清单。
 #[command(version)]
 pub struct Options {
     /// The workspace to use. If not set, will try to use P4CLIENT. If that is also not set, will try the default one.
