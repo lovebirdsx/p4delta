@@ -64,6 +64,10 @@ jobs:
       - name: Run tests
         env:
           P4_E2E_REQUIRED: "1"
+          # p4 只落在 vendor/，既不在 runner 的 PATH 也不在 P4V 安装目录，不指给它，
+          # src/test_util.rs 的 p4_available() 就会让依赖真实 p4 的单测一路静默跳过——
+          # 一场绿色的空跑。后缀跟着平台走，只有 Windows 的二进制带 .exe。
+          P4_EXE: ${{ github.workspace }}/vendor/p4${{ runner.os == 'Windows' && '.exe' || '' }}
         run: cargo test --all-targets --all-features --locked
 
   # 安装脚本的黑盒测试：把 install.ps1 与一个人造 exe 拷进临时目录再跑，

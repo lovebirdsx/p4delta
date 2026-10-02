@@ -82,17 +82,33 @@ pub(crate) const TEST_P4_ENV: [(&str, &str); 2] = [
     ("P4IGNORE", P4IGNORE_FILE_NAME),
 ];
 
+/// 「这台机器上没有 p4」的统一出口。调用方据此打印一行 `skipping:` 后跳过；
+/// 设了 `P4_E2E_REQUIRED` 则是失败——与 `tests/support/mod.rs` 的 `sandbox_or_skip`
+/// 同一套约定：CI 靠它把「p4 没到位、这些用例整段没跑」变成红色，而不是一场绿色的
+/// 空跑。靠日志抓不到这件事：`skipping:` 走 stderr，而 libtest 默认捕获测试的输出，
+/// 它压根不会出现在 CI 日志里。
+fn no_p4() {
+    assert!(
+        env::var_os("P4_E2E_REQUIRED").is_none(),
+        "P4_E2E_REQUIRED is set but p4 is not available"
+    );
+}
+
 /// 运行 p4 子进程。只有 p4 不存在才返回 None 让调用方跳过；
 /// 其他启动错误一律失败，不能把真实的 p4 问题伪装成「环境不支持」。
 ///
 /// 定位走生产代码那一套（`P4_EXE` → `PATH` → P4V 安装目录）：装了 P4V 但 p4 没进
-/// `PATH` 的机器上这些用例照样能真跑，而不是无声地跳过。
+/// `PATH` 的机器上这些用例照样能真跑，而不是无声地跳过。CI 上没有 P4V 安装目录，
+/// 由 ci.yml 把 `P4_EXE` 指向 vendor/ 里那一份。
 pub(crate) fn p4_output(
     root: &Path,
     args: &[&str],
     env: &[(&str, &str)],
 ) -> Option<std::process::Output> {
-    let program = crate::locate::p4_exe().ok()?;
+    let Ok(program) = crate::locate::p4_exe() else {
+        no_p4();
+        return None;
+    };
 
     match std::process::Command::new(program)
         .args(args)
@@ -103,20 +119,28 @@ pub(crate) fn p4_output(
         .output()
     {
         Ok(output) => Some(output),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            no_p4();
+            None
+        }
         Err(error) => panic!("p4 {} could not be started: {error}", args.join(" ")),
     }
 }
 
-/// p4 是否可用。不可用时测试显式跳过并打印一行说明，而不是静默通过。
+/// p4 是否可用。不可用时测试显式跳过并打印一行说明，而不是静默通过；
+/// 设了 `P4_E2E_REQUIRED` 时跳过本身即失败，见 [`no_p4`]。
 pub(crate) fn p4_available() -> bool {
     let Ok(program) = crate::locate::p4_exe() else {
+        no_p4();
         return false;
     };
 
     match std::process::Command::new(program).arg("-V").output() {
         Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            no_p4();
+            false
+        }
         Err(error) => panic!("p4 -V could not be started: {error}"),
     }
 }
