@@ -162,7 +162,7 @@ else
 fi
 
 # 上一版漏同步 manifest 的话，这里先拦住：脚本会把它改成新版本号，等于把错误悄悄
-# 抹平，而 manifest 的 version 本来该由 cargo test 里的用例盯着。
+# 抹平，而 manifest 的 version 本来该由测试里的用例盯着。
 grep -qF "version=\"$current.0\"" p4delta.exe.manifest ||
   die "p4delta.exe.manifest 的版本与 Cargo.toml 的 $current 对不上，先把上一版漏掉的同步补上"
 
@@ -228,7 +228,7 @@ else
   step '本地门禁'
   cargo fmt --all -- --check
   cargo clippy --all-targets --all-features --locked -- -D warnings
-  cargo test --all-targets --all-features --locked
+  cargo nextest run --all-targets --all-features --locked
   printf '    （机器上没有 p4/p4d 时 e2e 会自己跳过；CI 上不跳，那边设了 P4_E2E_REQUIRED）\n'
 fi
 

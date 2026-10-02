@@ -7,10 +7,20 @@
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo nextest run --all-targets --all-features
 ```
 
 CI 以 `-D warnings` 为硬门禁，clippy 有任何警告都算失败。
+
+测试跑的是 cargo-nextest 而不是 `cargo test`：cargo 逐个测试二进制**串行**执行，五个 e2e 二进制就是五轮；nextest 把所有目标的用例放进同一个调度池，并发度默认等于 CPU 数。装一份：
+
+```powershell
+cargo install cargo-nextest --locked     # 或者用 nexte.st 上的预编译包，快得多
+```
+
+`.config/nextest.toml` 里配了三条，理由写在文件内注释里：不 fail-fast（一次把失败跑全，而不是首个失败就跳过后面所有）、不重试（不靠重试掩盖 flake）、单用例 180 秒硬超时（nextest 默认只把超时的用例标记为「慢」，不终止进程）。
+
+两点与 `cargo test` 的差别要知道：nextest **不跑 doctest**（本项目目前没有真的 doctest，唯一的文档代码块是 text 类型的；将来真加了要另外补 `cargo test --doc`）；nextest 默认**隐藏通过用例的输出**，`skipping:` 那类提示只在你显式 `--no-capture` 或用例失败时才看得见。
 
 测试分三处：单元测试跟着被测代码放在各模块的 `#[cfg(test)] mod tests` 里，跨模块复用的测试基建在 `src/test_util.rs`；`tests/` 下是黑盒用例，通过进程边界观察，不引用 crate 内部符号；`tests/support/` 是 e2e 沙箱框架。
 
@@ -52,11 +62,11 @@ bash scripts/test-release.sh
 
 ### e2e：真实 p4d 沙箱
 
-`tests/e2e_*.rs` 为每个用例起一个独立的 p4d 实例，在真服务器上跑完整流程——八类变更、`--clean` 的三类动作、忽略目录剪枝、client view 排除、字符集、缓存复用。数据库模板只生成一次（`<target>/e2e/template/`），之后每个实例从模板复制，所以单个用例的开销在百毫秒级。
+`tests/e2e_*.rs` 为每个用例起一个独立的 p4d 实例，在真服务器上跑完整流程——八类变更、`--clean` 的三类动作、忽略目录剪枝、client view 排除、字符集、缓存复用。数据库模板只生成一次（`<target>/e2e/template-<指纹>/`），之后每个实例从模板复制，所以单个用例的开销在百毫秒级。
 
 ```bash
 # 机器上已经有 p4d（比如随 P4V 装的）就能直接跑
-cargo test --all-targets --all-features
+cargo nextest run --all-targets --all-features
 
 # 没有的话，下载一份带校验的到 vendor/（CI 走的就是这条路）
 bash scripts/fetch-p4-tools.sh
@@ -71,12 +81,18 @@ bash scripts/fetch-p4-tools.sh
 沙箱给被测程序的环境里没有任何继承来的 `P4*` 变量（免得连上你自己的服务器），路径形式的摘要缓存也被圈进实例目录。出问题时用 `P4_KEEP_SANDBOX=1` 保留现场：
 
 ```bash
-P4_KEEP_SANDBOX=1 cargo test --test e2e_open an_edited_file -- --nocapture
+P4_KEEP_SANDBOX=1 cargo nextest run -E 'test(an_edited_file)' --no-capture
 ```
+
+`-E 'test(...)'` 是按用例名过滤的 filterset（子串匹配，不绑模块路径）；`--no-capture` 让 nextest 串行执行并原样透传输出——保留现场的那几行提示走的是 stderr，不关掉捕获就看不到。
 
 退出时会把实例目录、端口和复核命令一起打出来。**服务器保持运行**——杀掉的话打印出来的端口就是个死端口，现场也就没法看了；代价是复核完要自己停掉它（命令也在提示里）。
 
+Windows 上另有一条：**别把这条命令的输出接进管道**（`| tee`、`| tail` 之类）。保留下来的 p4d 会继承管道的写端句柄，它不退出，管道就永远读不到 EOF，命令一直挂着——看起来像测试卡死，其实进程早就跑完了。要留日志就重定向到文件（`> log.txt`）。
+
 实例目录在 `<target>/e2e/instances/` 下，随 `cargo clean` 一起清掉。数据库模板在 `<target>/e2e/template-<指纹>/`：指纹由 p4d 的身份和种子版本算出，所以模板是**只发布、不修改**的，换了 p4d 或改了种子只会多出一个新目录，旧的留在原地——删掉一个正被别的进程读着的模板，会让它复制到一半就没东西可读，这比多占几十 KB 糟得多。
+
+nextest 是 process-per-test，与「逐个二进制串行」的 cargo 不同：冷缓存时（`cargo clean` 之后，或换了 p4d、改了种子）多个进程会同时走到 `ensure_template` 的「各建各的 staging、抢 rename」那条路径上。正确性由 rename 的原子性保证，模板只可能被发布一次；代价是种子会被重复跑几遍，只影响那一次冷跑。热缓存下是一次毫秒级的 stamp 命中。
 
 clean 模式的三类动作（删未跟踪文件、还原改动、写回缺失文件）在 `tests/e2e_clean.rs` 里对着真实服务器验证过，断言同时落在磁盘内容与 `p4 opened` 上，「已打开的文件不归 clean 管」也有一条专门的用例。仍未自动化的是与 `p4 clean -n` 的逐文件对照——拿它的文件集合与 `--clean -l` 的清单比对，三类动作应当一一对应。
 
@@ -110,7 +126,7 @@ tests/
   cli.rs               黑盒 CLI 测试（不起服务器，只覆盖参数解析与跳过路径）
   e2e_open.rs          八类变更（11 个用例）
   e2e_clean.rs         --clean 的三类动作（6 个用例）
-  e2e_prune.rs         忽略目录剪枝（4 个用例）
+  e2e_prune.rs         忽略目录剪枝（6 个用例）
   e2e_paths.rs         路径形式 / changelist / 缓存复用 / unmap（4 个用例）
   e2e_charset.rs       非 ASCII 文件名与输出契约（2 个用例）
 install.ps1            安装脚本：铺 exe + 注册 P4V 自定义工具

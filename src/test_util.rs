@@ -85,8 +85,8 @@ pub(crate) const TEST_P4_ENV: [(&str, &str); 2] = [
 /// 「这台机器上没有 p4」的统一出口。调用方据此打印一行 `skipping:` 后跳过；
 /// 设了 `P4_E2E_REQUIRED` 则是失败——与 `tests/support/mod.rs` 的 `sandbox_or_skip`
 /// 同一套约定：CI 靠它把「p4 没到位、这些用例整段没跑」变成红色，而不是一场绿色的
-/// 空跑。靠日志抓不到这件事：`skipping:` 走 stderr，而 libtest 默认捕获测试的输出，
-/// 它压根不会出现在 CI 日志里。
+/// 空跑。靠日志抓不到这件事：`skipping:` 走 stderr，而测试框架默认捕获用例的输出
+/// （libtest 与 nextest 都是），它压根不会出现在 CI 日志里。
 fn no_p4() {
     assert!(
         env::var_os("P4_E2E_REQUIRED").is_none(),

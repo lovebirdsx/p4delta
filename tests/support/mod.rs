@@ -41,8 +41,8 @@ use tools::Tools;
 ///
 /// 设了 `P4_E2E_REQUIRED` 就连「没有 p4d」也不许跳过。CI 用它把
 /// 「下载失败导致 e2e 整段没跑」变成一个红色的失败，而不是一次绿色的空跑。
-/// 靠 grep 日志做不到这件事：那行 `skipping:` 走的是 stderr，而 libtest
-/// 默认捕获测试的输出，它压根不会出现在 CI 日志里。
+/// 靠 grep 日志做不到这件事：那行 `skipping:` 走的是 stderr，而测试框架默认
+/// 会捕获用例的输出（libtest 与 nextest 都是），它压根不会出现在 CI 日志里。
 pub fn sandbox_or_skip() -> Option<Sandbox> {
     match Sandbox::start() {
         Some(sandbox) => Some(sandbox),

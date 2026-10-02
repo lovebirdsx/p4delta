@@ -123,7 +123,7 @@ function test_releases {
   # 门禁三条命令都跑过，而且 Cargo.lock 是走 cargo 刷新的
   assert_contains 'fmt --all -- --check' "$log" '门禁应当跑 fmt'
   assert_contains 'clippy --all-targets' "$log" '门禁应当跑 clippy'
-  assert_contains 'test --all-targets' "$log" '门禁应当跑 test'
+  assert_contains 'nextest run --all-targets' "$log" '门禁应当跑 test'
   assert_contains 'update --workspace' "$log" '应当刷新 Cargo.lock'
 
   # 提交只含那三个文件
@@ -203,7 +203,7 @@ function test_skip_check_skips_the_gate {
 
   run 9.9.9 --skip-check --yes || fail "发布失败（退出码 $?）：$(cat "$err")"
 
-  if grep -qE '^(fmt|clippy|test) ' "$log"; then
+  if grep -qE '^(fmt|clippy|nextest run|test) ' "$log"; then
     fail "--skip-check 不该跑门禁，实际调用：$(cat "$log")"
   fi
   assert_contains 'update --workspace' "$log" '--skip-check 不该连 Cargo.lock 的刷新一起跳过'

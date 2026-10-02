@@ -57,6 +57,10 @@ jobs:
       - name: Install p4 and p4d
         shell: bash
         run: bash scripts/fetch-p4-tools.sh
+      # nextest 而不是 cargo test：cargo 逐个测试二进制串行执行，五个 e2e 二进制
+      # 就是五轮；nextest 把所有目标的用例放进同一个调度池。行为差异与各项配置
+      # 见 .config/nextest.toml。装的是预编译包，不在 CI 上现编一遍。
+      - uses: taiki-e/install-action@nextest
       # 找不到 p4d 时 e2e 会打印一行 skipping 后整段跳过，测试仍然全绿——
       # 那是个「什么都没验证」的成功。安装脚本失败已经会让 job 红，但那只
       # 保证下载没出错，保证不了二进制真的能用。P4_E2E_REQUIRED 补上这道防线：
@@ -68,7 +72,7 @@ jobs:
           # src/test_util.rs 的 p4_available() 就会让依赖真实 p4 的单测一路静默跳过——
           # 一场绿色的空跑。后缀跟着平台走，只有 Windows 的二进制带 .exe。
           P4_EXE: ${{ github.workspace }}/vendor/p4${{ runner.os == 'Windows' && '.exe' || '' }}
-        run: cargo test --all-targets --all-features --locked
+        run: cargo nextest run --all-targets --all-features --locked
 
   # 安装脚本的黑盒测试：把 install.ps1 与一个人造 exe 拷进临时目录再跑，
   # 断言生成的 customtools.xml 与幂等/卸载行为。不需要构建产物，所以独立于 test。

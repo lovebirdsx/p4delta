@@ -37,6 +37,12 @@ embed-resource = "2.5"
 assert_cmd = "2"
 predicates = "3"
 
+[profile.dev]
+# 默认的 debug = 2 让每个测试二进制的 .pdb 涨到 15–18MB，链接是构建时间的大头。
+# line-tables-only 保住 anyhow backtrace 要用的文件名与行号，体积和链接时间都大幅下降。
+# test profile 继承 dev，所以这一条对 cargo test / cargo nextest 同样生效。
+debug = "line-tables-only"
+
 [profile.release]
 # 发布的是单个 exe：LTO 与单 codegen unit 换体积和运行速度。strip 只去 debuginfo，
 # 不去符号表——anyhow 的 backtrace 还要靠函数名，出问题时用户才能给出可读的调用栈。

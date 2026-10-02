@@ -1,0 +1,25 @@
+# cargo-nextest 的仓库配置：`cargo nextest run` 自动读取，`cargo test` 不认这个文件。
+#
+# 换掉 `cargo test` 的动机是并行度：cargo 逐个测试二进制**串行**执行，五个 e2e
+# 二进制就是五轮；nextest 把所有目标的用例放进同一个调度池，默认并发度等于 CPU 数。
+# 代价是 nextest 不跑 doctest——本项目目前没有真的 doctest（唯一的代码块是 text
+# 类型的），将来真加了要另外补一条 `cargo test --doc`。
+
+[profile.default]
+# cargo 与 nextest 默认都是「首个失败就停」。cargo 那边是后续二进制整个不跑、
+# 日志里看不出来；nextest 会打一行取消提示、把没跑的算成 skipped，比 cargo 透明，
+# 但一次把失败跑全仍然更省事。
+fail-fast = false
+
+# 显式写出默认值：不靠重试掩盖 flake 是刻意的。e2e 的偶发失败（端口被抢、
+# Windows 上文件句柄释放慢）沙箱自己已经兜过一轮，这里再加一层只会把真实的竞态藏起来。
+retries = 0
+
+# nextest 的 slow-timeout 默认只把超时的用例标记为「慢」、**不终止**，等于没有硬上限；
+# p4d 真卡住会把 CI 一路挂到 job 上限——那是个「没有结果」，远不如一个失败来得有用。
+# 加上 terminate-after：60 秒标记为慢，从用例启动算满三个周期（180 秒）就终止
+# （Unix 上还会给 10 秒宽限期才强杀）。
+#
+# 被杀意味着进程跑不到 Drop，实例目录会留在 target/e2e/instances/ 下（名字带 pid，
+# 不会和别的实例撞上）。真遇到超时，顺手确认一下有没有残留的 p4d 再收掉。
+slow-timeout = { period = "60s", terminate-after = 3 }
