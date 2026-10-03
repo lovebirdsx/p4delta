@@ -266,6 +266,171 @@ fn to_a_changelist_pulls_the_state_at_that_changelist() {
     assert!(sandbox.opened().is_empty());
 }
 
+/// `--to <CL>` 钉住的是**目标那一版**，不是「往回退一把」：have 比目标旧时，要往前拉到
+/// 目标那一版，而不是顺手拉到 head。
+///
+/// head / have / 目标三者互不相同只有这一种形状（have 更旧、head 更新），而它正是
+/// 「钉住的确实是目标那一版」最直接的证据——拉成 head 的话两个版本号都对不上。
+#[test]
+fn to_a_changelist_pulls_forward_to_that_revision_not_to_head() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // 三个版本，一个比一个新：目标夹在中间。
+    sandbox.commit("a.txt", "first version\n");
+    sandbox.p4_ok(&["edit", "a.txt"]);
+    sandbox.write("a.txt", "second version\n");
+    sandbox.p4_ok(&["submit", "-d", "second version"]);
+    let target = latest_submitted(&sandbox);
+
+    sandbox.p4_ok(&["edit", "a.txt"]);
+    sandbox.write("a.txt", "third version\n");
+    sandbox.p4_ok(&["submit", "-d", "third version"]);
+
+    // 把 have 与本地都退回第一版：下面要往前拉，但只该拉到目标那一版。
+    sandbox.p4_ok(&["sync", "//depot/main/a.txt#1"]);
+    let before = sandbox.p4_ok(&["fstat", "-T", "headRev haveRev", "a.txt"]);
+    assert!(
+        before.contains("headRev 3") && before.contains("haveRev 1"),
+        "unexpected depot state: {before}"
+    );
+
+    sandbox
+        .cli()
+        .args(["--sync", "--to", &target.to_string(), "-a", "-l"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Updating 1 files"))
+        // 目标之后提交的版本不该被拉下来；目标时刻就在库的文件也不该进删除组。
+        .stdout(predicate::str::contains("Deleting").not());
+
+    // 独立取证：have 停在目标那一版，head 没动，磁盘上是第二版。
+    let after = sandbox.p4_ok(&["fstat", "-T", "headRev haveRev", "a.txt"]);
+    assert!(
+        after.contains("headRev 3"),
+        "depot 的 head 不该被动过：{after}"
+    );
+    assert!(
+        after.contains("haveRev 2"),
+        "have 该停在目标 CL 的那一版：{after}"
+    );
+    assert_eq!(sandbox.read("a.txt"), "second version\n");
+    assert!(sandbox.opened().is_empty());
+}
+
+/// 空目标护栏：限定的目录里有跟踪文件，而选定的 CL 早于这个目录的出现——那个时刻目录里
+/// 一件东西都没有，分析层的结论会是「把本地每一个被跟踪的文件都删掉」。
+///
+/// 这个结论不该被静默执行：工具在动手之前就拒绝（`src/reconcile/mod.rs` 里那条护栏），
+/// 磁盘、have、opened 三处都不许动。
+#[test]
+fn a_target_changelist_that_predates_the_folder_is_refused() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // 目标取种子的那份已提交 CL：真实有效（是 p4 分配出来的号），只是早于下面这个子目录。
+    // 不写死编号——种子里多提交一次，写死的号就会指到别处去。
+    let before_the_subdir = latest_submitted(&sandbox);
+
+    // 限定目录：子目录里有跟踪文件，护栏的两个条件才凑得齐（depot 有记录、目标为空）。
+    sandbox.commit("sub/only.txt", "in the subdirectory\n");
+
+    // 前提，独立取证：head 侧有这个文件，而目标 CL 时刻还查不到它。
+    let head = sandbox.p4_ok(&["fstat", "-T", "headRev", "sub/only.txt"]);
+    assert!(head.contains("headRev 1"), "unexpected depot state: {head}");
+    let target_spec = format!("sub/...@{before_the_subdir}");
+    let at_target = sandbox.p4_lines(&["fstat", "-Rc", "-T", "depotFile", &target_spec]);
+    assert!(
+        at_target.is_empty(),
+        "目标 CL 时刻子目录里还没有东西，护栏的前提才成立：{at_target:?}"
+    );
+
+    let output = sandbox
+        .cli()
+        .args(["--sync", "--to", &before_the_subdir.to_string(), "-a", "-l"])
+        .arg("sub")
+        .output()
+        .expect("run the tool");
+
+    assert!(!output.status.success(), "空目标必须被拒绝：{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "Changelist {before_the_subdir} has no files in this client's view"
+        )),
+        "{stderr}"
+    );
+    // 护栏的理由：照着这个目标做会删掉本地每一个被跟踪的文件——这里恰好一个。
+    assert!(
+        stderr.contains("would delete all 1 local files this client tracks"),
+        "{stderr}"
+    );
+
+    // 拒绝发生在动作之前：磁盘、have、opened 三处都不许动。
+    assert_eq!(sandbox.read("sub/only.txt"), "in the subdirectory\n");
+    assert_eq!(
+        sandbox.p4_lines(&["have", "sub/only.txt"]).len(),
+        1,
+        "have 记录不该被清掉"
+    );
+    assert!(sandbox.opened().is_empty());
+}
+
+/// `--to` 给一个超过 head 的 CL：p4 把「大于任何已提交 CL 的 N」当成不设限，目标是 head
+/// 状态而不是空目标——护栏不该被它误触发。
+///
+/// 这是护栏的另一半：它挡的是「目标时刻真的什么都没有」，不是「目标号看着离谱」。真被
+/// 误触发的话，一个手打大了的号会让工具拒绝干活，而用户只看到一句「Pick a later
+/// changelist」。
+#[test]
+fn a_target_changelist_beyond_head_falls_back_to_head() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // 落后：提交新版，再把 have 与本地都退回旧版。
+    sandbox.commit("moving.txt", "first revision\n");
+    sandbox.p4_ok(&["edit", "moving.txt"]);
+    sandbox.write("moving.txt", "second revision\n");
+    sandbox.p4_ok(&["submit", "-d", "second revision"]);
+    sandbox.p4_ok(&["sync", "//depot/main/moving.txt#1"]);
+
+    // 大于任何已分配的 CL：偏移给大一点，不 +1——pending changelist 也占号。
+    let beyond_head = latest_submitted(&sandbox) + 1_000_000;
+
+    let before = sandbox.p4_ok(&["fstat", "-T", "headRev haveRev", "moving.txt"]);
+    assert!(
+        before.contains("headRev 2") && before.contains("haveRev 1"),
+        "unexpected depot state: {before}"
+    );
+
+    sandbox
+        .cli()
+        .args(["--sync", "--to", &beyond_head.to_string(), "-a", "-l"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Updating 1 files"))
+        // 空目标的话本地每一个文件都在删除之列——真有那一组就说明回落没发生。
+        .stdout(predicate::str::contains("Deleting").not());
+
+    // 独立取证：have 到了 head，磁盘上是 head 那一版，head 本身没动。
+    let after = sandbox.p4_ok(&["fstat", "-T", "headRev haveRev", "moving.txt"]);
+    assert!(
+        after.contains("headRev 2"),
+        "depot 的 head 不该被动过：{after}"
+    );
+    assert!(
+        after.contains("haveRev 2"),
+        "超过 head 的目标该落到 head：{after}"
+    );
+    assert_eq!(sandbox.read("moving.txt"), "second revision\n");
+    assert!(sandbox.opened().is_empty());
+}
+
 /// 与原生 `p4 sync -f -n` 对照：那边「真的要传」的文件，必须一个不漏地出现在我们的清单里。
 ///
 /// 不要求集合相等，因为两边的可观测面本来就不同：
@@ -401,8 +566,12 @@ fn verify_all_catches_what_the_timestamp_shortcut_misses() {
         return;
     };
 
-    sandbox.write("readme.txt", "changed behind the timestamp shortcut\n");
-    stamp_as_just_synced(&sandbox.client_root().join("readme.txt"));
+    // 改掉内容，但让它看起来还是刚同步下来的那一份——默认档的捷径就是靠这个跳过摘要的。
+    write_keeping_the_synced_mtime(
+        &sandbox,
+        "readme.txt",
+        "changed behind the timestamp shortcut\n",
+    );
 
     sandbox
         .cli()
@@ -411,10 +580,10 @@ fn verify_all_catches_what_the_timestamp_shortcut_misses() {
         .assert()
         .success()
         // 这一句同时是「捷径真的生效了」的证据，而且它该排在前面：万一 mtime 没落进
-        // ±1 秒窗口（负载高的机器上有可能，见 `stamp_as_just_synced`），失败会出现在这里，
-        // 一眼看得出是时间问题；否则它会以「Reverting 意外出现」的形式失败，看起来像工具坏了。
-        // 100% 是这个用例的隐含前提——种子里每个文件都是 `p4 sync -f` 刚落下来的，
-        // 把它写出来，前提不成立时失败信息会直接指向它。
+        // ±1 秒窗口（见 `write_keeping_the_synced_mtime`，那里把同步时的 mtime 原样恢复），
+        // 失败会出现在这里，一眼看得出是时间问题；否则它会以「Reverting 意外出现」的形式
+        // 失败，看起来像工具坏了。100% 是这个用例的隐含前提——种子里每个文件都是
+        // `p4 sync -f` 刚落下来的，把它写出来，前提不成立时失败信息会直接指向它。
         .stdout(predicate::str::contains("digest computations (100%)"))
         .stdout(predicate::str::contains("Reverting").not())
         .stdout(predicate::str::contains(
@@ -604,17 +773,33 @@ fn both_delete_legs_report_their_own_failure() {
     );
 }
 
-/// 把文件的 mtime 设成「刚刚」，落进 `is_unchanged_since_sync` 的 ±1 秒窗口。
+/// 把文件改成新内容，但把 mtime 留成 p4 同步时落下的那一份——正好落进
+/// `is_unchanged_since_sync` 的 ±1 秒窗口，默认档据此跳过摘要计算。
 ///
-/// [`support::Sandbox::write`] 会把 mtime 回拨一小时（免得用例踩中那个窗口），
-/// 这里要的正是窗口里面，所以写完再单独调回来。
-fn stamp_as_just_synced(path: &std::path::Path) {
+/// mtime 不取 `SystemTime::now()`：have 的 syncTime 是**同步那一刻**记下的，而 now() 与它
+/// 之间隔着这条用例跑到这里花掉的全部时间；机器一慢两者就差出一秒以上，窗口不成立，捷径
+/// 失效，用例以「100%」那条断言红掉——那是随负载浮动的竞态。改为写之前先存下同步时的
+/// mtime、写完再恢复：与 syncTime 的关系由 p4 当初怎么落盘决定，不需要 sleep 也不需要重试。
+///
+/// [`support::Sandbox::write`] 写完会把 mtime 回拨一小时（免得用例踩中那个窗口），
+/// 这里要的正是窗口里面，所以在它之后再单独改回来。
+fn write_keeping_the_synced_mtime(sandbox: &support::Sandbox, relative: &str, contents: &str) {
+    let path = sandbox.client_root().join(relative);
+    let synced = std::fs::metadata(&path)
+        .expect("the file must exist to have a sync-time mtime")
+        .modified()
+        .expect("the file must carry an mtime");
+
+    sandbox.write(relative, contents);
+
+    // 写这一步已经把只读位松开（`noclobber` 让 sync 下来的文件不可写），所以这里能直接
+    // 打开来改时间。
     let file = std::fs::File::options()
         .write(true)
-        .open(path)
-        .expect("open the file to stamp its mtime");
-    file.set_modified(std::time::SystemTime::now())
-        .expect("set the mtime");
+        .open(&path)
+        .expect("open the file to restore its mtime");
+    file.set_modified(synced)
+        .expect("restore the sync-time mtime");
 }
 
 /// 最近一次已提交的 changelist 号。

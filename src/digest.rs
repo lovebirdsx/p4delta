@@ -60,22 +60,24 @@ pub(crate) fn compute_digest_text(file: &WorkspaceFile, hasher: &mut Md5) -> Res
 }
 
 /// Computes the digest for a utf8 file, normalized line endings MD5 without BOM.
-/// This function is a bit slower, but only few files have this encoding, so it is fine.
+///
+/// 解码配置与整份读入时逐条相同（`utf8_passthru(false)`、BOM 嗅探、剥 BOM），改动只在
+/// 「不再把整个文件读进内存」：解码器流式接进 `BufReader`，未完成的多字节序列由解码器
+/// 自己跨 read 持有；按行归一化仍是共用的 [`update_text_digest_utf8`]，判定规则一个
+/// 字节都没变。没有 BOM 的文件走解码器的透传路径，等同于直接读原始字节。
 pub(crate) fn compute_digest_utf8(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
     let file = File::open(&file.path)?;
     let mut buffer = [0u8; READ_BUFFER_SIZE];
     let mut line_buffer = Vec::new();
-    let mut full_buffer = Vec::new();
 
-    let len = DecodeReaderBytesBuilder::new()
+    let decoded = DecodeReaderBytesBuilder::new()
         .utf8_passthru(false)
         .bom_sniffing(true)
         .strip_bom(true)
-        .build_with_buffer(file, &mut buffer[..])?
-        .read_to_end(&mut full_buffer)?;
+        .build_with_buffer(file, &mut buffer[..])?;
 
-    let mut filled = &full_buffer[..len];
-    update_text_digest_utf8(&mut filled, &mut line_buffer, hasher)
+    let mut read = BufReader::with_capacity(READ_BUFFER_SIZE, decoded);
+    update_text_digest_utf8(&mut read, &mut line_buffer, hasher)
 }
 
 /// Computes the digest for a symlink.
@@ -134,32 +136,46 @@ pub(crate) enum CachePolicy {
     Ignore,
 }
 
+/// 单个文件的摘要结果：文件本身、16 字节摘要，以及这个摘要是直接取自缓存
+/// （`from_cache`）还是这一轮真算出来的——统计「Hash 了多少字节」要靠它区分。
+#[derive(Debug)]
+pub(crate) struct DigestOutcome<'a> {
+    pub(crate) file: &'a WorkspaceFile,
+    pub(crate) digest: [u8; 16],
+    pub(crate) from_cache: bool,
+}
+
 /// Computes digests for a number of files in the workspace.
 ///
+/// 返回的结果与传入的 `files` 按位对应（rayon 收进 Vec 保序）。
 /// `policy` 为 [`CachePolicy::Ignore`] 时跳过缓存查找、逐个重算；重算的结果照常写回缓存，
 /// 默认档接着受益。
 pub(crate) fn parallel_compute_digests<'a>(
     files: Vec<(&'a WorkspaceFile, DigestType)>,
     cache: &mut WorkspaceCache,
     policy: CachePolicy,
-) -> Result<Vec<(&'a WorkspaceFile, [u8; 16], bool)>> {
-    let results: Result<Vec<(&'a WorkspaceFile, [u8; 16], bool)>> = files
+) -> Result<Vec<DigestOutcome<'a>>> {
+    let results: Result<Vec<DigestOutcome<'a>>> = files
         .into_par_iter()
         .with_max_len(1)
-        .map(|file| -> Result<(&'a WorkspaceFile, [u8; 16], bool)> {
+        .map(|(file, digest_type)| -> Result<DigestOutcome<'a>> {
             // Check cache first
             if policy == CachePolicy::Use
-                && let Some(cache_entry) = cache.file_map.get(&file.0.path_lower)
-                && cache_entry.size == file.0.size
-                && cache_entry.date == file.0.date
+                && let Some(cache_entry) = cache.file_map.get(&file.path_lower)
+                && cache_entry.size == file.size
+                && cache_entry.date == file.date
             {
-                return Ok((file.0, cache_entry.digest, true));
+                return Ok(DigestOutcome {
+                    file,
+                    digest: cache_entry.digest,
+                    from_cache: true,
+                });
             }
 
             let mut hasher = Md5::new();
             let mut digest: [u8; 16] = Default::default();
 
-            let file_data = std::fs::symlink_metadata(&file.0.path)?;
+            let file_data = std::fs::symlink_metadata(&file.path)?;
             // Perforce tracks symlinks as revisions of their own, so they are files here too.
             if !file_data.is_file() && !file_data.file_type().is_symlink() {
                 bail!(
@@ -168,15 +184,19 @@ pub(crate) fn parallel_compute_digests<'a>(
                 );
             }
 
-            match file.1 {
-                DigestType::Binary => compute_digest_binary(file.0, &mut hasher)?,
-                DigestType::Text => compute_digest_text(file.0, &mut hasher)?,
-                DigestType::Utf8 => compute_digest_utf8(file.0, &mut hasher)?,
-                DigestType::Symlink => compute_digest_symlink(file.0, &mut hasher)?,
+            match digest_type {
+                DigestType::Binary => compute_digest_binary(file, &mut hasher)?,
+                DigestType::Text => compute_digest_text(file, &mut hasher)?,
+                DigestType::Utf8 => compute_digest_utf8(file, &mut hasher)?,
+                DigestType::Symlink => compute_digest_symlink(file, &mut hasher)?,
             }
 
             digest.copy_from_slice(&hasher.finalize()[..16]);
-            Ok((file.0, digest, false))
+            Ok(DigestOutcome {
+                file,
+                digest,
+                from_cache: false,
+            })
         })
         .collect();
 
@@ -184,13 +204,13 @@ pub(crate) fn parallel_compute_digests<'a>(
 
     // Update cache
     for result in &results {
-        if !result.2 {
+        if !result.from_cache {
             cache.file_map.insert(
-                result.0.path_lower.clone(),
+                result.file.path_lower.clone(),
                 WorkspaceCacheEntry {
-                    size: result.0.size,
-                    date: result.0.date,
-                    digest: result.1,
+                    size: result.file.size,
+                    date: result.file.date,
+                    digest: result.digest,
                 },
             );
             cache.out_of_date = true;
@@ -205,6 +225,7 @@ mod tests {
     use super::*;
     use crate::test_util::*;
 
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use crate::path::local_path_key;
@@ -261,6 +282,236 @@ mod tests {
     #[test]
     fn text_digest_of_a_crlf_only_file_keeps_both_newlines() {
         assert_eq!(text_digest(b"\r\n\r\n"), md5_of(b"\n\n"));
+    }
+
+    // ---- UTF-8 解码（BOM、流式读取） ----
+
+    fn workspace_file(path: &Path) -> WorkspaceFile {
+        WorkspaceFile {
+            path: path.display().to_string(),
+            path_lower: local_path_key(&path.display().to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// 把原始字节写进临时树：BOM、UTF-16 这类内容没法用 `TempTree::file` 的 `&str` 表达。
+    fn write_bytes(tree: &TempTree, name: &str, contents: &[u8]) -> PathBuf {
+        let path = tree.root.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// 走磁盘上的 `compute_digest_utf8` 全流程，覆盖解码 + 按行归一化。
+    fn utf8_file_digest(path: &Path) -> [u8; 16] {
+        let mut hasher = Md5::new();
+        compute_digest_utf8(&workspace_file(path), &mut hasher).unwrap();
+
+        let mut digest = [0u8; 16];
+        digest.copy_from_slice(&hasher.finalize()[..16]);
+        digest
+    }
+
+    /// 带 BOM 的 UTF-16 编码，用来构造 UTF-16 输入。
+    fn utf16_with_bom(text: &str, big_endian: bool) -> Vec<u8> {
+        let mut out = if big_endian {
+            vec![0xFE, 0xFF]
+        } else {
+            vec![0xFF, 0xFE]
+        };
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&if big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            });
+        }
+        out
+    }
+
+    /// 流式改造之前的实现，逐字保留，**只作测试 oracle**：整份解码进内存，再交给共用的
+    /// 按行归一化。它与新实现的差别只有缓冲策略，所以两者必须逐字节一致。
+    fn oracle_utf8_digest(path: &Path) -> [u8; 16] {
+        let file = File::open(path).unwrap();
+        let mut buffer = [0u8; READ_BUFFER_SIZE];
+        let mut line_buffer = Vec::new();
+        let mut full_buffer = Vec::new();
+
+        let len = DecodeReaderBytesBuilder::new()
+            .utf8_passthru(false)
+            .bom_sniffing(true)
+            .strip_bom(true)
+            .build_with_buffer(file, &mut buffer[..])
+            .unwrap()
+            .read_to_end(&mut full_buffer)
+            .unwrap();
+
+        let mut hasher = Md5::new();
+        let mut filled = &full_buffer[..len];
+        update_text_digest_utf8(&mut filled, &mut line_buffer, &mut hasher).unwrap();
+
+        let mut digest = [0u8; 16];
+        digest.copy_from_slice(&hasher.finalize()[..16]);
+        digest
+    }
+
+    /// BOM 要在算摘要前剥掉：内容相同、有没有 BOM，摘要必须一样。
+    #[test]
+    fn utf8_digest_strips_the_bom() {
+        let tree = TempTree::new("utf8-bom");
+        let with_bom = write_bytes(&tree, "bom.txt", "\u{FEFF}alpha\r\nbeta\n".as_bytes());
+        let without_bom = write_bytes(&tree, "plain.txt", "alpha\r\nbeta\n".as_bytes());
+
+        let expected = md5_of(b"alpha\nbeta\n");
+        assert_eq!(utf8_file_digest(&with_bom), expected, "带 UTF-8 BOM");
+        assert_eq!(utf8_file_digest(&without_bom), expected, "不带 BOM");
+
+        // 只剩 BOM 的文件解码后就是空文件。
+        let only_bom = write_bytes(&tree, "only-bom.txt", "\u{FEFF}".as_bytes());
+        assert_eq!(utf8_file_digest(&only_bom), md5_of(b""));
+    }
+
+    /// BOM 嗅探认得 UTF-16LE/BE：解码成 UTF-8、剥 BOM，再按同一套换行归一化。
+    /// 期望值是手写的「UTF-8 内容（LF 结尾）的 md5」，不经过任何待测路径，避免自证。
+    #[test]
+    fn utf8_digest_decodes_utf16_with_a_bom() {
+        let tree = TempTree::new("utf8-utf16");
+        let text = "第一行\r\nsecond line\r\n第三行";
+        let expected = md5_of("第一行\nsecond line\n第三行".as_bytes());
+
+        let le = write_bytes(&tree, "le.txt", &utf16_with_bom(text, false));
+        let be = write_bytes(&tree, "be.txt", &utf16_with_bom(text, true));
+
+        assert_eq!(utf8_file_digest(&le), expected, "UTF-16LE");
+        assert_eq!(utf8_file_digest(&be), expected, "UTF-16BE");
+    }
+
+    /// 单行比读缓冲（128 KiB）还长：`read_until` 要跨多次填充把整行拼齐，
+    /// 末尾的 CRLF 照样只删 `\r`，末行没有换行也不能补。
+    #[test]
+    fn utf8_digest_normalizes_a_line_longer_than_the_read_buffer() {
+        let tree = TempTree::new("utf8-long-line");
+
+        let prefix = vec![b'a'; READ_BUFFER_SIZE - 1];
+        let mut raw = prefix.clone();
+        raw.extend_from_slice(b"\r\nb\r\nc");
+        let mut expected = prefix;
+        expected.extend_from_slice(b"\nb\nc");
+
+        let path = write_bytes(&tree, "long.txt", &raw);
+        assert_eq!(utf8_file_digest(&path), md5_of(&expected));
+    }
+
+    /// `\r` 落在读缓冲填充的接缝上（最后一个字节、以及前后各一个字节）时，
+    /// 跨填充的 CRLF 仍要当成一个换行处理——按行归一化的实现天然正确，
+    /// 这条用例锁住的是「别哪天退化成固定块状态机」。
+    #[test]
+    fn utf8_digest_normalizes_crlf_split_across_read_buffer_fills() {
+        let tree = TempTree::new("utf8-crlf-boundary");
+
+        for offset in [READ_BUFFER_SIZE - 1, READ_BUFFER_SIZE, READ_BUFFER_SIZE + 1] {
+            let mut raw = vec![b'a'; offset];
+            raw.extend_from_slice(b"\r\n");
+            raw.extend_from_slice(b"tail");
+
+            let mut expected = vec![b'a'; offset];
+            expected.extend_from_slice(b"\ntail");
+
+            let path = write_bytes(&tree, &format!("split-{offset}.txt"), &raw);
+            assert_eq!(
+                utf8_file_digest(&path),
+                md5_of(&expected),
+                "offset={offset}"
+            );
+        }
+
+        // 三条内容各自不同，防的是三条断言其实在看同一份数据。
+        let a = utf8_file_digest(&tree.root.join("split-131071.txt"));
+        let b = utf8_file_digest(&tree.root.join("split-131072.txt"));
+        let c = utf8_file_digest(&tree.root.join("split-131073.txt"));
+        assert!(a != b && b != c && a != c);
+    }
+
+    /// 多字节字符跨解码缓冲边界：3 字节的汉字在 128 KiB 处必然被切一刀，
+    /// 解码器要握住半个字符（而不是吐 U+FFFD）；UTF-16 的代理对同理。
+    #[test]
+    fn utf8_digest_keeps_multibyte_characters_across_buffer_boundaries() {
+        let tree = TempTree::new("utf8-decode-boundary");
+
+        // 150000 字节 > 128 KiB，且 131072 % 3 == 2，切缝必然落在某个字符中间。
+        let text = "中".repeat(50_000);
+        let raw = format!("\u{FEFF}{text}\r\ntail");
+        let path = write_bytes(&tree, "utf8-boundary.txt", raw.as_bytes());
+        assert_eq!(
+            utf8_file_digest(&path),
+            md5_of(format!("{text}\ntail").as_bytes())
+        );
+
+        // UTF-16 一侧：140000 字节原始输入，解码输出 210000 字节，两侧都跨缓冲。
+        let utf16_text = "中".repeat(70_000);
+        let utf16 = utf16_with_bom(&format!("{utf16_text}\r\n"), false);
+        let path = write_bytes(&tree, "utf16-boundary.txt", &utf16);
+        assert_eq!(
+            utf8_file_digest(&path),
+            md5_of(format!("{utf16_text}\n").as_bytes())
+        );
+    }
+
+    /// 新旧实现对拍：固定期望值防「两边一起错」，这个 oracle 防「新实现悄悄偏离旧行为」。
+    /// `oracle_utf8_digest` 就是改造前的整份读入版本，输入覆盖空文件、无末尾换行、
+    /// 孤立 CR、BOM、UTF-16 与跨缓冲的长行。
+    #[test]
+    fn streaming_utf8_digest_agrees_with_the_buffered_oracle() {
+        let tree = TempTree::new("utf8-oracle");
+
+        let long_line = {
+            let mut content = vec![b'x'; READ_BUFFER_SIZE + 7];
+            content.extend_from_slice(b"\r\n");
+            content.extend_from_slice(b"tail");
+            content
+        };
+
+        let payloads: [(&str, Vec<u8>); 10] = [
+            ("empty", Vec::new()),
+            ("no-trailing-newline", b"line\r\nline2".to_vec()),
+            ("lone-cr", b"lone\rcarriage\r".to_vec()),
+            ("crlf-only", b"\r\n\r\n".to_vec()),
+            ("bom", "\u{FEFF}a\r\nb\r\n".as_bytes().to_vec()),
+            ("bom-only", "\u{FEFF}".as_bytes().to_vec()),
+            ("utf16le", utf16_with_bom("one\r\ntwo\r\n", false)),
+            ("utf16be", utf16_with_bom("one\r\ntwo\r\n", true)),
+            (
+                "multibyte-boundary",
+                format!("\u{FEFF}{}\r\n", "中".repeat(50_000)).into_bytes(),
+            ),
+            ("long-line", long_line),
+        ];
+
+        for (name, payload) in payloads {
+            let path = write_bytes(&tree, &format!("{name}.txt"), &payload);
+            assert_eq!(
+                utf8_file_digest(&path),
+                oracle_utf8_digest(&path),
+                "payload={name}"
+            );
+        }
+    }
+
+    /// 空文件、孤立 CR、无末尾换行这几条边界，走流式全流程再过一遍。
+    #[test]
+    fn utf8_digest_edge_cases_survive_the_streaming_path() {
+        let tree = TempTree::new("utf8-edges");
+
+        let cases: [(&str, &[u8], &[u8]); 4] = [
+            ("empty", b"", b""),
+            ("lone-cr", b"a\r", b"a\r"),
+            ("crlf", b"a\r\nb", b"a\nb"),
+            ("no-final-newline", b"a\nb", b"a\nb"),
+        ];
+
+        for (name, raw, expected) in cases {
+            let path = write_bytes(&tree, &format!("{name}.txt"), raw);
+            assert_eq!(utf8_file_digest(&path), md5_of(expected), "case={name}");
+        }
     }
 
     // ---- 时间戳优化判据 ----
@@ -408,9 +659,9 @@ mod tests {
 
         let expected_content = format!("{}\n", target.display().to_string().replace('\\', "/"));
         let expected: [u8; 16] = Md5::digest(expected_content.as_bytes()).into();
-        assert_eq!(results[0].1, expected);
+        assert_eq!(results[0].digest, expected);
         assert!(
-            !results[0].2,
+            !results[0].from_cache,
             "digest must be computed, not served from the cache"
         );
         assert!(cache.file_map.contains_key(&file.path_lower));
@@ -439,8 +690,8 @@ mod tests {
             CachePolicy::Use,
         )
         .unwrap();
-        assert!(!first[0].2, "空缓存必然 miss");
-        let correct = first[0].1;
+        assert!(!first[0].from_cache, "空缓存必然 miss");
+        let correct = first[0].digest;
 
         // 把缓存里的摘要换成错值：size 与 date 都还对着，默认档看不出破绽。
         cache.file_map.get_mut(&file.path_lower).unwrap().digest = [0xAB; 16];
@@ -451,8 +702,8 @@ mod tests {
             CachePolicy::Use,
         )
         .unwrap();
-        assert!(cached[0].2, "默认档该命中缓存");
-        assert_eq!(cached[0].1, [0xAB; 16], "命中缓存就是交出缓存里的值");
+        assert!(cached[0].from_cache, "默认档该命中缓存");
+        assert_eq!(cached[0].digest, [0xAB; 16], "命中缓存就是交出缓存里的值");
 
         let recomputed = parallel_compute_digests(
             vec![(&file, DigestType::Text)],
@@ -460,8 +711,8 @@ mod tests {
             CachePolicy::Ignore,
         )
         .unwrap();
-        assert!(!recomputed[0].2, "验证档不该命中缓存");
-        assert_eq!(recomputed[0].1, correct, "验证档要的是重算出来的真值");
+        assert!(!recomputed[0].from_cache, "验证档不该命中缓存");
+        assert_eq!(recomputed[0].digest, correct, "验证档要的是重算出来的真值");
     }
 
     /// 以普通文本文件形式检出的符号链接（工作区不支持符号链接时）仍然按文本读取。

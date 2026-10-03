@@ -57,8 +57,8 @@ jobs:
       - name: Install p4 and p4d
         shell: bash
         run: bash scripts/fetch-p4-tools.sh
-      # nextest 而不是 cargo test：cargo 逐个测试二进制串行执行，五个 e2e 二进制
-      # 就是五轮；nextest 把所有目标的用例放进同一个调度池。行为差异与各项配置
+      # nextest 而不是 cargo test：cargo 逐个测试二进制串行执行，nextest 则把所有目标的
+      # 用例放进同一个调度池。行为差异与各项配置
       # 见 .config/nextest.toml。装的是预编译包，不在 CI 上现编一遍。
       - uses: taiki-e/install-action@nextest
       # 找不到 p4d 时 e2e 会打印一行 skipping 后整段跳过，测试仍然全绿——
@@ -89,6 +89,9 @@ jobs:
       - name: install.ps1 under PowerShell 7
         shell: pwsh
         run: ./scripts/test-install.ps1
+      - name: Preview benchmark script under PowerShell 7
+        shell: pwsh
+        run: ./scripts/test-benchmark.ps1
 
   # release.sh 的黑盒测试：在一次性 git 仓库里真跑一遍改版本号、提交、打附注 tag、推送，
   # 只有 cargo 换成垫片——所以不需要构建产物，也不联网。

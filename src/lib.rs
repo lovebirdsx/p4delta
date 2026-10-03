@@ -154,9 +154,7 @@ pub fn run(mut options: Options) -> Result<()> {
         }
     }
 
-    // Saves progressively, so a failure late in the run does not discard the digests already
-    // computed - on a workspace big enough to fail, that is the difference between eventually
-    // finishing and never finishing.
+    // 摘要阶段成功后按阈值保存，保留此前阶段的成果；不是阶段计算中的周期 checkpoint。
     let mut cache_writer = cache_path.map(CacheWriter::new);
 
     // 逐个处理输入里的路径，串行执行，输出才好读。不可用的路径先记下原因：一个都用不上时
@@ -252,7 +250,7 @@ pub fn run(mut options: Options) -> Result<()> {
     }
 
     // Save digest cache
-    save_cache(&mut cache_writer, &cache, true)?;
+    save_cache(&mut cache_writer, &mut cache, true)?;
 
     // We are done!
     println!(

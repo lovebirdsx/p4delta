@@ -42,10 +42,11 @@ p4delta 把「路径 → 摘要」持久化在
 
 - **bincode 2 + 流式读写**（`src/lib.rs` 的加载路径、`src/cache.rs::CacheWriter::maybe_save`）。缓存可以到
   几百 MB，整份读进内存再解码会让峰值翻倍。
-- **先写 `.bin.tmp` 再 rename**，崩溃不会留下半截坏缓存；加载失败只告警并整份重建。
-- **边算边存**：60 秒或新增 10 万条任一触发（`src/cache.rs::CACHE_SAVE_MIN_INTERVAL` /
-  `CACHE_SAVE_MIN_NEW_ENTRIES`），且每个摘要阶段结束后都存一次。注释里写着理由——以前只在整轮结束时写一次，
-  大工作区上内存耗尽时前面算的全作废，「一次都跑不完的机器上永远跑不完」。
+- **先写独占创建的唯一临时文件，再 rename 发布**，避免并发运行共用临时文件、相互覆盖；发布失败保留旧缓存。成功后清除脏标记，没有新变化时收尾不会再次全量写盘。加载失败只告警并整份重建。
+- **阶段间保存**：每个摘要阶段成功完成后检查一次，距离上次保存达到 60 秒或新增 10 万条时落盘
+  （`src/cache.rs::CACHE_SAVE_MIN_INTERVAL` / `CACHE_SAVE_MIN_NEW_ENTRIES`）；第一次有脏数据时即可保存，
+  整轮结束再保存尚未落盘的变化。它不是计算过程中每 60 秒自动 checkpoint：单个阶段失败时，
+  该阶段已算出的摘要仍不会写回缓存，但之前成功保存的阶段可以复用。
 
 这一层直接对应 README 里的 55s → 14s 和 4.5s → 1s。**那 4 倍差距纯粹来自缓存**，与摘要算法无关。
 open 模式与 `--clean` 共用同一份缓存，两个方向互相加速。
@@ -57,9 +58,9 @@ open 模式与 `--clean` 共用同一份缓存，两个方向互相加速。
 1. **二进制文件 + size 与 depot 不同 → 直接判为改动，零 I/O**（`src/reconcile/analyze.rs`）。
    原生没有这一条。文本文件不能这么判——CRLF 归一化会改变字节数，size 相等不代表内容相等，反之亦然
    （`src/reconcile/analyze.rs` 里有专门的回归用例）。
-2. **mtime 与 have 记录的 syncTime 差 ≤1 秒 → 整组跳过摘要**（`src/digest.rs::is_unchanged_since_sync`，
-   在 `src/reconcile/mod.rs::reconcile_dir` 里对三组候选分别过滤）。判据是「自 sync 之后没人动过这个文件」，
-   而这正是「内容是否与 have revision 一致」的充分条件。运行结束会打印跳过的比例。
+2. **mtime 与 have 记录的 syncTime 差 ≤1 秒 → 跳过摘要**（`src/digest.rs::is_unchanged_since_sync`）。
+   文件 mtime 先截断到秒，再与 syncTime 比较；这是“可能自 sync 后未变”的快捷判断，不是内容相同的证明。
+   运行结束会打印跳过的比例；需要重新验证内容的 sync 使用 `--verify-all`，同时绕过此捷径与摘要缓存。
 3. 缓存三字段命中，见上一节。
 
 > 公平起见：**时间戳捷径原生也有**。`p4 reconcile -m` 就是「比较 depot 里的 sync/submit 时间与工作区文件的
@@ -77,8 +78,9 @@ open 模式与 `--clean` 共用同一份缓存，两个方向互相加速。
   排除行覆盖的路径。注释写明了原因：对全部工作区文件做这件事，在几十万文件的目录上会变成灾难。
 - **路径参数走 stdin 批处理**：`p4 -x - -b N`，一批一个进程（`src/p4/process.rs`）。这最初是为绕开
   Windows 命令行按 ANSI 代码页转码导致非 ASCII 文件名失效，顺带也绕开了命令行长度上限。
-- **并发上限 8**（`src/p4/process.rs::MAX_PARALLEL_P4_COMMANDS`）。注释写着理由：服务端 `maxParallel=8`，
-  再多只是增加进程启动开销——无上限那版曾一度同时起上万个 `p4.exe`。
+- **每次批处理调用的并发上限为 8**（`src/p4/process.rs::MAX_PARALLEL_P4_COMMANDS`），防止一批文件
+  启动无界数量的子进程。不同查询可以重叠，因此它不是整个程序的全局进程数上限；是否需要统一预算，
+  要以实际服务端压力与吞吐测量为准。
 - **三路并发**：`src/reconcile/mod.rs::reconcile_dir` 用 `futures::join!` 同时跑 depot 查询、本地扫描、
   `p4 -G have`。原生是串行的。
 - **`p4 fstat -L`** 一次批量取回旧版本文件的元数据（`src/p4/fstat.rs`），注释称「比逐个文件查询快得多」，
@@ -96,7 +98,8 @@ p4delta 全程流式解析（`src/p4/fstat.rs`、`src/p4/marshal.rs`），只对
 
 真算的时候靠 rayon 并行（`src/digest.rs::parallel_compute_digests`，用 `with_max_len(1)` 让每个文件成为
 不可再分的并行单元），以及 128 KiB 的读缓冲（`src/lib.rs::READ_BUFFER_SIZE`，注释自陈是按 PCIe 4.0 SSD
-调的）。没有 memmap。
+调的）。没有 memmap。UTF-8 路径将 BOM 嗅探/解码 reader 直接接到缓冲流，不再先存一份完整解码文件；
+换行归一化仍按行处理，因此超长单行仍会占用与行长成比例的内存，不能称为严格固定内存。
 
 **所以快的是「哪些文件不用算」，不是「算得多快」。** 把这一层单独拎出来和原生比，两者的摘要吞吐是同一
 量级——差的是有多少文件落到这一层。
@@ -108,7 +111,8 @@ p4delta 全程流式解析（`src/p4/fstat.rs`、`src/p4/marshal.rs`），只对
 
 p4delta 的 clean 与 reconcile 共用同一条分析管线和同一份摘要缓存：
 `src/reconcile/clean.rs::CleanChanges::project` 只是把八类变更投影成三类，由
-`src/reconcile/mod.rs::reconcile_dir` 调用。只有动作层不同：
+`src/reconcile/mod.rs::reconcile_dir` 调用。clean 会跳过最终不消费的已打开文件摘要候选，
+保留元数据分析与校验；已打开文件多且缓存未命中时，这能省下无效读盘。动作层则不同：
 
 - **删除**（工作区有、depot 没有）是本地 `std::fs` + rayon 并行，**完全不碰服务端**。
 - **还原 / 写回**是批量 `p4 sync -f //depot/file#haveRev`（`src/reconcile/clean.rs::restore_specs`），
@@ -123,9 +127,12 @@ p4delta 的 clean 与 reconcile 共用同一条分析管线和同一份摘要缓
 
 - **判定范围更窄。** 不做 move 配对；Apple/Resource 旧格式和认不出的 `headType` 转交原生 p4；head revision
   是归档版本（archived）的文件跳过并汇报。这些都在 README「已知问题」里。
-- **摘要是拿正确性换速度。** 缓存键是秒级的 size + mtime。mtime 被外力改回原值，或碰上时间戳粒度、
-  时钟回拨，就会误判成「未变」。这是粒度取舍，不是缺陷，但值得知道边界在哪。
+- **元数据捷径不是内容验证。** 摘要缓存比较路径、size 与完整的 `SystemTime` mtime，代码不主动将缓存
+  时间截断到秒；另一个独立的“同步后未变”捷径才是秒级 ±1 秒判断。保留 size 和 mtime 的内容修改可能
+  命中旧缓存，落入同步时间窗口的修改可能被捷径跳过；两者不能混为一谈。sync 的 `--verify-all` 会绕过两者。
 - **时间戳捷径原生也有**（`p4 reconcile -m`），见第三节的说明。
-- **没有 benchmark 基建。** 无 `benches/`、无 criterion、CI 里没有性能 job；README 的数字是手工测量的，
-  没有原始日志，不可复现。唯一内置的 A/B 开关是 `--no-prune-ignored-dirs`，用来对照目录剪枝的收益
-  （见 README「路径与忽略目录优化」）。要据此判断自家仓库的收益，请以预览结果一致性和多轮计时为准。
+- **历史数字不等于本轮优化的实测收益。** README 的数据来自手工测量，不是此次改动的 A/B 结果。
+  现在有轻量的 `scripts/benchmark.ps1`，记录预览的多轮耗时、主进程峰值工作集与原始日志，并核对
+  动作多重集；用法与局限见 [开发指南](../CONTRIBUTING.md#预览性能测量powershell-7)。没有 criterion
+  或 CI 耗时硬门禁，也没有分阶段/进程树性能统计。`--no-prune-ignored-dirs` 可用于剪枝对照；
+  脚本不清摘要缓存，不控制操作系统缓存，不能把自然预热重复测量叫作冷缓存基准。

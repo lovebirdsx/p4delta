@@ -276,7 +276,8 @@ pub(crate) const FSTAT_ARGS: [&str; 5] = [
 pub(crate) const FSTAT_HAVE_ARGS: [&str; 6] = ["fstat", "-Rc", "-Ol", "-L", "-T", FSTAT_FIELDS];
 
 /// 校验补查结果，保证每条 `//depot/file#rev` 都返回了可用的 have 版本记录。
-/// 失败或返回不完整时终止 reconcile，不能沿用 head 版本的摘要。
+/// 失败或返回不完整时终止 reconcile——回填之后这些字段就是与本地文件比对的基线
+/// （见 `model::DepotFileRecord` 的文档），宁可不做，也不能拿 head 版本的摘要顶上。
 pub(crate) fn validate_refreshed_records(
     arguments: &[String],
     records: &[DepotFileRecord],
@@ -348,8 +349,9 @@ pub(crate) fn validate_refreshed_records(
 
 /// 取走初次查询里的 `(head_rev, head_action)`，作为目标版本的事实。
 ///
-/// 必须在补查**之前**调用：补查会把 `head_action` 换成 have 版本的动作（见
-/// [`run_p4_fstat_all`] 里的回填），而 sync 要回答的是「拉到哪个版本」，不是「上次同步的是哪版」。
+/// 必须在补查**之前**调用：补查会把 `head_type` / `head_action` / `file_size` / `digest`
+/// 换成 have 版本的值（见 [`run_p4_fstat_all`] 里的回填），而 sync 要回答的是「拉到哪个
+/// 版本」，不是「上次同步的是哪版」。
 ///
 /// 没有 headRev / headAction 的记录不进表。那种形状只出现在「已打开待添加」的文件上
 /// （还没进 depot），而 sync 本来就不碰已打开的文件；查不到即视为目标时刻不在库。
@@ -418,9 +420,9 @@ pub(crate) async fn run_p4_fstat_all(
     // Build hashmaps to find records
     depot_state.build_mapping();
 
-    // 趁 `head_action` 还是初次查询的原值先取走目标版本的事实：下面的补查会把它换成
-    // have 版本的动作。只有 head 目标的 sync 才建这张表——open / clean 用不上，在几十万条
-    // 记录上白占几十 MB 内存；`--to` 另走一次查询，这张表它连看都不看。
+    // 趁 `head_action` 还是初次查询的原值先取走目标版本的事实：下面的补查会把它连同
+    // 类型/大小/摘要一起换成 have 版本的值。只有 head 目标的 sync 才建这张表——open /
+    // clean 用不上，在几十万条记录上白占几十 MB 内存；`--to` 另走一次查询，这张表它连看都不看。
     let target =
         (options.sync && options.to.is_none()).then(|| snapshot_target(&depot_state.file_records));
 
@@ -476,6 +478,10 @@ pub(crate) async fn run_p4_fstat_all(
         for refreshed_record in &refreshed_records {
             match depot_state.get_depot_record_mut(&refreshed_record.depot_file_lower) {
                 Some(original_record) => {
+                    // 这些字段描述的是 **have 版本**——补查查的就是 have 那一版，回填后
+                    // 它们是与本地文件比对的基线（见 `model::DepotFileRecord` 的文档）。
+                    // `head_rev` / `have_rev` / `action` 刻意不动：head_rev 仍是真实 head，
+                    // 分析层靠它与 have_rev 的差判断本地是否落后。
                     original_record.head_type = refreshed_record.head_type;
                     original_record.unsupported_type = refreshed_record.unsupported_type.clone();
                     original_record.head_action = refreshed_record.head_action;

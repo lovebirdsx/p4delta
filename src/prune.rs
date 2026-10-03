@@ -68,9 +68,12 @@ pub(crate) fn top_most_dirs(dirs: &[String]) -> Vec<String> {
 
 /// 解析 `p4 ignores -i` 输出：只接受精确的 ` ignored` 后缀，且路径必须出现在请求集合里。
 /// 返回 (命中的路径集合, 无法识别的行数)，无法识别的行绝不会被当成过滤结果。
+///
+/// `requested` 借用调用方已有的路径（`&str`），它只用来做成员判断，不必为此把每个请求
+/// 路径克隆成 `String`。
 pub(crate) fn parse_ignores_output(
     lines: &[String],
-    requested: &HashSet<String>,
+    requested: &HashSet<&str>,
 ) -> (HashSet<String>, usize) {
     let mut ignored = HashSet::new();
     let mut unrecognized = 0;
@@ -201,7 +204,8 @@ pub(crate) async fn query_ignored_dirs(
     }
 
     let batches = compute_batches(&arguments).len();
-    let requested: HashSet<String> = arguments.iter().cloned().collect();
+    // 只借用，不克隆：这个集合只用来判断输出行是不是本批请求过的路径。
+    let requested: HashSet<&str> = arguments.iter().map(String::as_str).collect();
 
     let lines = run_p4_command_batched(
         options,
@@ -486,9 +490,8 @@ mod tests {
 
     #[test]
     fn parses_only_matching_ignore_output() {
-        let requested: HashSet<String> = ["c:\\ws\\a.txt".to_string(), "c:\\ws\\b.txt".to_string()]
-            .into_iter()
-            .collect();
+        // 请求集合借的是调用方已有的路径，这里就照生产用法借字符串字面量。
+        let requested: HashSet<&str> = ["c:\\ws\\a.txt", "c:\\ws\\b.txt"].into_iter().collect();
 
         let lines: Vec<String> = vec![
             "c:\\ws\\a.txt ignored".to_string(),

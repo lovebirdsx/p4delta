@@ -147,6 +147,84 @@ fn clean_never_touches_opened_files() {
     );
 }
 
+/// clean 不消费「已打开」的两组摘要候选：不读它们的文件、不算摘要、也不预热缓存。
+/// `p4 clean` 本来就不碰已打开的文件，为它们读盘算出来的摘要只会被丢掉——而这恰恰是
+/// 用户刚在编辑器里改过、体量最大的那些。
+///
+/// 两个候选都刻意做成「会进入原先摘要路径」的样子：mtime 被 `sandbox.write()` 回拨过
+/// 一小时（避开时间戳捷径），沙箱的摘要缓存又是冷的。三条断言各自独立：
+///
+/// - 输出里没有摘要阶段的字样（`Checking digests` / `Hashed`）；
+/// - 磁盘与 `p4 opened` 一个都没变（跳过不等于把它们当成不存在）；
+/// - 缓存里什么都没留下——下一轮运行时无缓存可加载（由程序自己报告，不必猜缓存路径）。
+#[test]
+fn clean_never_hashes_files_that_are_open() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // revert_edit 候选：打开编辑、内容改了。clean 的 Revert 只管**未打开**的文件，
+    // 所以这一份算出来「与 have 不同」也没有任何动作要用到它。
+    sandbox.p4_ok(&["edit", "readme.txt"]);
+    sandbox.write("readme.txt", "opened and changed\n");
+
+    // revert_delete_or_reopen_edit 候选：打开删除、本地文件又冒出来。
+    sandbox.p4_ok(&["delete", "src/lib.txt"]);
+    sandbox.write("src/lib.txt", "back again\n");
+    let mut opened_before = sandbox.opened();
+    opened_before.sort();
+    assert_eq!(opened_before.len(), 2);
+
+    let output = sandbox
+        .cli()
+        .args(["--clean", "-a", "-l"])
+        .arg(".")
+        .output()
+        .expect("run tool");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // 前置条件也要验：三个没打开的跟踪文件全部被时间戳捷径跳过。跳过数等于候选数，
+    // 说明这一轮**本来就没有**任何文件需要摘要——于是下面那句「一次摘要都没算」不是
+    // 被时间戳顺手掩盖出来的假象，而是真的没人进过摘要阶段。
+    assert!(
+        stdout.contains("Timestamp optimization: Skipped 3 of 3 digest computations (100%)"),
+        "unmodified files should be skipped by the timestamp shortcut:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Checking digests"),
+        "clean 不该为已打开的文件算摘要:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Hashed "),
+        "clean 不该读已打开文件的内容:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("No files to clean, everything up to date."),
+        "{stdout}"
+    );
+
+    // 磁盘与打开状态一个都不能变——「不处理」不包括把它们删掉或写回。
+    assert_eq!(sandbox.read("readme.txt"), "opened and changed\n");
+    assert_eq!(sandbox.read("src/lib.txt"), "back again\n");
+    let mut opened_after = sandbox.opened();
+    opened_after.sort();
+    assert_eq!(
+        opened_after, opened_before,
+        "clean must preserve open actions"
+    );
+
+    // 算过摘要的话缓存里会留下一份，下一轮一开跑就能加载。这一轮什么都没算，
+    // 所以第二轮的启动输出里不该有那句话。
+    let second = sandbox.cli().arg("-l").arg(".").output().expect("run tool");
+    assert!(second.status.success(), "{second:?}");
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        !second_stdout.contains("Loading cache from"),
+        "clean 不该把已打开文件的摘要写进缓存:\n{second_stdout}"
+    );
+}
+
 /// head revision 已被删除、本地文件又冒出来。
 ///
 /// 这是 README「已知问题」里唯一标着「未在真实 depot 上实测过」的一条：

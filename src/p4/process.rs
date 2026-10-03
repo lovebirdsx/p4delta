@@ -224,17 +224,32 @@ pub(crate) fn command_line_safe(path: &str) -> bool {
 
 /// 把一批路径劈成「能交给 p4 命令行的」与「交不出去的」两半，顺序各自保持。
 ///
+/// 消费路径的迭代器而不是先要一个 `&[String]`：调用方的路径常散在自己的结构体里
+/// （[`crate::workspace::apply_file_ignores`] 就是从 `WorkspaceFile` 里逐个借出），
+/// 这样它们不必先克隆出一个中间 `Vec`——每个路径只在这里克隆一次，就是返回的两个
+/// `Vec` 里各归其位的那一份。
+///
 /// 后半不是终点，但两个调用点的善后差得很远，一句通用文案说不准，所以这里只划分、
 /// 不报告——报告交给各自的调用方，在 `-v` 下按自己的口径打印：
 ///
 /// - 文件级过滤有回退：`p4 ignores` 不认 stdin，但 `p4 add -n` 认，于是那些名字改走
 ///   那条字节无损的通道补判（见 [`crate::workspace::apply_file_ignores`]）。
 /// - 目录级剪枝没有回退：交不出去的目录照常完整扫描，只损失性能。
-pub(crate) fn split_command_line_paths(paths: &[String]) -> (Vec<String>, Vec<String>) {
-    paths
-        .iter()
-        .cloned()
-        .partition(|path| command_line_safe(path))
+pub(crate) fn split_command_line_paths<'a>(
+    paths: impl IntoIterator<Item = &'a String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut ready = Vec::new();
+    let mut unreadable = Vec::new();
+
+    for path in paths {
+        if command_line_safe(path) {
+            ready.push(path.clone());
+        } else {
+            unreadable.push(path.clone());
+        }
+    }
+
+    (ready, unreadable)
 }
 
 /// 组装一次「一批路径参数」的 p4 调用，返回命令与要写进 stdin 的载荷。
@@ -484,8 +499,11 @@ pub(crate) async fn run_p4_command_slice(
 }
 
 /// Reads a p4 output stream line by line, decoding each line with the resolved charset.
-/// Streaming keeps large responses (fstat on a big workspace is tens of millions of lines)
-/// from being buffered in full.
+///
+/// Reading line by line keeps the raw bytes of a large response (fstat on a big workspace is
+/// tens of millions of lines) from being buffered whole, but it does not stream the response
+/// to the caller: every decoded line is accumulated, and the returned Vec holds the entire
+/// response.
 pub(crate) async fn read_p4_lines(stream: async_process::ChildStdout) -> io::Result<Vec<String>> {
     let encoding = p4_encoding();
     let mut reader = futures::io::BufReader::with_capacity(READ_BUFFER_SIZE, stream);
@@ -526,9 +544,14 @@ pub(crate) async fn read_p4_stderr(stream: ChildStderr) -> Vec<u8> {
     buffer
 }
 
-/// Maximum number of concurrent p4 processes. The server is configured with maxParallel=8, and
-/// running more clients than that only adds process startup overhead and memory pressure.
-/// Unbounded spawning previously put tens of thousands of p4.exe processes in flight at once.
+/// Upper bound on how many p4 processes one batched call keeps in flight: it is the
+/// `buffered(..)` width inside [`run_p4_command_batched`], and the same width is used by
+/// `run_p4_fstat_batched`. It is a per-call cap, not a global one: it bounds that one call's
+/// stream and says nothing about batched calls running at the same time elsewhere.
+///
+/// The server is configured with maxParallel=8, and running more clients than that only adds
+/// process startup overhead and memory pressure. Unbounded spawning previously put tens of
+/// thousands of p4.exe processes in flight at once.
 pub(crate) const MAX_PARALLEL_P4_COMMANDS: usize = 8;
 
 /// 按参数长度把参数切成若干片：每片交给一个 p4 进程，片数也就是并发度。
@@ -685,6 +708,39 @@ mod tests {
             assert_eq!(ready, paths);
             assert!(unreadable.is_empty());
         }
+    }
+
+    /// 接口消费路径的迭代器：调用方（例如 [`crate::workspace::apply_file_ignores`]）从
+    /// 自己的结构体里逐个借出 `&String` 即可，不必先克隆出一个中间 `Vec`——每个路径只在
+    /// split 里克隆一次。两半同样各自保持原顺序。
+    #[test]
+    fn split_command_line_paths_consumes_a_borrowing_iterator() {
+        struct Entry {
+            path: String,
+        }
+
+        let entries: Vec<Entry> = [r"C:\ws\readme.txt", r"C:\ws\使用说明.txt", r"C:\ws\build"]
+            .into_iter()
+            .map(|path| Entry {
+                path: path.to_owned(),
+            })
+            .collect();
+
+        let (ready, unreadable) = split_command_line_paths(entries.iter().map(|entry| &entry.path));
+
+        let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+        if cfg!(windows) {
+            assert_eq!(ready, [paths[0].clone(), paths[2].clone()]);
+            assert_eq!(unreadable, [paths[1].clone()]);
+        } else {
+            assert_eq!(ready, paths);
+            assert!(unreadable.is_empty());
+        }
+
+        // 空集合照样给回两个空半边，调用方不必自己特判。
+        let none: Vec<String> = Vec::new();
+        let (empty_ready, empty_unreadable) = split_command_line_paths(&none);
+        assert!(empty_ready.is_empty() && empty_unreadable.is_empty());
     }
 
     /// 没有参数时不能加 `-x -`：那会让 p4 去读一个空的 stdin，一个参数都拿不到。

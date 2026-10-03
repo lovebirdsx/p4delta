@@ -37,6 +37,45 @@ pub(crate) struct Analysis<'a> {
     pub(crate) archived_files: Vec<String>,
 }
 
+/// 守卫报错的统一构造：说清触发了哪条规则，再附上判断依据的记录状态。
+///
+/// `label` 是规则短名：`analyze` 用 `rule N`，编号沿用旧消息里的数字，测试按它把每条
+/// 分支的失败行为逐条钉住；`analyze_at_target` 用 `sync`。`missing` 是该规则需要、而
+/// 记录里没有的字段（形状本身未建模的规则传空）——旧消息只有路径和编号，日志里看不出
+/// 记录是什么形状、缺了什么。
+fn guard_error(
+    label: &str,
+    rule: &str,
+    path: &str,
+    record: &DepotFileRecord,
+    missing: &[&str],
+) -> String {
+    let mut message = format!(
+        "Cannot handle \"{path}\" ({label}: {rule}); action={:?} head_action={:?} \
+         head_rev={:?} have_rev={:?}",
+        record.action, record.head_action, record.head_rev, record.have_rev
+    );
+
+    if !missing.is_empty() {
+        message.push_str(&format!("; missing {}", missing.join(", ")));
+    }
+
+    message
+}
+
+/// `(head_type, file_size)` 成对匹配的守卫需要这两个字段：缺哪个列哪个，
+/// 作为 [`guard_error`] 的缺失字段列表。
+fn missing_type_or_size(record: &DepotFileRecord) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if record.head_type.is_none() {
+        missing.push("head_type");
+    }
+    if record.file_size.is_none() {
+        missing.push("file_size");
+    }
+    missing
+}
+
 /// 两阶段分析：phase one 拿 depot 记录找工作区里缺了什么，phase two 反过来。
 pub(crate) fn analyze<'a>(
     depot: &'a DepotState,
@@ -125,7 +164,15 @@ pub(crate) fn analyze<'a>(
                                         }
                                     }
                                 } else {
-                                    bail!("Cannot handle \"{}\" 1", record.client_file);
+                                    let error = guard_error(
+                                        "rule 1",
+                                        "open for delete while the file is still present locally; \
+                                         a digest check needs head_type and file_size",
+                                        &record.client_file,
+                                        record,
+                                        &missing_type_or_size(record),
+                                    );
+                                    bail!("{error}");
                                 }
                             }
                         }
@@ -143,7 +190,17 @@ pub(crate) fn analyze<'a>(
                                 changes.delete.push(record.client_file.clone());
                             }
                         }
-                        _ => bail!("Cannot handle \"{}\" 2", record.client_file),
+                        _ => bail!(
+                            "{}",
+                            guard_error(
+                                "rule 2",
+                                "the file exists at the comparison revision and this client has it synced, but it \
+                                 is open with an action the analysis does not model",
+                                &record.client_file,
+                                record,
+                                &[],
+                            )
+                        ),
                     }
                 }
             }
@@ -155,7 +212,17 @@ pub(crate) fn analyze<'a>(
                         changes.revert_add.push(record.client_file.clone());
                     }
                 }
-                _ => bail!("Cannot handle \"{}\" 3", record.client_file),
+                _ => bail!(
+                    "{}",
+                    guard_error(
+                        "rule 3",
+                        "the file is not in the depot at head, and is open with an action \
+                         other than add/move-add/branch",
+                        &record.client_file,
+                        record,
+                        &[],
+                    )
+                ),
             },
         }
     }
@@ -193,7 +260,17 @@ pub(crate) fn analyze<'a>(
                         None => {
                             changes.add.push(file.path.clone());
                         }
-                        _ => bail!("Cannot handle \"{}\" 5", file.path),
+                        _ => bail!(
+                            "{}",
+                            guard_error(
+                                "rule 5",
+                                "deleted at the comparison revision while the file is still present locally, but \
+                                 open with an action the analysis does not model",
+                                &file.path,
+                                record,
+                                &[],
+                            )
+                        ),
                     }
                 }
                 // It already exists in the depot, check if we need to do something.
@@ -228,7 +305,14 @@ pub(crate) fn analyze<'a>(
                                     }
                                 }
                             } else {
-                                bail!("Cannot handle \"{}\" 6", file.path);
+                                let error = guard_error(
+                                    "rule 6",
+                                    "open for edit; a digest check needs head_type and file_size",
+                                    &file.path,
+                                    record,
+                                    &missing_type_or_size(record),
+                                );
+                                bail!("{error}");
                             }
                         }
                         // We don't have it open, check if we should.
@@ -257,7 +341,17 @@ pub(crate) fn analyze<'a>(
                                 }
                             }
                         }
-                        _ => bail!("Cannot handle \"{}\" 7", file.path),
+                        _ => bail!(
+                            "{}",
+                            guard_error(
+                                "rule 7",
+                                "the file exists at the comparison revision and this client has it synced, but it \
+                                 is open with an action the analysis does not model",
+                                &file.path,
+                                record,
+                                &[],
+                            )
+                        ),
                     }
                 }
             }
@@ -295,14 +389,10 @@ pub(crate) struct DigestCheck<'a> {
     pub(crate) digest_type: DigestType,
 }
 
-/// [`analyze_at_target`] 的全部产出。
-///
-/// 与 [`Analysis`] 平行而不是复用：那八类对着 `p4 reconcile` 的分类学，被测试逐条钉死；
-/// 这里的分法只服务于「把工作区拉到目标版本」，判据与动作都不一样。
-/// 目标时刻该路径不在库、本地却有的文件。
+/// 目标时刻该路径不在库、本地却有的文件：要删掉。
 ///
 /// 两个路径都有用处，且都不是摆设：本地路径用来删文件，depot 路径用来让 p4 清掉 have
-/// 记录（两者各有一种对方覆盖不到的情形，见 `sync::SyncChanges` 里删除组的注释）。
+/// 记录（两者各有一种对方覆盖不到的情形，见 `sync::DeleteFile` 的注释）。
 pub(crate) struct DeletedAtTarget<'a> {
     pub(crate) record: &'a DepotFileRecord,
     pub(crate) file: &'a WorkspaceFile,
@@ -442,7 +532,15 @@ pub(crate) fn analyze_at_target<'a>(
         }
 
         let (Some(file_type), Some(size)) = (record.head_type, record.file_size) else {
-            bail!("Cannot handle \"{}\" (sync)", record.client_file);
+            let error = guard_error(
+                "sync",
+                "at the target revision with the local file present; a digest check needs \
+                 head_type and file_size",
+                &record.client_file,
+                record,
+                &missing_type_or_size(record),
+            );
+            bail!("{error}");
         };
 
         // 二进制长度不符就已经能判定内容变了，不必再读一遍内容。
@@ -891,17 +989,20 @@ mod tests {
 
     // ---- 未建模的组合必须响亮失败 ----
 
-    /// `(守卫编号, depot 记录, 工作区文件)`。
+    /// `(守卫编号, depot 记录, 工作区文件, 错误里必须说清的记录状态)`。
     type UnhandledCase = (
         &'static str,
         DepotFileRecord,
         &'static [(&'static str, u64, bool)],
+        &'static str,
     );
 
     /// 遇到没建模的记录形状要报错，而不是猜一个分类——猜错会直接改到用户的
-    /// changelist。每条守卫都带上文件名，好知道是哪个文件触发的。
+    /// changelist。每条守卫的报错都要带上：编号（把用例与源码里的守卫一一对上）、
+    /// 规则描述，以及判断所依据的记录状态（action / head / have；缺字段的规则还要
+    /// 列出缺了什么）——光有一个文件路径，日志里看不出为什么失败。
     ///
-    /// 编号对应源码里的 `Cannot handle "{}" N`。7 号（phase two 里 action 是
+    /// 编号对应源码里 `guard_error` 的 `rule N`。7 号（phase two 里 action 是
     /// add/branch 之类）测不到：phase one 遍历全部 depot 记录，同一条记录会先在
     /// 那边以 2 号失败。
     #[test]
@@ -915,6 +1016,8 @@ mod tests {
                     ..synced_record(PATH)
                 },
                 &[(PATH, SIZE, false)],
+                // 记录里 file_size 还在，缺的只有 head_type。
+                "missing head_type",
             ),
             (
                 "2",
@@ -923,6 +1026,7 @@ mod tests {
                     ..synced_record(PATH)
                 },
                 &[],
+                "action=Some(Add)",
             ),
             (
                 "3",
@@ -931,6 +1035,7 @@ mod tests {
                     ..open_add_record(PATH)
                 },
                 &[],
+                "head_action=None",
             ),
             (
                 "5",
@@ -940,6 +1045,7 @@ mod tests {
                     ..synced_record(PATH)
                 },
                 &[(PATH, SIZE, false)],
+                "head_action=Some(Delete)",
             ),
             (
                 "6",
@@ -949,10 +1055,11 @@ mod tests {
                     ..synced_record(PATH)
                 },
                 &[(PATH, SIZE, false)],
+                "missing head_type",
             ),
         ];
 
-        for (number, record, workspace_entries) in cases {
+        for (number, record, workspace_entries, shape) in cases {
             let depot = depot_state(vec![record]);
             let workspace = workspace_state(workspace_entries);
             let error = analyze(&depot, &workspace, false)
@@ -960,8 +1067,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("case {number} must fail"))
                 .to_string();
 
+            // 编号仍在：它把用例与源码里的守卫一一对上。
             assert!(
-                error.contains(&format!("Cannot handle \"{PATH}\" {number}")),
+                error.contains(&format!("Cannot handle \"{PATH}\" (rule {number}:")),
+                "case {number}: {error}"
+            );
+            // 光有编号没用：记录长什么样、这条规则缺了什么，都要写出来。
+            assert!(error.contains(shape), "case {number}: {error}");
+            assert!(
+                error.contains("head_rev=") && error.contains("have_rev="),
                 "case {number}: {error}"
             );
         }
@@ -1337,5 +1451,29 @@ mod tests {
 
         assert_eq!(non_empty_sync_groups(&analysis), ["update"]);
         assert_eq!(analysis.update.len(), 1);
+    }
+
+    /// 本地在位、have 与目标一致，但记录缺 head_type：摘要算不了，必须响亮失败。
+    /// 报错也要带上记录形状——旧消息只有一个文件路径。
+    #[test]
+    fn a_sync_record_without_a_type_fails_loudly_with_its_shape() {
+        let depot = depot_state(vec![DepotFileRecord {
+            head_type: None,
+            ..synced_record(PATH)
+        }]);
+        let target = head_target(&depot.file_records);
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+
+        let error = analyze_at_target(&depot, &workspace, &target)
+            .err()
+            .expect("a record without head_type must fail")
+            .to_string();
+
+        assert!(
+            error.contains(&format!("Cannot handle \"{PATH}\" (sync:")),
+            "{error}"
+        );
+        assert!(error.contains("missing head_type"), "{error}");
+        assert!(error.contains("have_rev=Some(1)"), "{error}");
     }
 }

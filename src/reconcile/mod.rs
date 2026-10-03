@@ -23,7 +23,9 @@ use sync::{apply_sync, build_sync_changes};
 use crate::cache::{CacheWriter, save_cache};
 use crate::cli::Options;
 use crate::digest::{CachePolicy, is_unchanged_since_sync, parallel_compute_digests};
-use crate::model::{DepotState, HaveRecord, TargetMap, WorkspaceCache, WorkspaceState};
+use crate::model::{
+    DepotState, DigestType, HaveRecord, TargetMap, WorkspaceCache, WorkspaceFile, WorkspaceState,
+};
 use crate::p4::fstat::{run_p4_fstat_all, run_p4_fstat_at_revision};
 use crate::p4::process::{FailureMode, run_p4_command_batched, run_p4_have};
 use crate::prune::PrunePlan;
@@ -166,139 +168,59 @@ pub(crate) async fn reconcile_dir(
     // clean 模式会删掉一个 p4 根本不管的文件。
     changes.add = filter_unmapped_paths(options, work_dir, &changes.add).await?;
 
-    // Track timestamp optimization stats
-    let mut total_skipped = 0;
-    let mut total_candidates = 0;
-
-    // Filter files using timestamp optimization
-    let check_edit_filtered = if !check_edit.is_empty() {
-        let original_count = check_edit.len();
-        total_candidates += original_count;
-
-        let (unchanged, needs_digest): (Vec<_>, Vec<_>) = check_edit
-            .into_iter()
-            .partition(|(file, _)| is_unchanged_since_sync(file, &have_records));
-
-        total_skipped += unchanged.len();
-
-        if !unchanged.is_empty() && options.verbose {
-            println!(
-                "   Skipped {} file(s) unchanged since sync (check_edit).",
-                unchanged.len()
-            );
-        }
-
-        needs_digest
-    } else {
-        Vec::new()
-    };
-
-    let (check_revert_edit_filtered, check_revert_edit_reverted) = if !check_revert_edit.is_empty()
-    {
-        let original_count = check_revert_edit.len();
-        total_candidates += original_count;
-
-        let (unchanged, needs_digest): (Vec<_>, Vec<_>) = check_revert_edit
-            .into_iter()
-            .partition(|(file, _)| is_unchanged_since_sync(file, &have_records));
-
-        total_skipped += unchanged.len();
-
-        if !unchanged.is_empty() && options.verbose {
-            println!(
-                "   Skipped {} file(s) unchanged since sync (check_revert_edit).",
-                unchanged.len()
-            );
-        }
-
-        (needs_digest, unchanged)
-    } else {
+    // clean 模式不消费「已打开」的两组候选：`p4 clean` 不碰已打开的文件，
+    // [`CleanChanges::project`] 把这两组的结论整个丢弃——为它们读文件算摘要、写缓存
+    // 都是白烧在最贵的一批候选上。在任何摘要工作之前摘掉，open 模式一个字节不动。
+    let (check_revert_edit, check_revert_delete_or_reopen_edit) = if options.clean {
         (Vec::new(), Vec::new())
+    } else {
+        (check_revert_edit, check_revert_delete_or_reopen_edit)
     };
 
-    let (check_revert_delete_filtered, check_revert_delete_reverted) =
-        if !check_revert_delete_or_reopen_edit.is_empty() {
-            let original_count = check_revert_delete_or_reopen_edit.len();
-            total_candidates += original_count;
+    // 三组候选的时间戳快筛：判据相同，快筛与统计共用；「未改动」那批的归宿不同，
+    // 留在各组自己手里（见下面三段）。
+    let mut timestamps = TimestampStats::new(options.verbose);
+    let edit = timestamps.filter(check_edit, &have_records, "check_edit");
+    let revert_edit = timestamps.filter(check_revert_edit, &have_records, "check_revert_edit");
+    let revert_delete = timestamps.filter(
+        check_revert_delete_or_reopen_edit,
+        &have_records,
+        "check_revert_delete",
+    );
 
-            let (unchanged, needs_digest): (Vec<_>, Vec<_>) = check_revert_delete_or_reopen_edit
-                .into_iter()
-                .partition(|(file, _)| is_unchanged_since_sync(file, &have_records));
-
-            total_skipped += unchanged.len();
-
-            if !unchanged.is_empty() && options.verbose {
-                println!(
-                    "   Skipped {} file(s) unchanged since sync (check_revert_delete).",
-                    unchanged.len()
-                );
-            }
-
-            (needs_digest, unchanged)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
-    if total_skipped > 0 {
-        // Skipped files are a subset of the candidates, so the divisor is non-zero here;
-        // `checked_div` keeps that from being load-bearing.
-        let percentage = (total_skipped * 100)
-            .checked_div(total_candidates)
-            .unwrap_or(0);
-        println!(
-            "   Timestamp optimization: Skipped {} of {} digest computations ({}%).",
-            total_skipped, total_candidates, percentage
-        );
+    if let Some(summary) = timestamps.summary() {
+        println!("{summary}");
     }
 
     // Phase 2: Compute digests for files that need checking
 
     // Compute digests to see if we need to open files for edit.
-    if !check_edit_filtered.is_empty() {
-        println!(
-            "   Checking digests for {} files.",
-            check_edit_filtered.len()
-        );
+    if !edit.needs_digest.is_empty() {
+        println!("   Checking digests for {} files.", edit.needs_digest.len());
 
-        let start_time = Instant::now();
-        let mut total_size = 0;
-
-        let results = parallel_compute_digests(check_edit_filtered, cache, CachePolicy::Use)?;
+        let mut hashed = HashStats::new();
+        let results = parallel_compute_digests(edit.needs_digest, cache, CachePolicy::Use)?;
         // Persist as we go: this phase dominates the runtime, and a later failure must not
         // discard everything it produced.
         save_cache(cache_writer, cache, false)?;
-        for result in results {
-            if !result.2 {
-                total_size += result.0.size;
-            }
+        for outcome in results {
+            hashed.record(outcome.from_cache, outcome.file.size);
 
-            let record = depot
-                .get_client_record(&result.0.path_lower)
-                .ok_or_else(|| anyhow!("Failed to find depot record for {}", result.0.path))?;
-            let expected_digest = record
-                .digest
-                .ok_or_else(|| anyhow!("Missing digest for {}", record.depot_file))?;
-            if result.1 != expected_digest {
-                changes.edit.push(result.0.path.clone());
+            // 摘要不等就是 edit：工作区这一份已经不是 have 那一版了。
+            if outcome.digest != expected_digest(&depot, outcome.file)? {
+                changes.edit.push(outcome.file.path.clone());
 
                 if options.verbose {
-                    println!("         File \"{}\" digest is wrong.", result.0.path);
+                    println!("         File \"{}\" digest is wrong.", outcome.file.path);
                 }
             }
         }
-
-        if total_size > 0 {
-            println!(
-                "      Hashed {} in {} seconds.",
-                format_size(total_size, BINARY),
-                start_time.elapsed().as_secs_f32()
-            );
-        }
+        hashed.report();
     }
 
     // Compute digests to see if we need to revert files open for edit.
     // First add the files we already know are unchanged
-    for (file, _) in check_revert_edit_reverted {
+    for (file, _) in revert_edit.unchanged {
         changes.revert_edit.push(file.path.clone());
         if options.verbose {
             println!(
@@ -308,50 +230,33 @@ pub(crate) async fn reconcile_dir(
         }
     }
 
-    if !check_revert_edit_filtered.is_empty() {
+    if !revert_edit.needs_digest.is_empty() {
         println!(
             "   Checking digests for {} files.",
-            check_revert_edit_filtered.len()
+            revert_edit.needs_digest.len()
         );
 
-        let start_time = Instant::now();
-        let mut total_size = 0;
-
-        let results =
-            parallel_compute_digests(check_revert_edit_filtered, cache, CachePolicy::Use)?;
+        let mut hashed = HashStats::new();
+        let results = parallel_compute_digests(revert_edit.needs_digest, cache, CachePolicy::Use)?;
         save_cache(cache_writer, cache, false)?;
-        for result in results {
-            if !result.2 {
-                total_size += result.0.size;
-            }
+        for outcome in results {
+            hashed.record(outcome.from_cache, outcome.file.size);
 
-            let record = depot
-                .get_client_record(&result.0.path_lower)
-                .ok_or_else(|| anyhow!("Failed to find depot record for {}", result.0.path))?;
-            let expected_digest = record
-                .digest
-                .ok_or_else(|| anyhow!("Missing digest for {}", record.depot_file))?;
-            if result.1 == expected_digest {
-                changes.revert_edit.push(result.0.path.clone());
+            // 这一组反过来：摘要与 have 相等才是「打开了编辑却没改」，该 revert。
+            if outcome.digest == expected_digest(&depot, outcome.file)? {
+                changes.revert_edit.push(outcome.file.path.clone());
 
                 if options.verbose {
-                    println!("         File \"{}\" digest is correct.", result.0.path);
+                    println!("         File \"{}\" digest is correct.", outcome.file.path);
                 }
             }
         }
-
-        if total_size > 0 {
-            println!(
-                "      Hashed {} in {} seconds.",
-                format_size(total_size, BINARY),
-                start_time.elapsed().as_secs_f32()
-            );
-        }
+        hashed.report();
     }
 
     // Compute digests to see if we need to revert deletes or reopen files for edit.
     // First add the files we already know are unchanged (revert delete)
-    for (file, _) in check_revert_delete_reverted {
+    for (file, _) in revert_delete.unchanged {
         changes.revert_delete.push(file.path.clone());
         if options.verbose {
             println!(
@@ -361,51 +266,36 @@ pub(crate) async fn reconcile_dir(
         }
     }
 
-    if !check_revert_delete_filtered.is_empty() {
+    if !revert_delete.needs_digest.is_empty() {
         println!(
             "   Checking digests for {} files.",
-            check_revert_delete_filtered.len()
+            revert_delete.needs_digest.len()
         );
 
-        let start_time = Instant::now();
-        let mut total_size = 0;
-
+        let mut hashed = HashStats::new();
         let results =
-            parallel_compute_digests(check_revert_delete_filtered, cache, CachePolicy::Use)?;
+            parallel_compute_digests(revert_delete.needs_digest, cache, CachePolicy::Use)?;
         save_cache(cache_writer, cache, false)?;
-        for result in results {
-            if !result.2 {
-                total_size += result.0.size;
-            }
+        for outcome in results {
+            hashed.record(outcome.from_cache, outcome.file.size);
 
-            let record = depot
-                .get_client_record(&result.0.path_lower)
-                .ok_or_else(|| anyhow!("Failed to find depot record for {}", result.0.path))?;
-            let expected_digest = record
-                .digest
-                .ok_or_else(|| anyhow!("Missing digest for {}", record.depot_file))?;
-            if result.1 == expected_digest {
-                changes.revert_delete.push(result.0.path.clone());
+            // 打开删除、本地文件却还在：摘要与 have 相等说明内容没动过，撤销那次删除；
+            // 不等则是本地又改了，重新打开成 edit 才跟得上内容。
+            if outcome.digest == expected_digest(&depot, outcome.file)? {
+                changes.revert_delete.push(outcome.file.path.clone());
 
                 if options.verbose {
-                    println!("         File \"{}\" digest is correct.", result.0.path);
+                    println!("         File \"{}\" digest is correct.", outcome.file.path);
                 }
             } else {
-                changes.reopen_edit.push(result.0.path.clone());
+                changes.reopen_edit.push(outcome.file.path.clone());
 
                 if options.verbose {
-                    println!("         File \"{}\" digest is wrong.", result.0.path);
+                    println!("         File \"{}\" digest is wrong.", outcome.file.path);
                 }
             }
         }
-
-        if total_size > 0 {
-            println!(
-                "      Hashed {} in {} seconds.",
-                format_size(total_size, BINARY),
-                start_time.elapsed().as_secs_f32()
-            );
-        }
+        hashed.report();
     }
 
     // clean 模式下只有「未打开」的三类要动作，投影之后的数目才是这一轮真正要处理的。
@@ -495,6 +385,129 @@ pub(crate) async fn reconcile_dir(
     Ok(())
 }
 
+// ---- 摘要阶段的小工具 ----
+//
+// open / clean 的三组候选（edit / revert edit / revert delete or reopen edit）判据与动作
+// 各不相同，刻意不合并；只抽出真正一样的两块：时间戳快筛（含统计与文案），
+// 以及「期望摘要 + 读盘计价」。
+
+/// 一组候选经过时间戳快筛后的两半。
+struct FilteredCandidates<'a> {
+    /// 需要真算摘要的。
+    needs_digest: Vec<(&'a WorkspaceFile, DigestType)>,
+
+    /// 被时间戳捷径**视为**未改动的：不读文件就能下结论。
+    ///
+    /// 捷径只保证 mtime 与 have 的 syncTime 相差不超过一秒，那不是证明。后两组里
+    /// 这批直接成为 revert 动作，edit 组里则只是被丢掉——归宿不同，由调用方按组处理。
+    unchanged: Vec<(&'a WorkspaceFile, DigestType)>,
+}
+
+/// 时间戳快筛的累计账目：三组共用一份，末尾合成一行汇总。
+struct TimestampStats {
+    verbose: bool,
+    candidates: usize,
+    skipped: usize,
+}
+
+impl TimestampStats {
+    fn new(verbose: bool) -> Self {
+        TimestampStats {
+            verbose,
+            candidates: 0,
+            skipped: 0,
+        }
+    }
+
+    /// 快筛一组候选。`phase` 是 verbose 文案里的组名，三组各自保留自己的名字
+    /// （第三组的字段叫 `check_revert_delete_or_reopen_edit`，文案里是 `check_revert_delete`）。
+    fn filter<'a>(
+        &mut self,
+        candidates: Vec<(&'a WorkspaceFile, DigestType)>,
+        have_records: &HashMap<String, HaveRecord>,
+        phase: &str,
+    ) -> FilteredCandidates<'a> {
+        self.candidates += candidates.len();
+
+        let (unchanged, needs_digest): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|(file, _)| is_unchanged_since_sync(file, have_records));
+
+        self.skipped += unchanged.len();
+
+        if !unchanged.is_empty() && self.verbose {
+            println!(
+                "   Skipped {} file(s) unchanged since sync ({phase}).",
+                unchanged.len()
+            );
+        }
+
+        FilteredCandidates {
+            needs_digest,
+            unchanged,
+        }
+    }
+
+    /// 汇总行；一个都没跳过时不作声。跳过的文件是候选的子集，所以除数非零，
+    /// `checked_div` 只是不让它成为前提。
+    fn summary(&self) -> Option<String> {
+        (self.skipped > 0).then(|| {
+            let percentage = (self.skipped * 100)
+                .checked_div(self.candidates)
+                .unwrap_or(0);
+            format!(
+                "   Timestamp optimization: Skipped {} of {} digest computations ({}%).",
+                self.skipped, self.candidates, percentage
+            )
+        })
+    }
+}
+
+/// 一条候选的期望摘要：从 depot 记录里取。取不到就是分析结果与 depot 状态对不上，
+/// 期望值不存在时「相等」与「不等」两个结论都是假的，必须响亮失败。
+fn expected_digest(depot: &DepotState, file: &WorkspaceFile) -> Result<[u8; 16]> {
+    let record = depot
+        .get_client_record(&file.path_lower)
+        .ok_or_else(|| anyhow!("Failed to find depot record for {}", file.path))?;
+
+    record
+        .digest
+        .ok_or_else(|| anyhow!("Missing digest for {}", record.depot_file))
+}
+
+/// 一段摘要阶段的读盘账目，收尾时合成 `Hashed` 那行。open / clean 与 sync 共用。
+struct HashStats {
+    total_size: u64,
+    start: Instant,
+}
+
+impl HashStats {
+    fn new() -> Self {
+        HashStats {
+            total_size: 0,
+            start: Instant::now(),
+        }
+    }
+
+    /// 记一条摘要结果。缓存命中没有产生任何读盘，不能算进这一段的计价里。
+    fn record(&mut self, from_cache: bool, size: u64) {
+        if !from_cache {
+            self.total_size += size;
+        }
+    }
+
+    /// 一个字都没读时不作声——缓存全命中时那行本来就该缺席。
+    fn report(&self) {
+        if self.total_size > 0 {
+            println!(
+                "      Hashed {} in {} seconds.",
+                format_size(self.total_size, BINARY),
+                self.start.elapsed().as_secs_f32()
+            );
+        }
+    }
+}
+
 // ---- 从工作区删除文件 ----
 //
 // 放在这里而不是留在 clean 里：sync 也有「从工作区删文件」这一类动作（它删的是
@@ -577,7 +590,125 @@ fn handoff_specs(depot_files: &[String], to: Option<u32>) -> Vec<String> {
 mod tests {
     use super::*;
 
-    use crate::test_util::{TempTree, symlink_file};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use crate::model::DepotFileRecord;
+    use crate::path::local_path_key;
+    use crate::test_util::{TempTree, depot_record, symlink_file};
+
+    // ---- 摘要阶段的小工具 ----
+
+    /// 一个 mtime 距 UNIX_EPOCH 指定秒数的工作区文件。
+    fn dated_file(path: &str, modified: u64) -> WorkspaceFile {
+        WorkspaceFile {
+            path: path.to_owned(),
+            path_lower: local_path_key(path),
+            date: UNIX_EPOCH + Duration::from_secs(modified),
+            ..Default::default()
+        }
+    }
+
+    /// 一条带 syncTime 的 have 记录，键与 [`dated_file`] 同口径。
+    fn have_synced_at(path: &str, sync_time: u64) -> HashMap<String, HaveRecord> {
+        HashMap::from([(
+            local_path_key(path),
+            HaveRecord {
+                sync_time: Some(sync_time),
+            },
+        )])
+    }
+
+    /// 时间戳快筛把候选切成「要算摘要」与「未改动」两半，并把两组数都记进整轮账目。
+    #[test]
+    fn the_timestamp_filter_splits_candidates_and_counts_them() {
+        let untouched = dated_file(r"C:\ws\untouched.txt", 100);
+        let touched = dated_file(r"C:\ws\touched.txt", 100);
+        // 只有 touched 的 syncTime 差得远：untouched 与 have 同一时刻，走得掉捷径。
+        let mut have_records = have_synced_at(&untouched.path, 100);
+        have_records.extend(have_synced_at(&touched.path, 3_600));
+
+        let mut stats = TimestampStats::new(false);
+        let filtered = stats.filter(
+            vec![(&untouched, DigestType::Text), (&touched, DigestType::Text)],
+            &have_records,
+            "check_edit",
+        );
+
+        assert_eq!(filtered.unchanged.len(), 1);
+        assert_eq!(filtered.unchanged[0].0.path, untouched.path);
+        assert_eq!(filtered.needs_digest.len(), 1);
+        assert_eq!(filtered.needs_digest[0].0.path, touched.path);
+
+        // 账目按整轮算：跳过的与候选的总数都留着给末尾那行汇总用。
+        assert_eq!(stats.skipped, 1);
+        assert_eq!(stats.candidates, 2);
+    }
+
+    /// 汇总行只在确实跳过过东西时出现；百分比按整轮的候选数算。
+    #[test]
+    fn the_timestamp_summary_reports_the_skipped_share() {
+        let mut stats = TimestampStats::new(false);
+        assert_eq!(stats.summary(), None, "一个都没跳过时不该有汇总行");
+
+        stats.candidates = 4;
+        stats.skipped = 1;
+        let summary = stats.summary().expect("跳过了就该有汇总行");
+        assert!(
+            summary.contains("Skipped 1 of 4 digest computations (25%)"),
+            "{summary}"
+        );
+        // 前导空格是输出契约的一部分：和上下文那几行对齐。
+        assert!(
+            summary.starts_with("   Timestamp optimization: "),
+            "{summary}"
+        );
+
+        // 全部跳过（分子等于分母）是合法的：100% 不该成为除零的牺牲品。
+        stats.skipped = 4;
+        let summary = stats.summary().expect("跳过了就该有汇总行");
+        assert!(summary.contains("(100%)"), "{summary}");
+    }
+
+    /// 期望摘要必须从 depot 记录里取，两种取不到都要响亮失败：期望值不存在时，
+    /// 「相等」与「不等」两个结论都是假的，将就其中任何一个都会静默给出错误动作。
+    #[test]
+    fn the_expected_digest_comes_from_the_depot_record() {
+        let mut depot = DepotState::default();
+        depot.file_records = vec![DepotFileRecord {
+            digest: Some([0x5A; 16]),
+            ..depot_record("a.txt")
+        }];
+        depot.build_mapping();
+
+        let file = dated_file("a.txt", 100);
+        assert_eq!(expected_digest(&depot, &file).unwrap(), [0x5A; 16]);
+
+        let unknown = dated_file("missing.txt", 100);
+        let error = expected_digest(&depot, &unknown).expect_err("没有记录必须报错");
+        assert!(
+            error.to_string().contains("Failed to find depot record"),
+            "{error}"
+        );
+
+        // 记录在、摘要缺：fstat 的补查没做全，同样不能将就。
+        let mut without_digest = DepotState::default();
+        without_digest.file_records = vec![depot_record("a.txt")];
+        without_digest.build_mapping();
+
+        let error = expected_digest(&without_digest, &file).expect_err("缺摘要必须报错");
+        assert!(error.to_string().contains("Missing digest"), "{error}");
+    }
+
+    /// 读盘计价只算真的读过的那份：缓存命中没有产生读盘，不能算进去。
+    #[test]
+    fn hash_stats_only_count_what_was_read() {
+        let mut hashed = HashStats::new();
+        hashed.record(true, 4096);
+        hashed.record(false, 100);
+        hashed.record(false, 23);
+
+        assert_eq!(hashed.total_size, 123);
+    }
 
     /// 转交出去的文件在 `--to` 下必须钉住目标 changelist。
     ///

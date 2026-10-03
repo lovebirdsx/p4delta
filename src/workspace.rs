@@ -76,12 +76,11 @@ pub(crate) async fn apply_file_ignores(
     // p4 在命令行上认不出的名字整个不进主查询：一条这样的路径就足以让**整批**失败，
     // 同批里 ASCII 文件的忽略判断会被一起带走（见 [`command_line_safe`]）。
     // 它们改走下面的补充判据，不是被放弃。
-    let (ignores_paths, unreadable_paths) = split_command_line_paths(
-        &files
-            .iter()
-            .map(|file| file.path.clone())
-            .collect::<Vec<_>>(),
-    );
+    //
+    // 直接借出每个 `WorkspaceFile` 的路径给 split，不必先克隆出一个中间 `Vec`：
+    // 每个路径只被克隆一次，就在 split 交出的两半里。
+    let (ignores_paths, unreadable_paths) =
+        split_command_line_paths(files.iter().map(|file| &file.path));
 
     // 交不出去的那些不是被放弃，下面有补充判据接手。只在 `-v` 下说一声：它们现在有解，
     // 不该在正常输出里冒充告警——那会让人以为出了事。
@@ -111,7 +110,9 @@ async fn query_ignores(
         return Ok(0);
     }
 
-    let requested: HashSet<String> = ignores_paths.iter().cloned().collect();
+    // 只借用 `ignores_paths` 里的字符串，不克隆：这个集合只用来判断输出行是不是本批
+    // 请求过的路径。
+    let requested: HashSet<&str> = ignores_paths.iter().map(String::as_str).collect();
 
     // 文件级过滤沿用旧行为：p4 报错只告警，不改变已有结果。
     let ignored_files = run_p4_command_batched(

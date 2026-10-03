@@ -122,6 +122,12 @@ impl std::str::FromStr for FileType {
 
 /// Information about a single file in the depot, returned by p4 fstat queries.
 /// Many of the fields are optional and only appear in specific situations.
+///
+/// **补查会改写一部分字段的版本语义**：本地落后的记录会被 fstat 补查（见 `p4/fstat.rs`
+/// 的回填），之后 `head_type` / `head_action` / `file_size` / `digest`（连同
+/// `unsupported_type`）描述的都是 **have 版本**——与本地文件比对时的基线；而 `head_rev`
+/// 不受影响，始终是 depot 的真实 head 修订号。`head_rev` 与 `have_rev` 之差就是「本地
+/// 落后」的判据。
 #[derive(Default, Debug)]
 pub(crate) struct DepotFileRecord {
     /// Path in depot syntax, such as "//Depot/Stream/File.ext".
@@ -137,31 +143,46 @@ pub(crate) struct DepotFileRecord {
     pub(crate) client_file_lower: String,
 
     /// If the file is in the depot, holds the current file type, such as text+w or binary+l.
+    ///
+    /// 补查后是 **have 版本**的类型：摘要要按本地那一版算，见结构体文档。
     pub(crate) head_type: Option<FileType>,
 
     /// 原始的 `headType` 字符串，只在 [`Self::head_type`] 解析不出来时非空。
     /// 认不出的类型算不了摘要，但不该让整轮 reconcile 失败——分析阶段会把这类
-    /// 记录挑出来转交 `p4 reconcile`。
+    /// 记录挑出来转交 `p4 reconcile`。补查会随 [`Self::head_type`] 一起回填，
+    /// 于是它也是 have 版本的原始串。
     pub(crate) unsupported_type: Option<String>,
 
     /// If the file is in the depot, holds the type of the last change made in the depot.
     /// This tells us if the file existed once but was deleted from the depot.
+    ///
+    /// 补查后是 **have 版本**的动作，见结构体文档。
     pub(crate) head_action: Option<FileAction>,
 
     /// If the file is in the depot, holds the most recent revision number on the server.
+    ///
+    /// 补查**不动**这一项：它始终是真实 head，被换成 have 版本的是类型/动作/大小/摘要
+    /// 那几项，见结构体文档。
     pub(crate) head_rev: Option<u32>,
 
     /// If the file is in the workspace, holds the latest revision that we synced.
-    /// This may be different from head_rev if we are behind, then the digest does not apply.
+    /// This may be different from head_rev if we are behind.
+    ///
+    /// 补查之后，`head_type` / `head_action` / `file_size` / `digest` 描述的就是这一版
+    /// （比较基线），见结构体文档。
     pub(crate) have_rev: Option<u32>,
 
     /// If the file is in a pending changelist, holds what we are doing with it.
     pub(crate) action: Option<FileAction>,
 
     /// If the file is in the depot, holds the expected size on disk.
+    ///
+    /// 补查后是 **have 版本**的大小，见结构体文档。
     pub(crate) file_size: Option<u64>,
 
     /// If the file is in the depot, holds the expected normalized MD5 digest.
+    ///
+    /// 补查后是 **have 版本**的摘要——正是拿来和本地文件比对的那个基线，见结构体文档。
     pub(crate) digest: Option<[u8; 16]>,
 }
 

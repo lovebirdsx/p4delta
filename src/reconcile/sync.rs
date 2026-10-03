@@ -13,11 +13,10 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
-use humansize::{BINARY, format_size};
 
 use super::analyze::{SyncAnalysis, SyncSource, analyze_at_target};
 use super::changes::{render_title, report_group};
-use super::delete_workspace_files;
+use super::{HashStats, delete_workspace_files};
 use crate::cache::{CacheWriter, save_cache};
 use crate::cli::Options;
 use crate::digest::{CachePolicy, is_unchanged_since_sync, parallel_compute_digests};
@@ -517,8 +516,7 @@ pub(crate) async fn build_sync_changes(
         if !needs_digest.is_empty() {
             println!("   Checking digests for {} files.", needs_digest.len());
 
-            let start_time = Instant::now();
-            let mut total_size = 0;
+            let mut hashed = HashStats::new();
 
             let candidates = needs_digest
                 .iter()
@@ -534,32 +532,24 @@ pub(crate) async fn build_sync_changes(
             // 边算边存：这一阶段占掉大部分运行时间，后面的失败不该把它整个丢掉。
             save_cache(cache_writer, cache, false)?;
 
-            for (result, check) in results.into_iter().zip(&needs_digest) {
-                if !result.2 {
-                    total_size += result.0.size;
-                }
+            for (outcome, check) in results.into_iter().zip(&needs_digest) {
+                hashed.record(outcome.from_cache, outcome.file.size);
 
                 // 走到这里必然 have == target_rev，记录里的摘要就是目标版本的摘要
                 // （补查只把 head_rev != have_rev 的记录换成 have 版本的摘要）。
                 let expected_digest = check.source.record.digest.ok_or_else(|| {
                     anyhow!("Missing digest for {}", check.source.record.depot_file)
                 })?;
-                if result.1 != expected_digest {
+                if outcome.digest != expected_digest {
                     drifted.push(check.source);
 
                     if options.verbose {
-                        println!("         File \"{}\" digest is wrong.", result.0.path);
+                        println!("         File \"{}\" digest is wrong.", outcome.file.path);
                     }
                 }
             }
 
-            if total_size > 0 {
-                println!(
-                    "      Hashed {} in {} seconds.",
-                    format_size(total_size, BINARY),
-                    start_time.elapsed().as_secs_f32()
-                );
-            }
+            hashed.report();
         }
     }
 

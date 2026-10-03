@@ -12,7 +12,7 @@ cargo nextest run --all-targets --all-features
 
 CI 以 `-D warnings` 为硬门禁，clippy 有任何警告都算失败。
 
-测试跑的是 cargo-nextest 而不是 `cargo test`：cargo 逐个测试二进制**串行**执行，五个 e2e 二进制就是五轮；nextest 把所有目标的用例放进同一个调度池，并发度默认等于 CPU 数。装一份：
+测试跑的是 cargo-nextest 而不是 `cargo test`：cargo 逐个测试二进制**串行**执行；nextest 把所有目标的用例放进同一个调度池，并发度默认等于 CPU 数。装一份：
 
 ```powershell
 cargo install cargo-nextest --locked     # 或者用 nexte.st 上的预编译包，快得多
@@ -31,6 +31,30 @@ pwsh -File scripts/test-install.ps1        # 或 powershell -File ...
 ```
 
 CI 用 Windows PowerShell 5.1 与 PowerShell 7 各跑一遍。两个脚本都**必须带 UTF-8 BOM**：5.1 对没有 BOM 的文件按系统 ANSI 代码页解析，里面的中文会全变乱码（`test-install.ps1` 有一条断言拦着）。
+
+### 预览性能测量（PowerShell 7）
+
+`scripts/benchmark.ps1` 固定执行预览（`-l`，不传 `-a`），先预热一次，再计时 5 轮：
+
+```powershell
+cargo build --release --locked
+pwsh -File scripts/benchmark.ps1 -Binary ./target/release/p4delta.exe `
+    -Workspace <client> -Path <本地目录> -OutDir <扫描范围外的新输出目录>
+# 可选：-Mode clean，或 -Mode sync -To <CL> -VerifyAll
+# 剪枝对照：相同场景另跑一份 -NoPruneIgnoredDirs
+pwsh -File scripts/test-benchmark.ps1
+```
+
+每次输出到新目录，保留原始 stdout/stderr 与 `result.json`；预热与计时轮的动作和完整路径按区分
+大小写的多重集比较，乱序不算差异，重复数量参与比较。输出目录与测量目录不得互相包含，避免
+基准日志污染扫描。遇到转交原生 P4 的不支持文件时，因清单不完整而拒绝报告成功的基准结果。
+对照不同构建或剪枝开关时，先核对动作一致，再比较多轮耗时，不能只比最快的一轮。
+
+脚本不清除摘要缓存，也不控制操作系统文件缓存；正常档是自然预热后的重复测量，`-VerifyAll`
+仍每轮绕过摘要缓存与时间戳捷径，不是“冷操作系统缓存”测量。峰值工作集只覆盖主进程，
+不包含 P4 子进程；退出后无法取得有效峰值时，使用运行期间每 50 ms 刷新采样所得的下界，
+始终取不到有效值则记 `null`。目前没有分阶段耗时、服务端负载或进程树峰值统计，也不在 CI
+里设耗时硬阈值。脚本测试使用假 CLI 与模拟进程对象，不访问真实 P4。
 
 ### 装本地构建到 P4V 里验证
 
@@ -58,7 +82,7 @@ pwsh -File scripts/install-local.ps1 -Restore     # 把本地安装之前的那�
 bash scripts/test-release.sh
 ```
 
-部分用例需要机器上有 `p4`（用来读 `.p4ignore`、跑真实 marshal 输出）。缺失时它们会打印一行 `skipping: p4 is not available` 后跳过，而不是静默通过——在 CI 日志里看到这一行，说明那次运行并没有覆盖到这些路径。
+部分用例需要机器上有 `p4`（用来读 `.p4ignore`、跑真实 marshal 输出）。缺失时它们会输出 `skipping: p4 is not available` 后跳过，但通过用例的输出默认被捕获，不能靠 CI 日志里没有这行来判断覆盖完整。CI 设置 `P4_E2E_REQUIRED=1`，让缺少工具直接失败。
 
 ### e2e：真实 p4d 沙箱
 
@@ -94,11 +118,11 @@ Windows 上另有一条：**别把这条命令的输出接进管道**（`| tee`�
 
 nextest 是 process-per-test，与「逐个二进制串行」的 cargo 不同：冷缓存时（`cargo clean` 之后，或换了 p4d、改了种子）多个进程会同时走到 `ensure_template` 的「各建各的 staging、抢 rename」那条路径上。正确性由 rename 的原子性保证，模板只可能被发布一次；代价是种子会被重复跑几遍，只影响那一次冷跑。热缓存下是一次毫秒级的 stamp 命中。
 
-clean 模式的三类动作（删未跟踪文件、还原改动、写回缺失文件）在 `tests/e2e_clean.rs` 里对着真实服务器验证过，断言同时落在磁盘内容与 `p4 opened` 上，「已打开的文件不归 clean 管」也有一条专门的用例。仍未自动化的是与 `p4 clean -n` 的逐文件对照——拿它的文件集合与 `--clean -l` 的清单比对，三类动作应当一一对应。
+clean 模式的三类动作（删未跟踪文件、还原改动、写回缺失文件）在 `tests/e2e_clean.rs` 里对着真实服务器验证过，断言同时落在磁盘内容与 `p4 opened` 上，「已打开的文件不归 clean 管」也有一条专门的用例。另有一条「head 已删除、本地文件重现」的用例，用 `p4 clean -n` 的删除判定交叉验证；三类动作与原生清单的逐文件集合对照尚未自动化，不应把该个案当成完整对照覆盖。
 
 sync 模式的四组动作在 `tests/e2e_sync.rs` 里同样对着真实服务器验证：`--to <CL>` 那条用 `p4 fstat` 的 `haveRev` 独立取证（不看工具自己的 stdout），另有两条把「默认档会漏、`--verify-all` 才抓得住」和「原生 `p4 sync -f -n` 里非 `refreshing` 的文件必须被我们的清单覆盖」都做成断言。删除组那两条腿的保证（一条腿失败不让另一条不跑）由 `both_delete_legs_report_their_own_failure` 守着：它把文件摁住让删除被系统拒绝，断言两条腿的失败都出现在错误信息里——改造前这条会红，因为前一条腿的 `?` 会让后一条腿整个不执行。
 
-`--to` 的两个边界在真实仓库上实测过：**查出空目标时工具拒绝执行**（`--to 1` 得到一个 589 文件的工作区该被删光的结论，直接 `bail!`，退出码 1），理由与解析层拒绝 `--to 0` 相同——「目标时刻什么都不存在」不该被静默执行。反过来，**`--to` 给一个超出 head 的 CL 不会得到空目标**：`p4 fstat ./...@999999999` 返回的是 head 状态（p4 把「大于任何已提交 CL 的 N」当成不设限），所以护栏不会被它误触发。
+`--to` 的两个边界也纳入了沙箱自动化：**目标 CL 早于限定子目录首次提交时拒绝执行**，并断言内容、have 和 opened 不变；**超过 head 的 CL 回落到 head**，通过读回 `haveRev` 与内容确认没有误触发空目标护栏。目标号都从沙箱已提交记录取得，不依赖固定种子 CL。另有 have < 目标 < head 的前向同步用例，确认不会越过指定目标。时间戳捷径的用例在修改内容后恢复实际同步时的 mtime，不再依赖测试执行时的当前时钟。
 
 删除组还有一条实测值得记：`p4 sync -f //depot/f#none` 面对**被别的进程占着的文件**会重试约十秒才放弃，而且它会先把 `deleted as` 打到 stdout、把 `unlink: ...` 写到 stderr，**have 记录原样保留**——「看起来成功、其实什么都没做」的典型。这正是那一组的判据必须是 `ExitCodeOrStderr` 而不能是 `ExitCode` 的原因（后者会让它整个隐形），也是 `both_delete_legs_report_their_own_failure` 那条用例要跑十来秒的原因。
 
@@ -117,7 +141,7 @@ src/
   locate.rs            p4 可执行文件的定位（P4_EXE → PATH → P4V 安装目录）
   model.rs             领域数据模型：depot 记录、工作区文件、摘要缓存
   path.rs              本地路径规范化与路径键
-  cache.rs             摘要缓存的落盘（增量保存 + 临时文件改名）
+  cache.rs             摘要缓存的阶段间保存（全量序列化 + 临时文件改名）
   digest.rs            p4 摘要计算与「自 sync 起未改动」判定
   prune.rs             .p4ignore 分析、预扫描、目录剪枝决策
   workspace.rs         工作区文件收集与忽略过滤
@@ -135,14 +159,16 @@ src/
 tests/
   support/             e2e 沙箱框架：p4d 生命周期、数据库模板、环境隔离
   cli.rs               黑盒 CLI 测试（不起服务器，只覆盖参数解析与路径参数的校验）
-  e2e_open.rs          八类变更（11 个用例）
-  e2e_clean.rs         --clean 的三类动作（6 个用例）
-  e2e_sync.rs          --sync 的四组动作、--to <CL> 与 --verify-all（12 个用例）
-  e2e_prune.rs         忽略目录剪枝（6 个用例）
-  e2e_paths.rs         路径形式 / changelist / 缓存复用 / unmap（4 个用例）
-  e2e_charset.rs       非 ASCII 文件名与输出契约（2 个用例）
+  e2e_open.rs          八类变更
+  e2e_clean.rs         --clean 的三类动作与已打开文件的保护
+  e2e_sync.rs          --sync 的四组动作、--to <CL> 与 --verify-all
+  e2e_prune.rs         忽略目录剪枝
+  e2e_paths.rs         路径形式 / changelist / 缓存复用 / unmap
+  e2e_charset.rs       非 ASCII 文件名与输出契约
 install.ps1            安装脚本：铺 exe + 注册 P4V 自定义工具
 scripts/
+  benchmark.ps1        仅预览的多轮计时、动作多重集比对与日志留存（PowerShell 7）
+  test-benchmark.ps1   测量脚本的假 CLI 黑盒测试
   fetch-p4-tools.sh    下载 p4/p4d 到 vendor/（开发与 e2e 用）
   install-local.ps1    构建本地 exe 并装进安装目录，供在 P4V 里验证
   release.sh           发布：改版本号 → 本地门禁 → 提交 → 打 tag → 推送
@@ -150,7 +176,7 @@ scripts/
   test-release.sh      release.sh 的黑盒测试
 ```
 
-依赖方向自下而上、无环：`cli` / `model` / `path` / `charset` / `locate` 不依赖 crate 内其他模块；`p4/*` 依赖它们；`prune` / `workspace` / `cache` / `digest` 再往上一层；`reconcile/*` 在最上面。`lib.rs` 只做模块声明，不反向依赖任何模块。
+阅读时可从 `model` / `path` 等基础模块入手，再看 `p4/*` 的查询和进程管理、`workspace` / `cache` / `digest` 的扫描与摘要，最后看 `reconcile/*` 的分类和动作。`lib.rs` 不仅声明模块，还负责编排参数、缓存生命周期与逐目录执行；`main.rs` 才是薄入口。
 
 ## 发布检查清单
 
