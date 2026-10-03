@@ -75,8 +75,25 @@ pub fn run(mut options: Options) -> Result<()> {
         }
     };
 
+    // 没有路径就无事可做，而「什么事都没做」不该报告成功——P4V 那边的 prompt 留空正好落到
+    // 这里（`-l $D` 展开成空）。空串也算没给（`p4delta -l ""`）：`is_empty()` 时 `all()` 为真，
+    // 一个判断同时覆盖「没给」与「给了空串」。
+    if options.paths.iter().all(|path| path.trim().is_empty()) {
+        bail!("No path given; pass the folder to work on.");
+    }
+
     if options.clean {
         println!("Clean mode: updating the workspace to match the depot.");
+    }
+    if options.sync {
+        // 说清目标是哪个版本：head 与指定 changelist 是两种不同的结果，
+        // 而用户未必记得自己没写 --to。
+        match options.to {
+            Some(changelist) => {
+                println!("Sync mode: updating the workspace to changelist {changelist}.")
+            }
+            None => println!("Sync mode: updating the workspace to the head revision."),
+        }
     }
 
     // Changelist input
@@ -87,6 +104,11 @@ pub fn run(mut options: Options) -> Result<()> {
         n if options.clean => {
             eprintln!("Warning: --changelist {n} is ignored, clean never opens files.")
         }
+        // sync 同理，但这里多一句：想指定目标版本的用法是 `--to`，
+        // 而那正是 `-c` 在别的模式下长得最像的东西。
+        n if options.sync => eprintln!(
+            "Warning: --changelist {n} is ignored, sync never opens files (use --to to pick a target changelist)."
+        ),
         n => println!("Using pending changelist {}.", n),
     }
 
@@ -137,7 +159,11 @@ pub fn run(mut options: Options) -> Result<()> {
     // finishing and never finishing.
     let mut cache_writer = cache_path.map(CacheWriter::new);
 
-    // Process paths from input, do these serially so the output makes more sense
+    // 逐个处理输入里的路径，串行执行，输出才好读。不可用的路径先记下原因：一个都用不上时
+    // 整轮失败（见循环之后），只是其中一部分时最后汇总成一行告警。
+    let mut usable = 0usize;
+    let mut unusable: Vec<String> = Vec::new();
+
     for original_path in &options.paths {
         let mut path: String = original_path.to_owned();
 
@@ -196,11 +222,32 @@ pub fn run(mut options: Options) -> Result<()> {
                     &mut cache,
                     &mut cache_writer,
                 ))?;
+                usable += 1;
             } else {
-                println!("Skipping path \"{}\", is not a directory.", path);
+                unusable.push(format!("\"{original_path}\" is not a directory"));
             }
         } else {
-            println!("Skipping path \"{}\", doesn't exist.", path);
+            unusable.push(format!("\"{original_path}\" does not exist"));
+        }
+    }
+
+    // 一个用得上的路径都没有，等于什么都没做，而「什么都没做」不该报成功。原因一律用
+    // `original_path`：`path` 在上面被归一化、剥通配后缀、绝对化、首字母大写，depot 路径
+    // 翻译失败时还会变成 `\\depot\...` 的样子，拿它报错用户对不上自己输入的东西。
+    if usable == 0 {
+        bail!(
+            "Nothing to work on; p4delta works on folders:\n  {}",
+            unusable.join("\n  ")
+        );
+    }
+    if !unusable.is_empty() {
+        // 告警走 stderr：`-l` 的清单在 stdout 上，别混在一起。
+        eprintln!(
+            "Warning: skipped {} path(s) that cannot be worked on:",
+            unusable.len()
+        );
+        for reason in &unusable {
+            eprintln!("  {reason}");
         }
     }
 

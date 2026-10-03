@@ -36,8 +36,18 @@ $ToolsPath = Join-Path $Root '.p4qt\customtools.xml'
 $ReconcileTool = 'p4delta Reconcile'
 $CleanPreviewTool = 'p4delta Clean (preview)'
 $CleanApplyTool = 'p4delta Clean (APPLY - irreversible)'
-$CleanApplyFolder = 'p4delta (irreversible)'
+$SyncHistoryPreviewTool = 'p4delta Sync to changelist (preview)'
+$SyncHistoryApplyTool = 'p4delta Sync to changelist (APPLY - irreversible)'
+$SyncFolderPreviewTool = 'p4delta Sync this folder to changelist (preview)'
+$SyncFolderApplyTool = 'p4delta Sync this folder to changelist (APPLY - irreversible)'
+$IrreversibleFolder = 'p4delta (irreversible)'
 $OtherTool = '别人的工具 & 中文'
+
+# prompt 文本是契约的一部分（P4V 用它问用户缺的那半个参数），与 Arguments 一样在这里另写
+# 一份：测试要是从 install.ps1 里读，改坏了也测不出来。
+$FolderPromptText = '要同步哪个目录？从 History 视图的路径栏复制（本地路径或 depot 路径都行）：'
+$ChangelistPromptText = '要同步到哪个 changelist？填你在 History 里看到的那个号：'
+
 
 function Assert-True($Condition, [string] $Message) {
     if (-not $Condition) {
@@ -159,7 +169,7 @@ function Assert-OtherToolIntact($doc) {
     Assert-Equal 'false' (Get-ChildText $other 'Refresh') '第三方的 Refresh 不该被改'
 }
 
-function Assert-OurTool($doc, [string] $Name, [string] $Arguments) {
+function Assert-OurTool($doc, [string] $Name, [string] $Arguments, [string] $PromptText = '') {
     $tool = Get-Tool $doc $Name
     Assert-True ($null -ne $tool) "应当注册 $Name"
     Assert-Equal (Join-Path $InstallDir 'p4delta.exe') (Get-ChildText $tool 'Definition/Command') "$Name 的 Command 应当是安装路径"
@@ -168,7 +178,15 @@ function Assert-OurTool($doc, [string] $Name, [string] $Arguments) {
     Assert-Equal 'false' (Get-ChildText $tool 'Console/CloseOnExit') "$Name 不该勾 Close window upon completion"
     Assert-Equal 'true' (Get-ChildText $tool 'AddToContext') "$Name 该进右键菜单"
     Assert-Equal 'true' (Get-ChildText $tool 'Refresh') "$Name 该刷新 P4V"
-    Assert-True ($null -eq $tool.SelectSingleNode('Prompt')) "$Name 不该勾 Prompt for arguments"
+    if ($PromptText) {
+        # 有 Prompt 块 = 勾上 "Prompt for arguments"：$D 得有人填，没这个块参数就是空的。
+        Assert-Equal $PromptText (Get-ChildText $tool 'Prompt/PromptText') "$Name 的 PromptText"
+        # 浏览按钮（`<ShowBrowse>`）不给：2026-10-03 实测它打开的是**文件**选择器、选不了目录，
+        # 而两条 sync 入口问的都是目录。顺带把「没写它」钉住，防止哪天又被顺手加回来。
+        Assert-True ($null -eq $tool.SelectSingleNode('Prompt/ShowBrowse')) "$Name 不该勾 Add file browser to prompt dialog"
+    } else {
+        Assert-True ($null -eq $tool.SelectSingleNode('Prompt')) "$Name 不该勾 Prompt for arguments"
+    }
 }
 
 # ---- 用例 ----
@@ -189,11 +207,17 @@ function Test-FreshInstall {
     Assert-True (Test-Path -LiteralPath $ToolsPath) '应当新建自定义工具文件'
 
     $doc = Read-ToolsDocument
-    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '默认应当注册三个工具'
+    Assert-Equal 7 $doc.SelectNodes('//CustomToolDef').Count '默认应当注册七个工具'
     Assert-Equal 'customtooldeflist' $doc.DocumentElement.GetAttribute('varName') '根元素属性'
     Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
     Assert-OurTool $doc $CleanPreviewTool '--clean -w $c -l %D'
     Assert-OurTool $doc $CleanApplyTool '-a --clean -w $c -l %D'
+    # sync 两条入口各自动一半、手补一半：History 那条自动 changelist（%S），prompt 问目录；
+    # 工作区树那条自动目录（%D），prompt 问 changelist。
+    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncHistoryApplyTool '-a --sync -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderPreviewTool '--sync -w $c -l %D --to $D' $ChangelistPromptText
+    Assert-OurTool $doc $SyncFolderApplyTool '-a --sync -w $c -l %D --to $D' $ChangelistPromptText
 
     # 编码：P4V 自己导出的文件没有 BOM，这里也不该有。
     $head = [System.IO.File]::ReadAllBytes($ToolsPath)[0..2]
@@ -207,7 +231,7 @@ function Test-KeepsForeignToolsAndIsIdempotent {
     Invoke-Installer
     $doc = Read-ToolsDocument
     Assert-OtherToolIntact $doc
-    Assert-Equal 4 $doc.SelectNodes('//CustomToolDef').Count '别人的工具加上我们的三个'
+    Assert-Equal 8 $doc.SelectNodes('//CustomToolDef').Count '别人的工具加上我们的七个'
     Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
 
     # 幂等：再跑一次，内容一字不差，也不该多出备份。默认注册现在含 APPLY 及其子菜单，
@@ -280,30 +304,87 @@ function Test-UpdatesATamperedDefinition {
     Invoke-Installer
 
     $doc = Read-ToolsDocument
-    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '改回来时不该多出节点'
+    Assert-Equal 7 $doc.SelectNodes('//CustomToolDef').Count '改回来时不该多出节点'
     Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
     Assert-OurTool $doc $CleanApplyTool '-a --clean -w $c -l %D'
     Assert-Equal 1 $doc.SelectNodes('//CustomToolFolder').Count '子菜单不该被重复创建'
     $inFolder = $doc.SelectSingleNode(
-        "//CustomToolFolder[Name='$CleanApplyFolder']//CustomToolDef[Definition/Name='$CleanApplyTool']")
+        "//CustomToolFolder[Name='$IrreversibleFolder']//CustomToolDef[Definition/Name='$CleanApplyTool']")
     Assert-True ($null -ne $inFolder) '被挪出去的 APPLY 应当被放回子菜单里'
 }
 
-function Test-CleanApplyUsesASubmenu {
+function Test-IrreversibleToolsUseASubmenu {
     Reset-Root
     Invoke-Installer
 
     $doc = Read-ToolsDocument
-    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '默认三个工具'
+    Assert-Equal 7 $doc.SelectNodes('//CustomToolDef').Count '默认七个工具'
     Assert-OurTool $doc $CleanApplyTool '-a --clean -w $c -l %D'
+    Assert-OurTool $doc $SyncHistoryApplyTool '-a --sync -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderApplyTool '-a --sync -w $c -l %D --to $D' $ChangelistPromptText
 
+    # 三条不可逆的共用一个子菜单，四条安全的都留在顶层。
     $folders = $doc.SelectNodes('//CustomToolFolder')
-    Assert-Equal 1 $folders.Count '不可逆的那个应当单独放在一个子菜单里'
-    Assert-Equal $CleanApplyFolder (Get-ChildText $folders[0] 'Name') '子菜单名'
-    $inFolder = $folders[0].SelectSingleNode(".//CustomToolDef[Definition/Name='$CleanApplyTool']")
-    Assert-True ($null -ne $inFolder) '不可逆的工具应当在这个子菜单里'
-    Assert-True ($null -eq (Get-Tool $doc $ReconcileTool).SelectSingleNode('ancestor::CustomToolFolder')) 'Reconcile 不该被塞进子菜单'
-    Assert-True ($null -eq (Get-Tool $doc $CleanPreviewTool).SelectSingleNode('ancestor::CustomToolFolder')) 'clean 预演也不该被塞进子菜单'
+    Assert-Equal 1 $folders.Count '不可逆的那三条应当共用一个子菜单'
+    Assert-Equal $IrreversibleFolder (Get-ChildText $folders[0] 'Name') '子菜单名'
+    foreach ($name in @($CleanApplyTool, $SyncHistoryApplyTool, $SyncFolderApplyTool)) {
+        $inFolder = $folders[0].SelectSingleNode(".//CustomToolDef[Definition/Name='$name']")
+        Assert-True ($null -ne $inFolder) "$name 应当在这个子菜单里"
+    }
+    foreach ($name in @($ReconcileTool, $CleanPreviewTool, $SyncHistoryPreviewTool, $SyncFolderPreviewTool)) {
+        $tool = Get-Tool $doc $name
+        Assert-True ($null -eq $tool.SelectSingleNode('ancestor::CustomToolFolder')) "$name 不该被塞进子菜单"
+    }
+}
+
+# sync 的两条入口各自动一半、手补一半。这不是偷懒，是 P4V 的两条实测限制逼出来的：
+#   1. 一个工具定义里**只能有一个 `%` 参数**——`%D %S` 同用会当场弹
+#      "More than one replaceable file argument of type %X is not allowed"。
+#   2. 「文件夹的历史」里 `%D` 是空的（变量取不到值时 P4V 干脆不显示带它的工具），
+#      所以 History 视图那条拿不到目录，只能 prompt 手填。
+#
+# `%S`（Selected submitted changelists）只对**已提交**的 changelist 有值，History 那条因此
+# 在 Pending 视图里不触发。换成 `%c` 就漏了：它在 Pending 视图同样有值，会把一个 pending 号
+# 喂给 `--to`，而 changelist 号是创建时分配的——pending 号完全可能小于 head，那一下就是
+# 「退回历史版本并删掉之后新建的文件」。
+#
+# 这条用例把这些选择钉住，免得日后被「统一成 %D / %c」或者「范围改回 $r」顺手改掉。
+function Test-SyncToolsWireUpBothEntryPoints {
+    Reset-Root
+    Invoke-Installer
+
+    $doc = Read-ToolsDocument
+
+    # History 视图那条：changelist 自动，目录由 prompt 补。
+    foreach ($name in @($SyncHistoryPreviewTool, $SyncHistoryApplyTool)) {
+        $arguments = Get-ChildText (Get-Tool $doc $name) 'Definition/Arguments'
+        Assert-True ($arguments -clike '*--to %S*') "$name 应当用 %S 取已提交的 changelist"
+        Assert-True ($arguments -clike '*-l $D*') "$name 应当把目录交给 prompt 的 `$D"
+        Assert-True ($arguments -cnotlike '*%D*') "$name 不能带 %D：一个工具只允许一个 % 参数"
+        Assert-True ($arguments -cnotlike '*%c*') "$name 不该用 %c：它在 Pending 视图里也有值"
+        Assert-True ($arguments -cnotlike '*-l $r*') "$name 不该同步整个工作区：范围要落在 prompt 给的那个目录上"
+        Assert-Equal $FolderPromptText (Get-ChildText (Get-Tool $doc $name) 'Prompt/PromptText') "$name 的 prompt 该问目录"
+    }
+
+    # 工作区树那条：目录自动（右键选中项），changelist 由 prompt 补。
+    foreach ($name in @($SyncFolderPreviewTool, $SyncFolderApplyTool)) {
+        $arguments = Get-ChildText (Get-Tool $doc $name) 'Definition/Arguments'
+        Assert-True ($arguments -clike '*-l %D*') "$name 应当同步右键选中的那个目录"
+        Assert-True ($arguments -clike '*--to $D*') "$name 应当把 changelist 交给 prompt 的 `$D"
+        Assert-True ($arguments -cnotlike '*%S*') "$name 不能带 %S：一个工具只允许一个 % 参数"
+        Assert-True ($arguments -cnotlike '*%c*') "$name 不该用 %c：它在 Pending 视图里也有值"
+        Assert-Equal $ChangelistPromptText (Get-ChildText (Get-Tool $doc $name) 'Prompt/PromptText') "$name 的 prompt 该问 changelist"
+    }
+
+    # 预演与实际执行只差一个 -a，别的部分一字不差——两边的行为才是同一件事。
+    foreach ($pair in @(
+            @($SyncHistoryPreviewTool, $SyncHistoryApplyTool),
+            @($SyncFolderPreviewTool, $SyncFolderApplyTool)
+        )) {
+        $preview = Get-ChildText (Get-Tool $doc $pair[0]) 'Definition/Arguments'
+        $apply = Get-ChildText (Get-Tool $doc $pair[1]) 'Definition/Arguments'
+        Assert-Equal "-a $preview" $apply "$($pair[1]) 应当就是 $($pair[0]) 加一个 -a"
+    }
 }
 
 function Test-WithoutCleanApplySkipsCleanApply {
@@ -311,19 +392,23 @@ function Test-WithoutCleanApplySkipsCleanApply {
     Invoke-Installer @('-WithoutCleanApply')
 
     $doc = Read-ToolsDocument
-    Assert-Equal 2 $doc.SelectNodes('//CustomToolDef').Count '-WithoutCleanApply 时只有两个工具'
+    Assert-Equal 6 $doc.SelectNodes('//CustomToolDef').Count '-WithoutCleanApply 时只有六个工具'
     Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
     Assert-OurTool $doc $CleanPreviewTool '--clean -w $c -l %D'
+    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderPreviewTool '--sync -w $c -l %D --to $D' $ChangelistPromptText
     Assert-True ($null -eq (Get-Tool $doc $CleanApplyTool)) '不可逆的 clean 不该注册'
-    # 全新机器上跑退出口，不该凭空造出（或留下）子菜单目录。
-    Assert-Equal 0 $doc.SelectNodes('//CustomToolFolder').Count '不该有子菜单目录'
+    # 子菜单留着：sync 那两条不可逆的还在里面。clean 的退出口不该把同住一个子菜单的邻居带走。
+    Assert-Equal 1 $doc.SelectNodes('//CustomToolFolder').Count '装 sync 那两条的子菜单还在'
+    Assert-True ($null -ne (Get-Tool $doc $SyncHistoryApplyTool)) 'sync 那两条不受 -WithoutCleanApply 影响'
+    Assert-True ($null -ne (Get-Tool $doc $SyncFolderApplyTool)) 'sync 那两条不受 -WithoutCleanApply 影响'
 }
 
 function Test-WithoutCleanApplyRemovesRegisteredCleanApply {
     Reset-Root
     Write-Utf8NoBom $ToolsPath $OtherToolXml
     Invoke-Installer
-    Assert-Equal 4 (Read-ToolsDocument).SelectNodes('//CustomToolDef').Count '先按默认装齐：别人的一个加我们的三个'
+    Assert-Equal 8 (Read-ToolsDocument).SelectNodes('//CustomToolDef').Count '先按默认装齐：别人的一个加我们的七个'
 
     # -WhatIf：移除只发生在内存里，文件一字不动，也不该产生备份。
     $before = [System.IO.File]::ReadAllBytes($ToolsPath)
@@ -332,18 +417,21 @@ function Test-WithoutCleanApplyRemovesRegisteredCleanApply {
     Assert-BytesEqual $before ([System.IO.File]::ReadAllBytes($ToolsPath)) '-WhatIf 改动了文件'
     Assert-Equal $backupsBefore (Get-BackupCount) '-WhatIf 不该产生备份'
 
-    # 真摘：APPLY 与空掉的子菜单都没了，别人的工具与安全的两条原样。
+    # 真摘：APPLY 没了，别人的工具与安全的四条原样。子菜单留着——sync 那两条不可逆的还在
+    # 里面，只有整个子菜单空了才该清掉（下一个用例覆盖那个分支）。
     # 备份文件名只精确到秒，先跨过一秒——否则这次的备份会覆盖掉上面安装时那份，
     # 「多出一份备份」的断言就会假失败（pwsh 跑得快时真的撞上过）。
     Start-Sleep -Seconds 1
     Invoke-Installer @('-WithoutCleanApply')
     $doc = Read-ToolsDocument
-    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '别人的一个加我们的两个'
+    Assert-Equal 7 $doc.SelectNodes('//CustomToolDef').Count '别人的一个加我们的六个'
     Assert-True ($null -eq (Get-Tool $doc $CleanApplyTool)) 'APPLY 条目应当被摘掉'
-    Assert-Equal 0 $doc.SelectNodes('//CustomToolFolder').Count '空掉的子菜单目录应当被清掉'
+    Assert-Equal 1 $doc.SelectNodes('//CustomToolFolder').Count 'sync 那两条还在，子菜单就该留着'
     Assert-OtherToolIntact $doc
     Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
     Assert-OurTool $doc $CleanPreviewTool '--clean -w $c -l %D'
+    Assert-OurTool $doc $SyncHistoryApplyTool '-a --sync -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderApplyTool '-a --sync -w $c -l %D --to $D' $ChangelistPromptText
     Assert-Equal ($backupsBefore + 1) (Get-BackupCount) '真摘掉了就该走一次备份 + 保存'
 
     # 退出口自身幂等：再跑一次，字节不变、不多出备份。跨过一秒的理由同上一条用例。
@@ -354,33 +442,74 @@ function Test-WithoutCleanApplyRemovesRegisteredCleanApply {
     Assert-Equal ($backupsBefore + 1) (Get-BackupCount) '没变化就不该产生新的备份'
 }
 
-function Test-WithoutCleanApplyKeepsFolderWithForeignTools {
+function Test-IrreversibleFolderKeepsForeignTools {
     Reset-Root
     Invoke-Installer
 
-    # 用户往我们的子菜单里塞了自己的工具：退出口只摘 APPLY，子菜单得留着。
+    # 用户往我们的子菜单里塞了自己的工具：退出口只摘我们的（这里三条不可逆的都摘），
+    # 子菜单得留着。
     $doc = Read-ToolsDocument
-    $folderList = $doc.SelectSingleNode("//CustomToolFolder[Name='$CleanApplyFolder']/CustomToolDefList")
+    $folderList = $doc.SelectSingleNode("//CustomToolFolder[Name='$IrreversibleFolder']/CustomToolDefList")
     Assert-True ($null -ne $folderList) '默认安装应当建出子菜单'
     $otherDoc = New-Object System.Xml.XmlDocument
     $otherDoc.LoadXml($OtherToolXml)
     [void]$folderList.AppendChild($doc.ImportNode($otherDoc.SelectSingleNode('//CustomToolDef'), $true))
     $doc.Save($ToolsPath)
 
-    Invoke-Installer @('-WithoutCleanApply')
+    Invoke-Installer @('-WithoutCleanApply', '-WithoutSyncApply')
 
     $doc = Read-ToolsDocument
     Assert-True ($null -eq (Get-Tool $doc $CleanApplyTool)) 'APPLY 仍然要被摘掉'
+    Assert-True ($null -eq (Get-Tool $doc $SyncHistoryApplyTool)) 'sync 那两条也要被摘掉'
+    Assert-True ($null -eq (Get-Tool $doc $SyncFolderApplyTool)) 'sync 那两条也要被摘掉'
     Assert-True ($null -ne (Get-Tool $doc $OtherTool)) '塞进去的工具不该被动'
-    Assert-Equal 3 $doc.SelectNodes('//CustomToolDef').Count '我们的两条加塞进来的一条'
+    Assert-Equal 5 $doc.SelectNodes('//CustomToolDef').Count '我们的四条加塞进来的一条'
     Assert-Equal 1 $doc.SelectNodes('//CustomToolFolder').Count '子菜单里还有别人的工具，就该留着'
+}
+
+function Test-WithoutSyncApplySkipsSyncApply {
+    Reset-Root
+    Invoke-Installer @('-WithoutSyncApply')
+
+    $doc = Read-ToolsDocument
+    Assert-Equal 5 $doc.SelectNodes('//CustomToolDef').Count '-WithoutSyncApply 时只有五个工具'
+    Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
+    Assert-OurTool $doc $CleanPreviewTool '--clean -w $c -l %D'
+    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderPreviewTool '--sync -w $c -l %D --to $D' $ChangelistPromptText
+    Assert-True ($null -eq (Get-Tool $doc $SyncHistoryApplyTool)) '不可逆的 sync 不该注册'
+    Assert-True ($null -eq (Get-Tool $doc $SyncFolderApplyTool)) '不可逆的 sync 不该注册'
+    # 子菜单留着：clean 那条不可逆的还在里面。sync 的退出口不该把邻居带走。
+    Assert-Equal 1 $doc.SelectNodes('//CustomToolFolder').Count '装 clean 那条的子菜单还在'
+    Assert-True ($null -ne (Get-Tool $doc $CleanApplyTool)) 'clean 那条不受 -WithoutSyncApply 影响'
+}
+
+function Test-BothWithoutSwitchesClearTheFolder {
+    # 全新机器上给两个开关：子菜单一次都不该被建出来。
+    Reset-Root
+    Invoke-Installer @('-WithoutCleanApply', '-WithoutSyncApply')
+    Assert-Equal 0 (Read-ToolsDocument).SelectNodes('//CustomToolFolder').Count '不该凭空造出子菜单'
+
+    # 先按默认装齐、再三条一起摘：空掉的子菜单这时才该清掉（只摘一条时都要留着，
+    # 那几条分支在上面各自的用例里）。
+    Reset-Root
+    Invoke-Installer
+    Assert-Equal 1 (Read-ToolsDocument).SelectNodes('//CustomToolFolder').Count '默认安装应当建出子菜单'
+
+    Invoke-Installer @('-WithoutCleanApply', '-WithoutSyncApply')
+
+    $doc = Read-ToolsDocument
+    Assert-Equal 4 $doc.SelectNodes('//CustomToolDef').Count '三条都摘掉后只剩四条安全的'
+    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderPreviewTool '--sync -w $c -l %D --to $D' $ChangelistPromptText
+    Assert-Equal 0 $doc.SelectNodes('//CustomToolFolder').Count '三条都摘掉后空掉的子菜单应当被清掉'
 }
 
 function Test-Uninstall {
     Reset-Root
     Write-Utf8NoBom $ToolsPath $OtherToolXml
     Invoke-Installer
-    Assert-Equal 4 (Read-ToolsDocument).SelectNodes('//CustomToolDef').Count '装完应当是他们的一个加我们的三个'
+    Assert-Equal 8 (Read-ToolsDocument).SelectNodes('//CustomToolDef').Count '装完应当是他们的一个加我们的七个'
 
     Invoke-Installer @('-Uninstall')
 
@@ -410,10 +539,13 @@ $cases = @(
     'Test-MissingExePathFails',
     'Test-KeepsForeignToolsAndIsIdempotent',
     'Test-UpdatesATamperedDefinition',
-    'Test-CleanApplyUsesASubmenu',
+    'Test-IrreversibleToolsUseASubmenu',
+    'Test-SyncToolsWireUpBothEntryPoints',
     'Test-WithoutCleanApplySkipsCleanApply',
     'Test-WithoutCleanApplyRemovesRegisteredCleanApply',
-    'Test-WithoutCleanApplyKeepsFolderWithForeignTools',
+    'Test-WithoutSyncApplySkipsSyncApply',
+    'Test-BothWithoutSwitchesClearTheFolder',
+    'Test-IrreversibleFolderKeepsForeignTools',
     'Test-Uninstall',
     'Test-WhatIfChangesNothing'
 )

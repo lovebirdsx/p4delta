@@ -62,7 +62,7 @@ bash scripts/test-release.sh
 
 ### e2e：真实 p4d 沙箱
 
-`tests/e2e_*.rs` 为每个用例起一个独立的 p4d 实例，在真服务器上跑完整流程——八类变更、`--clean` 的三类动作、忽略目录剪枝、client view 排除、字符集、缓存复用。数据库模板只生成一次（`<target>/e2e/template-<指纹>/`），之后每个实例从模板复制，所以单个用例的开销在百毫秒级。
+`tests/e2e_*.rs` 为每个用例起一个独立的 p4d 实例，在真服务器上跑完整流程——八类变更、`--clean` 的三类动作、`--sync` 的四组动作、忽略目录剪枝、client view 排除、字符集、缓存复用。数据库模板只生成一次（`<target>/e2e/template-<指纹>/`），之后每个实例从模板复制，所以单个用例的开销在百毫秒级。
 
 ```bash
 # 机器上已经有 p4d（比如随 P4V 装的）就能直接跑
@@ -96,6 +96,16 @@ nextest 是 process-per-test，与「逐个二进制串行」的 cargo 不同：
 
 clean 模式的三类动作（删未跟踪文件、还原改动、写回缺失文件）在 `tests/e2e_clean.rs` 里对着真实服务器验证过，断言同时落在磁盘内容与 `p4 opened` 上，「已打开的文件不归 clean 管」也有一条专门的用例。仍未自动化的是与 `p4 clean -n` 的逐文件对照——拿它的文件集合与 `--clean -l` 的清单比对，三类动作应当一一对应。
 
+sync 模式的四组动作在 `tests/e2e_sync.rs` 里同样对着真实服务器验证：`--to <CL>` 那条用 `p4 fstat` 的 `haveRev` 独立取证（不看工具自己的 stdout），另有两条把「默认档会漏、`--verify-all` 才抓得住」和「原生 `p4 sync -f -n` 里非 `refreshing` 的文件必须被我们的清单覆盖」都做成断言。删除组那两条腿的保证（一条腿失败不让另一条不跑）由 `both_delete_legs_report_their_own_failure` 守着：它把文件摁住让删除被系统拒绝，断言两条腿的失败都出现在错误信息里——改造前这条会红，因为前一条腿的 `?` 会让后一条腿整个不执行。
+
+`--to` 的两个边界在真实仓库上实测过：**查出空目标时工具拒绝执行**（`--to 1` 得到一个 589 文件的工作区该被删光的结论，直接 `bail!`，退出码 1），理由与解析层拒绝 `--to 0` 相同——「目标时刻什么都不存在」不该被静默执行。反过来，**`--to` 给一个超出 head 的 CL 不会得到空目标**：`p4 fstat ./...@999999999` 返回的是 head 状态（p4 把「大于任何已提交 CL 的 N」当成不设限），所以护栏不会被它误触发。
+
+删除组还有一条实测值得记：`p4 sync -f //depot/f#none` 面对**被别的进程占着的文件**会重试约十秒才放弃，而且它会先把 `deleted as` 打到 stdout、把 `unlink: ...` 写到 stderr，**have 记录原样保留**——「看起来成功、其实什么都没做」的典型。这正是那一组的判据必须是 `ExitCodeOrStderr` 而不能是 `ExitCode` 的原因（后者会让它整个隐形），也是 `both_delete_legs_report_their_own_failure` 那条用例要跑十来秒的原因。
+
+真实大工作区上的 A/B 也跑过一轮（客户端的 `Source\Client\Config` 589 文件、`Source\Script\QAScript` 44,554 文件 5.09 GiB）：前者原生 10 个 `updating`、我们 10 个 `Update`，文件集合逐条相同。`--to <CL>` 换成一个能真正区分 head 与目标的目标 CL 后（8984916，那里 `DefaultEngine.ini` 是 `#34`、head 已是 `#35`），两边仍是同样的那 10 个文件。后者整轮 dry run 2.54 s（摘要缓存全命中）。**那里出现过一次分歧**：原生打了 22 行 `deleted as` 而我们说「无事可做」——逐条核实后那 22 个既不在磁盘上也没有 have 记录，原生那几行只是描述目标状态、p4 自己也无事可做，结论钉在 `a_deleted_target_with_nothing_local_is_a_no_op` 里。
+
+这一轮是**一次性的人工核对**，没做成自动化（要连真实的 `songxiao_aki_branch_3.8_2`，CI 上跑不了），而且全程 dry run——`-a` 会动到那份真实工作区。所以它验证的是「取数、分类、集合」三者与原生一致；**「钉住的确实是目标那一版（`#34` 而非 `#35`）」只有沙箱用例有独立取证**（`p4 fstat` 读回的 `haveRev`），工具自己的输出里不打印目标版本号。
+
 ## 项目结构
 
 ```
@@ -120,12 +130,14 @@ src/
     analyze.rs         两阶段差异分析：每个文件落在哪一类变更（纯逻辑）
     changes.rs         变更分类，以及表驱动的报告与应用
     clean.rs           clean 模式：三类动作的投影、报告与执行
+    sync.rs            sync 模式：四类动作的投影、报告与执行（目标版本，默认 head）
   test_util.rs         跨模块共享的测试基建（仅测试构建）
 tests/
   support/             e2e 沙箱框架：p4d 生命周期、数据库模板、环境隔离
-  cli.rs               黑盒 CLI 测试（不起服务器，只覆盖参数解析与跳过路径）
+  cli.rs               黑盒 CLI 测试（不起服务器，只覆盖参数解析与路径参数的校验）
   e2e_open.rs          八类变更（11 个用例）
   e2e_clean.rs         --clean 的三类动作（6 个用例）
+  e2e_sync.rs          --sync 的四组动作、--to <CL> 与 --verify-all（12 个用例）
   e2e_prune.rs         忽略目录剪枝（6 个用例）
   e2e_paths.rs         路径形式 / changelist / 缓存复用 / unmap（4 个用例）
   e2e_charset.rs       非 ASCII 文件名与输出契约（2 个用例）
@@ -164,5 +176,16 @@ scripts/
    一致、CRT 是静态链接的，打包 zip 与 `SHA256SUMS`，建 release。盯进度用 `gh run watch`。
 3. release 建好后，在一台装了 P4V 的机器上核对一遍：从 zip 跑 `install.ps1` → 重启 P4V →
    `Tools > Manage Tools` 里应出现对应条目 → 右键一个无关紧要的目录跑预演确认输出正常。
-   生成 XML 与 P4V 自己 `Export tools...` 的差异也在这里对（见 README「已知问题」里两条未经实测的选项）。
+
+   还要核对 sync 那两条入口各自出现在哪个菜单、命令行拼出来对不对：在 **History 视图**右键
+   一个已提交的 changelist，`p4delta Sync to changelist` 应当出现（预演输出里的 `--to` 就是
+   那一行的号），点它应当弹出问目录的输入框；在 **Workspace / Depot 树**里右键一个目录，
+   `p4delta Sync this folder to changelist` 应当出现，点它问 changelist 号。
+
+   这一段 **2026-10-03 已在本机完整对过**：我们手写的节点在 P4V 重写 `customtools.xml` 时原样
+   保留（与 P4V 自己 `Export tools...` 的输出比对差异为零），两条 sync 入口都出现在预期位置、
+   prompt 留空以退出码 1 报 `No path given`、输出进 P4V 自己的输出窗。之后凡是动过
+   `install.ps1` 里元素形状或 Arguments 的改动，这一段就再走一遍。同样要留意 README 里那条：
+   团队那个 `RunTaskAndSyncFiles.bat` 会拿 depot 的 `tools.xml` 覆盖 `customtools.xml`，跑过
+   一次它之后 p4delta 的七条就全没了，别把"菜单里没有"误判成工具定义写错了。
 

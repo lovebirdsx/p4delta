@@ -223,6 +223,26 @@ impl DepotState {
     }
 }
 
+/// 同步目标里一条记录的状态：该路径在目标版本（head 或某个 changelist）上是什么。
+///
+/// 与 [`DepotFileRecord`] 分开是刻意的。那份记录里的 `digest`、`head_action`、`file_size`
+/// 描述的都是 **have 版本**——fstat 的补查会把它们换成 have 的（见 `p4/fstat.rs` 的回填），
+/// 而这里回答的是另一个问题：「要拉到哪」。两个概念混用一个结构，迟早会有人读错字段。
+///
+/// 目标时刻**不在库**的路径不进这张表：调用方查不到即视为不在库。两种来源都归此列——
+/// 目标时刻已是删除版本，或（只有 changelist 目标才可能）目标时刻它还没进 depot。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TargetRecord {
+    /// 目标时刻的修订号。
+    pub(crate) rev: u32,
+
+    /// 目标时刻的动作。删除类动作表示该路径在目标时刻不在库。
+    pub(crate) action: FileAction,
+}
+
+/// 目标版本的全部记录，键是 `depot_file_lower`（与 [`DepotState`] 的 depot 索引同口径）。
+pub(crate) type TargetMap = HashMap<String, TargetRecord>;
+
 /// Information about a single file in the workspace.
 #[derive(Debug)]
 pub(crate) struct WorkspaceFile {

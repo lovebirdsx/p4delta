@@ -123,17 +123,33 @@ pub(crate) fn is_unchanged_since_sync(
     false
 }
 
+/// 摘要计算要不要吃缓存。
+///
+/// 绝大多数调用点用 [`Self::Use`]——缓存是第二轮快一个数量级的全部原因。`--verify-all`
+/// 用 [`Self::Ignore`]：缓存里放的是**上一轮**算出来的值，拿它下结论就还是推断，而那一档
+/// 的全部意义就是把推断换成验证。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CachePolicy {
+    Use,
+    Ignore,
+}
+
 /// Computes digests for a number of files in the workspace.
+///
+/// `policy` 为 [`CachePolicy::Ignore`] 时跳过缓存查找、逐个重算；重算的结果照常写回缓存，
+/// 默认档接着受益。
 pub(crate) fn parallel_compute_digests<'a>(
     files: Vec<(&'a WorkspaceFile, DigestType)>,
     cache: &mut WorkspaceCache,
+    policy: CachePolicy,
 ) -> Result<Vec<(&'a WorkspaceFile, [u8; 16], bool)>> {
     let results: Result<Vec<(&'a WorkspaceFile, [u8; 16], bool)>> = files
         .into_par_iter()
         .with_max_len(1)
         .map(|file| -> Result<(&'a WorkspaceFile, [u8; 16], bool)> {
             // Check cache first
-            if let Some(cache_entry) = cache.file_map.get(&file.0.path_lower)
+            if policy == CachePolicy::Use
+                && let Some(cache_entry) = cache.file_map.get(&file.0.path_lower)
                 && cache_entry.size == file.0.size
                 && cache_entry.date == file.0.date
             {
@@ -383,8 +399,12 @@ mod tests {
         };
 
         let mut cache = WorkspaceCache::default();
-        let results =
-            parallel_compute_digests(vec![(&file, DigestType::Symlink)], &mut cache).unwrap();
+        let results = parallel_compute_digests(
+            vec![(&file, DigestType::Symlink)],
+            &mut cache,
+            CachePolicy::Use,
+        )
+        .unwrap();
 
         let expected_content = format!("{}\n", target.display().to_string().replace('\\', "/"));
         let expected: [u8; 16] = Md5::digest(expected_content.as_bytes()).into();
@@ -394,6 +414,54 @@ mod tests {
             "digest must be computed, not served from the cache"
         );
         assert!(cache.file_map.contains_key(&file.path_lower));
+    }
+
+    /// `--verify-all` 的立身之本：缓存里的值再「新鲜」也不能拿来下结论。
+    ///
+    /// 用例先把缓存正常填上，再把摘要改成**错值**、size 与 mtime 保持原样——在默认档看来
+    /// 它完全可信。两个策略跑同一份输入：`Use` 交出那个错值，`Ignore` 交出真值。
+    /// 哪天 `Ignore` 被写回成「照查缓存」，这条用例立刻变红。
+    #[test]
+    fn ignoring_the_cache_recomputes_the_digest() {
+        let tree = TempTree::new("cache-policy");
+        let path = tree.file("data.txt", "real content");
+
+        let file = WorkspaceFile {
+            path: path.display().to_string(),
+            path_lower: local_path_key(&path.display().to_string()),
+            ..Default::default()
+        };
+
+        let mut cache = WorkspaceCache::default();
+        let first = parallel_compute_digests(
+            vec![(&file, DigestType::Text)],
+            &mut cache,
+            CachePolicy::Use,
+        )
+        .unwrap();
+        assert!(!first[0].2, "空缓存必然 miss");
+        let correct = first[0].1;
+
+        // 把缓存里的摘要换成错值：size 与 date 都还对着，默认档看不出破绽。
+        cache.file_map.get_mut(&file.path_lower).unwrap().digest = [0xAB; 16];
+
+        let cached = parallel_compute_digests(
+            vec![(&file, DigestType::Text)],
+            &mut cache,
+            CachePolicy::Use,
+        )
+        .unwrap();
+        assert!(cached[0].2, "默认档该命中缓存");
+        assert_eq!(cached[0].1, [0xAB; 16], "命中缓存就是交出缓存里的值");
+
+        let recomputed = parallel_compute_digests(
+            vec![(&file, DigestType::Text)],
+            &mut cache,
+            CachePolicy::Ignore,
+        )
+        .unwrap();
+        assert!(!recomputed[0].2, "验证档不该命中缓存");
+        assert_eq!(recomputed[0].1, correct, "验证档要的是重算出来的真值");
     }
 
     /// 以普通文本文件形式检出的符号链接（工作区不支持符号链接时）仍然按文本读取。

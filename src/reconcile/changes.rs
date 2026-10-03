@@ -118,7 +118,7 @@ pub(crate) fn render_title(template: &str, count: usize) -> String {
 /// 打印一类变更的标题，以及（`-l` 时的）逐文件清单。
 ///
 /// 六格缩进的标题、`         {label} "{file}".` 的清单行都是输出契约的一部分，
-/// open 模式与 clean 模式共用这一处，免得两边的文案各漂各的。
+/// open / clean / sync 三个模式共用这一处，免得几边的文案各漂各的。
 pub(crate) fn report_group<'a>(
     label: &str,
     title: &str,

@@ -28,6 +28,12 @@
     本地改动），默认会注册，但放在单独的子菜单里，免得和安全的那个挨着被误点；
     用这个开关时，以前注册过的会被摘掉。
 
+.PARAMETER WithoutSyncApply
+    不注册「sync 到指定 changelist 实际执行」的两条（History 视图版与工作区树版）。它们
+    同样**不可逆**（把工作区退回目标 changelist 时刻的状态：改过的文件退回旧版，目标之后
+    新建的文件被删掉），默认会注册在同一个不可逆子菜单里；用这个开关时，以前注册过的会
+    被摘掉。
+
 .PARAMETER Uninstall
     卸载：摘掉工具定义、清掉安装目录。不会动摘要缓存（%LOCALAPPDATA%\p4delta）。
 
@@ -46,11 +52,15 @@
 
 .EXAMPLE
     .\install.ps1
-    装到默认位置，注册三个工具（reconcile + clean 预演 + clean 实际清理）。
+    装到默认位置，注册七个工具（reconcile + clean 预演/实际清理 + sync 的两条入口各预演/实际清理）。
 
 .EXAMPLE
     .\install.ps1 -WithoutCleanApply
     不注册不可逆的「clean 实际清理」；以前注册过的会被摘掉。
+
+.EXAMPLE
+    .\install.ps1 -WithoutCleanApply -WithoutSyncApply
+    所有不可逆的工具都不注册（预演那三条照常）。
 
 .EXAMPLE
     .\install.ps1 -Uninstall
@@ -62,6 +72,7 @@ param(
     [string] $CustomToolsPath = (Join-Path $env:USERPROFILE '.p4qt\customtools.xml'),
     [string] $ExePath,
     [switch] $WithoutCleanApply,
+    [switch] $WithoutSyncApply,
     [switch] $Uninstall,
     [switch] $Force,
     [switch] $AddToPath,
@@ -75,13 +86,33 @@ $ExeName = 'p4delta.exe'
 $ScriptName = 'install.ps1'
 
 # 工具的显示名。它们是幂等写入的**识别键**：改了名字，下次安装会变成「新增」而不是
-# 「更新」，旧节点会留在菜单里；删除（-WithoutCleanApply、卸载）也按这套名字找节点。
-# 全部用 ASCII，免得菜单字体出意外。
+# 「更新」，旧节点会留在菜单里；删除（-WithoutCleanApply / -WithoutSyncApply、卸载）
+# 也按这套名字找节点。全部用 ASCII，免得菜单字体出意外。
 $ReconcileTool = 'p4delta Reconcile'
 $CleanPreviewTool = 'p4delta Clean (preview)'
 $CleanApplyTool = 'p4delta Clean (APPLY - irreversible)'
-$CleanApplyFolder = 'p4delta (irreversible)'
-$OurToolNames = @($ReconcileTool, $CleanPreviewTool, $CleanApplyTool)
+$SyncHistoryPreviewTool = 'p4delta Sync to changelist (preview)'
+$SyncHistoryApplyTool = 'p4delta Sync to changelist (APPLY - irreversible)'
+$SyncFolderPreviewTool = 'p4delta Sync this folder to changelist (preview)'
+$SyncFolderApplyTool = 'p4delta Sync this folder to changelist (APPLY - irreversible)'
+$IrreversibleFolder = 'p4delta (irreversible)'
+$OurToolNames = @(
+    $ReconcileTool,
+    $CleanPreviewTool,
+    $CleanApplyTool,
+    $SyncHistoryPreviewTool,
+    $SyncHistoryApplyTool,
+    $SyncFolderPreviewTool,
+    $SyncFolderApplyTool
+)
+
+# sync 的两条入口各缺一半信息，缺的那半由 prompt 对话框手工补。P4V 的硬限制是原因：
+# 一个工具定义里只允许一个 `%` 参数（两个会当场弹 "More than one replaceable file
+# argument of type %X is not allowed"），而 History 视图的「文件夹历史」里 `%D` 是空的
+# ——变量取不到值时 P4V 干脆不显示带它的工具。于是「目录 + changelist 都自动」做不到。
+$FolderPromptText = '要同步哪个目录？从 History 视图的路径栏复制（本地路径或 depot 路径都行）：'
+$ChangelistPromptText = '要同步到哪个 changelist？填你在 History 里看到的那个号：'
+
 
 function Write-Info([string] $Message) {
     if (-not $Quiet) {
@@ -199,13 +230,26 @@ function Get-OrCreateFolder($doc, [string] $Name) {
     return $list
 }
 
-# 造一个工具定义节点。
+# 造一个工具定义节点。元素名与位置都取自实证、不臆造，来源是 P4V 自己导出的工具文件
+# （本机 customtools.xml 里的现成样例，以及 2026-10-03 让 P4V 从 GUI 生成再 Export tools…
+# 出来的那一份）：
 #
-# 两个已知的缺口，都**没有臆造元素名**：README 表格里的「Run tool in terminal window」与
-# 「Ignore P4CONFIG files」在这里没有对应元素——它们在 P4V 的工具 XML 里叫什么名字，官方
-# 文档没写、也没实测过。前者不勾时输出进 P4V 的输出窗格，工具照常可用。要补齐的话：
-# 在 GUI 里手工勾上这两项 → Export tools... → 与这里生成的文件对比，把新出现的元素名加进来。
-function New-ToolElement($doc, [string] $Name, [string] $Arguments, [string] $ExePath) {
+#   <Prompt><PromptText>…</PromptText></Prompt>
+#       `$PromptText` 非空 = 勾上 "Prompt for arguments"：命令跑起来前 P4V 先弹个输入框，
+#       填进去的文本替换 Arguments 里的 `$D`。
+#       `<ShowBrowse>`（**故意不写**）= 再勾上 "Add file browser to prompt dialog"，对话框上
+#       多一个浏览按钮。2026-10-03 在 GUI 里点开实测：那是个**文件**选择器，选不了目录；
+#       而两条 sync 入口问的都是目录，给了按钮反而把人往「选个文件再报错」上引。
+#       （形状备查：`<Prompt>` 内、`<PromptText>` 之后。）
+#   <InitDir>$r</InitDir> = "Start In"，P4V 会展开 `$r`（client 根目录）。
+#   <Console><CloseOnExit>false</CloseOnExit></Console>：`CloseOnExit` 对应 "Close window upon
+#       completion"，写 false = 跑完别自动关，留着才看得到输出。外层 `Console` 与 "Run tool
+#       in terminal window" 的对应没在 GUI 里逐项核对过；2026-10-03 实测我们这个 .exe：
+#       不弹 cmd 终端窗，输出直接出现在 P4V 自己的输出窗里——预演看得见清单，够用。
+#   <AddToContext> / <Refresh> = "Add to applicable context menus" / "Refresh P4V upon completion"。
+#   <IgnoreP4Config>（**故意不写**）= "Ignore P4CONFIG files"：写了等于关掉 .p4config 的发现，
+#       而工具要靠它拿 P4IGNORE 与 P4CHARSET。
+function New-ToolElement($doc, [string] $Name, [string] $Arguments, [string] $ExePath, [string] $PromptText = '') {
     $tool = $doc.CreateElement('CustomToolDef')
 
     $definition = $doc.CreateElement('Definition')
@@ -225,9 +269,17 @@ function New-ToolElement($doc, [string] $Name, [string] $Arguments, [string] $Ex
     [void]$definition.AppendChild($initDir)
     [void]$tool.AppendChild($definition)
 
+    if ($PromptText) {
+        $prompt = $doc.CreateElement('Prompt')
+        $text = $doc.CreateElement('PromptText')
+        $text.InnerText = $PromptText
+        [void]$prompt.AppendChild($text)
+        [void]$tool.AppendChild($prompt)
+    }
+
     # 不勾 "Close window upon completion"：留着窗口才能看到输出。
-    # 不写 <Prompt> 块 = 不勾 "Prompt for arguments"。
     $console = $doc.CreateElement('Console')
+
     $closeOnExit = $doc.CreateElement('CloseOnExit')
     $closeOnExit.InnerText = 'false'
     [void]$console.AppendChild($closeOnExit)
@@ -293,15 +345,32 @@ function Test-SameNode($Expected, $Actual) {
     return $true
 }
 
-# 默认注册三条；-WithoutCleanApply 只把不可逆的那条从注册列表里去掉——已经注册过的
-# 旧条目由 Remove-CleanApplyTool 在调用点摘掉。
-function Get-DesiredTools([switch] $WithoutCleanApply) {
+# 默认注册七条；两条不可逆的分别由 -WithoutCleanApply / -WithoutSyncApply 从注册列表里
+# 去掉——已经注册过的旧条目由 Remove-IrreversibleTool 在调用点摘掉。
+function Get-DesiredTools([switch] $WithoutCleanApply, [switch] $WithoutSyncApply) {
     $specs = @(
-        @{ Name = $ReconcileTool; Arguments = '-a -w $c -l %D'; Folder = $null },
-        @{ Name = $CleanPreviewTool; Arguments = '--clean -w $c -l %D'; Folder = $null }
+        @{ Name = $ReconcileTool; Arguments = '-a -w $c -l %D'; Prompt = ''; Folder = $null },
+        @{ Name = $CleanPreviewTool; Arguments = '--clean -w $c -l %D'; Prompt = ''; Folder = $null },
+        # sync 的两条入口，各自动一半、手补一半（原因见文件头附近的 prompt 常量注释）：
+        #   History 那条：`%S` 是 P4V 的 "Selected submitted changelists"，只对**已提交**的
+        #   changelist 有值，所以 Pending 视图里不触发。`%c` 在那边同样有值，会把一个 pending
+        #   号喂给 `--to`——changelist 号是**创建**时分配的，pending 号完全可能小于 head，
+        #   那一下就是「退回历史版本并删掉之后新建的文件」，与点它的人的意图正好相反。
+        #   目录只能 prompt 手填（或用 depot 路径），范围是那个目录而不是整个工作区。
+        #   工作区树那条：`%D` 是右键选中的目录（在**文件**的历史里它是文件，那时名字与所见
+        #   不符、点下去也会得到一句 "is not a directory"），changelist 由 prompt 手填。
+        # 目录那条 prompt 上不加浏览按钮（`<ShowBrowse>`）：2026-10-03 在 GUI 里实测，那个按钮
+        # 打开的是**文件**选择器，选不了目录——给了反而把人往「选个文件、工具报不是目录」上引。
+        # 目录路径只能手打或粘贴。
+        @{ Name = $SyncHistoryPreviewTool; Arguments = '--sync -w $c -l $D --to %S'; Prompt = $FolderPromptText; Folder = $null },
+        @{ Name = $SyncFolderPreviewTool; Arguments = '--sync -w $c -l %D --to $D'; Prompt = $ChangelistPromptText; Folder = $null }
     )
     if (-not $WithoutCleanApply) {
-        $specs += @{ Name = $CleanApplyTool; Arguments = '-a --clean -w $c -l %D'; Folder = $CleanApplyFolder }
+        $specs += @{ Name = $CleanApplyTool; Arguments = '-a --clean -w $c -l %D'; Prompt = ''; Folder = $IrreversibleFolder }
+    }
+    if (-not $WithoutSyncApply) {
+        $specs += @{ Name = $SyncHistoryApplyTool; Arguments = '-a --sync -w $c -l $D --to %S'; Prompt = $FolderPromptText; Folder = $IrreversibleFolder }
+        $specs += @{ Name = $SyncFolderApplyTool; Arguments = '-a --sync -w $c -l %D --to $D'; Prompt = $ChangelistPromptText; Folder = $IrreversibleFolder }
     }
     return $specs
 }
@@ -313,7 +382,7 @@ function Update-ToolList($doc, $Specs, [string] $ExePath) {
         $existing = Find-ToolByName $doc $spec.Name
         if ($null -ne $existing) {
             $inRightFolder = (Get-ContainingFolderName $existing) -eq $spec.Folder
-            $desired = New-ToolElement $doc $spec.Name $spec.Arguments $ExePath
+            $desired = New-ToolElement $doc $spec.Name $spec.Arguments $ExePath $spec.Prompt
             if ($inRightFolder -and (Test-SameNode $desired $existing)) {
                 continue
             }
@@ -325,7 +394,7 @@ function Update-ToolList($doc, $Specs, [string] $ExePath) {
         } else {
             $parent = $doc.DocumentElement
         }
-        [void]$parent.AppendChild((New-ToolElement $doc $spec.Name $spec.Arguments $ExePath))
+        [void]$parent.AppendChild((New-ToolElement $doc $spec.Name $spec.Arguments $ExePath $spec.Prompt))
         $changed = $true
     }
 
@@ -359,15 +428,15 @@ function Remove-ToolsByName($doc, [string[]] $Names) {
     return $changed
 }
 
-# -WithoutCleanApply 的退出口：摘掉 APPLY 那条，并清掉因此变空的子菜单目录。
+# -WithoutCleanApply / -WithoutSyncApply 的退出口：摘掉指定那条，并清掉因此变空的子菜单。
 #
 # 子菜单只在名字对上、且里面一条工具都不剩时才删：用户往里放了自己的东西就留着，
 # 别的空目录也一概不碰——这条路径只该动我们自己的节点。
-function Remove-CleanApplyTool($doc) {
-    $changed = Remove-ToolsByName $doc @($CleanApplyTool)
+function Remove-IrreversibleTool($doc, [string] $ToolName) {
+    $changed = Remove-ToolsByName $doc @($ToolName)
 
     foreach ($folder in @($doc.SelectNodes('//CustomToolFolder'))) {
-        if ((Get-ChildText $folder 'Name') -eq $CleanApplyFolder -and
+        if ((Get-ChildText $folder 'Name') -eq $IrreversibleFolder -and
                 $folder.SelectNodes('.//CustomToolDef').Count -eq 0) {
             [void]$folder.ParentNode.RemoveChild($folder)
             $changed = $true
@@ -520,15 +589,22 @@ function Invoke-Install {
     }
 
     $doc = Read-CustomToolsDocument $CustomToolsPath
-    $changed = Update-ToolList $doc (Get-DesiredTools -WithoutCleanApply:$WithoutCleanApply) $targetExe
+    $changed = Update-ToolList $doc (Get-DesiredTools -WithoutCleanApply:$WithoutCleanApply -WithoutSyncApply:$WithoutSyncApply) $targetExe
 
-    # 退出口：以前注册过 APPLY 的话把它摘掉。结果要并进 $changed——只删不加时，
+    # 退出口：以前注册过不可逆的那些就把它摘掉。结果要并进 $changed——只删不加时，
     # 下面那扇保存的门只认 $changed。
-    $removedCleanApply = $false
-    if ($WithoutCleanApply) {
-        $removedCleanApply = Remove-CleanApplyTool $doc
-        if ($removedCleanApply) {
-            $changed = $true
+    $removed = @()
+    if ($WithoutCleanApply -and (Remove-IrreversibleTool $doc $CleanApplyTool)) {
+        $changed = $true
+        $removed += $CleanApplyTool
+    }
+    if ($WithoutSyncApply) {
+        # sync 那条入口有两条不可逆的（History 版与工作区树版），一起摘。
+        foreach ($name in @($SyncHistoryApplyTool, $SyncFolderApplyTool)) {
+            if (Remove-IrreversibleTool $doc $name) {
+                $changed = $true
+                $removed += $name
+            }
         }
     }
 
@@ -538,8 +614,8 @@ function Invoke-Install {
         $backup = Backup-CustomToolsFile $CustomToolsPath
         Save-CustomToolsDocument $doc $CustomToolsPath
         Write-Info "已更新 $CustomToolsPath"
-        if ($removedCleanApply) {
-            Write-Info "已摘掉不可逆的「$CleanApplyTool」条目。"
+        foreach ($name in $removed) {
+            Write-Info "已摘掉不可逆的「$name」条目。"
         }
         if ($backup) {
             Write-Info "改动前的备份：$backup"
@@ -576,10 +652,17 @@ function Invoke-Install {
         # 绝对路径，P4V 每次点菜单都新起一个进程。
         Write-Info '装好了。工具定义没变，P4V 不用重启：下次点菜单用的就是这份 exe。'
     }
-    if ($WithoutCleanApply) {
-        Write-Info '（按 -WithoutCleanApply 没注册「clean 实际清理」；它不可逆，以前装过的话这次已经摘掉。）'
-    } else {
-        Write-Info "（「clean 实际清理」不可逆，放在「$CleanApplyFolder」子菜单里；动手前先跑一遍预演。）"
+    $registered = @()
+    if (-not $WithoutCleanApply) { $registered += '「clean 实际清理」' }
+    if (-not $WithoutSyncApply) { $registered += '「sync 到指定 changelist」' }
+    if ($registered.Count -gt 0) {
+        Write-Info "（$($registered -join '、')不可逆，放在「$IrreversibleFolder」子菜单里；动手前先跑一遍预演。）"
+    }
+    $skipped = @()
+    if ($WithoutCleanApply) { $skipped += '「clean 实际清理」' }
+    if ($WithoutSyncApply) { $skipped += '「sync 到指定 changelist」' }
+    if ($skipped.Count -gt 0) {
+        Write-Info "（按开关没注册 $($skipped -join '、')；以前装过的话这次已经摘掉。）"
     }
 }
 

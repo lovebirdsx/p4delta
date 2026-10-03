@@ -12,7 +12,7 @@ use hex::FromHex;
 use crate::READ_BUFFER_SIZE;
 use crate::charset::{decode_p4_bytes, p4_encoding, strip_bom, trim_line_ending};
 use crate::cli::Options;
-use crate::model::{DepotFileRecord, DepotState, FileAction};
+use crate::model::{DepotFileRecord, DepotState, FileAction, TargetMap, TargetRecord};
 use crate::p4::process::{
     MAX_PARALLEL_P4_COMMANDS, P4Pipes, build_p4_command, compute_batches, read_p4_stderr,
     take_p4_pipes, write_p4_arguments,
@@ -346,7 +346,66 @@ pub(crate) fn validate_refreshed_records(
     Ok(())
 }
 
-pub(crate) async fn run_p4_fstat_all(options: &Options, work_dir: &str) -> Result<DepotState> {
+/// 取走初次查询里的 `(head_rev, head_action)`，作为目标版本的事实。
+///
+/// 必须在补查**之前**调用：补查会把 `head_action` 换成 have 版本的动作（见
+/// [`run_p4_fstat_all`] 里的回填），而 sync 要回答的是「拉到哪个版本」，不是「上次同步的是哪版」。
+///
+/// 没有 headRev / headAction 的记录不进表。那种形状只出现在「已打开待添加」的文件上
+/// （还没进 depot），而 sync 本来就不碰已打开的文件；查不到即视为目标时刻不在库。
+pub(crate) fn snapshot_target(records: &[DepotFileRecord]) -> TargetMap {
+    records
+        .iter()
+        .filter_map(|record| {
+            Some((
+                record.depot_file_lower.clone(),
+                TargetRecord {
+                    rev: record.head_rev?,
+                    action: record.head_action?,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// 目标为 changelist 时的一次查询：取该 CL 时刻每个文件的修订号与动作。
+///
+/// 与 [`run_p4_fstat_all`] 的两处不同，都是实测逼出来的：
+///
+/// - 版本说明符拼在查询载荷里（`./...@<CL>`），与路径一样经 stdin 发放，不经过 Windows 命令行；
+/// - **不套用 [`validate_refreshed_records`]**：那套校验要求每条记录都带 `haveRev`，而
+///   `@CL` 的返回只在「该文件的 have 恰好就是目标修订」时才带它——套上去会把一次完全
+///   正常的查询判死。这里也不补查：要的是目标时刻的事实，不是 have 版本的摘要。
+///
+/// 查询本身是硬失败（`strict`）：它一旦失败，空结果会被下游读成「目标时刻什么都没有」，
+/// 而那个结论会让工具删光本地文件。宁可整轮停下。
+pub(crate) async fn run_p4_fstat_at_revision(
+    options: &Options,
+    work_dir: &str,
+    changelist: u32,
+) -> Result<TargetMap> {
+    println!("   Requesting depot state for changelist {changelist}.");
+    let start_time = Instant::now();
+
+    let query = [format!("./...@{changelist}")];
+    let records = run_p4_fstat_batched(options, work_dir, &FSTAT_ARGS, &query, true).await?;
+    let target = snapshot_target(&records);
+
+    println!(
+        "      Received {} fstat records for changelist {} in {} seconds.",
+        target.len(),
+        changelist,
+        start_time.elapsed().as_secs_f32()
+    );
+
+    Ok(target)
+}
+
+/// 查询 depot 状态。第二项是目标版本快照，只有 sync 模式才建（见 [`snapshot_target`]）。
+pub(crate) async fn run_p4_fstat_all(
+    options: &Options,
+    work_dir: &str,
+) -> Result<(DepotState, Option<TargetMap>)> {
     println!("   Requesting depot state for all files.");
     let start_time = Instant::now();
 
@@ -358,6 +417,12 @@ pub(crate) async fn run_p4_fstat_all(options: &Options, work_dir: &str) -> Resul
 
     // Build hashmaps to find records
     depot_state.build_mapping();
+
+    // 趁 `head_action` 还是初次查询的原值先取走目标版本的事实：下面的补查会把它换成
+    // have 版本的动作。只有 head 目标的 sync 才建这张表——open / clean 用不上，在几十万条
+    // 记录上白占几十 MB 内存；`--to` 另走一次查询，这张表它连看都不看。
+    let target =
+        (options.sync && options.to.is_none()).then(|| snapshot_target(&depot_state.file_records));
 
     // Find records with out of date revisions
     let mut old_records = Vec::new();
@@ -440,7 +505,7 @@ pub(crate) async fn run_p4_fstat_all(options: &Options, work_dir: &str) -> Resul
         );
     }
 
-    Ok(depot_state)
+    Ok((depot_state, target))
 }
 
 #[cfg(test)]
@@ -478,6 +543,42 @@ mod tests {
         // Non-ASCII paths survive decoding, and the lookup keys stay ASCII-folded.
         assert_eq!(records[1].client_file, "E:\\ws\\中文.txt");
         assert_eq!(records[1].client_file_lower, "e:\\ws\\中文.txt");
+    }
+
+    /// 目标快照的取值口径：认 `headRev` 与 `headAction`，缺一个就不进表。
+    ///
+    /// 两条断言各挡一件事：
+    ///
+    /// - 第一条记录 `haveRev` 是 1、`headRev` 是 3，快照必须是 3——取成 have 的话，sync 会把
+    ///   「have 与目标一致」错判成「落后」，白传一轮；
+    /// - 第二条只有 `headRev`、没有 `headAction`，不进表。「查不到」在分析层的含义是「目标
+    ///   时刻该路径不在库」，落下去就是删本地文件，所以这里不拿别的字段凑数。
+    #[test]
+    fn snapshot_target_takes_the_head_fields_and_skips_partial_records() {
+        let lines: Vec<&[u8]> = vec![
+            b"... depotFile //depot/a.txt",
+            b"... clientFile E:\\ws\\a.txt",
+            b"... headType text",
+            b"... headAction edit",
+            b"... headRev 3",
+            b"... haveRev 1",
+            b"",
+            b"... depotFile //depot/b.txt",
+            b"... clientFile E:\\ws\\b.txt",
+            b"... headRev 2",
+        ];
+
+        let records = parse_p4_fstat_lines(lines, UTF_8).unwrap();
+        let target = snapshot_target(&records);
+
+        assert_eq!(target.len(), 1);
+        assert_eq!(
+            target.get("//depot/a.txt"),
+            Some(&TargetRecord {
+                rev: 3,
+                action: FileAction::Edit,
+            })
+        );
     }
 
     /// 认不出的 `headType` 不能中止整轮 fstat：原串记下来，由分析阶段转交 p4 reconcile。

@@ -31,7 +31,27 @@ pub struct Options {
     #[arg(long)]
     pub(crate) clean: bool,
 
-    /// The files and folders to start from.
+    /// 同步模式：把工作区拉到目标版本（默认 head），等价于「只传真正需要传的文件」的
+    /// `p4 sync -f`。不删 depot 里没有的文件；已打开的文件一律不碰。
+    #[arg(long, conflicts_with = "clean")]
+    pub(crate) sync: bool,
+
+    /// 同步的目标 changelist（仅 `--sync`）。缺省是 head。
+    ///
+    /// 不接受 0：`-c 0` 在本工具里是「默认 changelist」，照搬成 `--to 0` 太容易，而
+    /// `@0` 在 p4 语法里是「第一个修订版之前」——目标时刻什么都不存在，`--sync` 会据此
+    /// 删光本地文件。解析层直接当用法错误挡掉。
+    #[arg(long, value_name = "CL", requires = "sync", value_parser = clap::value_parser!(u32).range(1..))]
+    pub(crate) to: Option<u32>,
+
+    /// 不信任任何推断（仅 `--sync`）：对目标版本没变的文件全部重算摘要，摘要缓存也不看。
+    /// 默认档靠 mtime 与缓存跳过它们，快，但「没变化」是上一轮或时间戳说的；这一档把推断
+    /// 换成验证，代价是每次运行都要全量读盘。
+    #[arg(long, requires = "sync")]
+    pub(crate) verify_all: bool,
+
+    /// The folders to start from. A path that does not exist, or that is a file rather than a
+    /// folder, is reported and does not count as work; if no folder is usable the run fails.
     pub(crate) paths: Vec<String>,
 
     /// 关闭忽略目录剪枝，回退到完整扫描（默认自动判断）。仅在结果异常时用来对比。
@@ -69,6 +89,33 @@ mod tests {
             .expect("clean 与 -c 同时给出不该是用法错误");
         assert!(parsed.clean);
         assert_eq!(parsed.changelist, 5);
+    }
+
+    #[test]
+    fn sync_flags_are_wired_up() {
+        let parsed = Options::parse_from([
+            "p4delta",
+            "--sync",
+            "-w",
+            "ws",
+            "--to",
+            "12345",
+            "--verify-all",
+        ]);
+        assert!(parsed.sync);
+        assert_eq!(parsed.to, Some(12345));
+        assert!(parsed.verify_all);
+    }
+
+    /// `--to 0` 在 p4 语法里是「第一个修订版之前」：目标时刻什么都不存在，sync 会据此
+    /// 删光本地文件。而 `-c 0` 在本工具里表示「默认 changelist」，照搬成 `--to 0` 太容易，
+    /// 所以要在解析层挡住，不能让它走到分析阶段。
+    #[test]
+    fn a_zero_target_changelist_is_a_usage_error() {
+        let error = Options::try_parse_from(["p4delta", "--sync", "-w", "ws", "--to", "0"])
+            .expect_err("--to 0 必须是用法错误");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

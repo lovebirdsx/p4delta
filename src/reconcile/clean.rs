@@ -10,15 +10,12 @@
 //! opened for add, edit, delete, or integrate are not impacted by p4 clean"），所以
 //! [`CleanChanges::project`] 直接丢弃：既不动作，也不汇报。
 
-use std::io;
-use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 
-use rayon::prelude::*;
-
 use super::changes::{Changes, render_title, report_group};
+use super::delete_workspace_files;
 use crate::cli::Options;
 use crate::model::DepotState;
 use crate::p4::process::{FailureMode, run_p4_command_batched};
@@ -199,65 +196,6 @@ fn restore_specs(files: &[RestoreFile]) -> Vec<String> {
         .collect()
 }
 
-/// 删除工作区里的一个条目。符号链接删的是链接本身，不跟随目标。
-///
-/// 幂等：文件已经不在了（或本来就不存在）算成功——大小写冲突下同一个文件可能被推入
-/// 两次，第二次不能算失败。
-fn remove_workspace_entry(path: &Path) -> io::Result<()> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        result => result?,
-    };
-    let is_symlink = meta.file_type().is_symlink();
-
-    #[cfg(windows)]
-    {
-        // Windows 的 DeleteFile 拒绝只读文件，先清掉这一位。这是 Windows 独有的问题：
-        // Unix 上删除权限由父目录决定，与文件自身的 mode 无关。
-        // 符号链接不能走这步，set_permissions 会跟随链接改到目标文件的权限上去。
-        #[allow(clippy::permissions_set_readonly_false)] // Windows 的只读位不是 Unix 的 mode
-        if !is_symlink && meta.permissions().readonly() {
-            let mut permissions = meta.permissions();
-            permissions.set_readonly(false);
-            std::fs::set_permissions(path, permissions)?;
-        }
-    }
-
-    match std::fs::remove_file(path) {
-        // 已经不在了：目标状态已达成。
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        // 指向目录的符号链接：symlink_metadata 的 is_dir() 是 false，而 Windows 上
-        // 只有 RemoveDirectory 删得掉它（Unix 上 unlink 已经成功了，走不到这儿）。
-        Err(_) if is_symlink => std::fs::remove_dir(path),
-        result => result,
-    }
-}
-
-/// 从磁盘删除 `add` 类的文件。
-///
-/// 全部尝试完再报错：一个文件删不掉（编辑器占着、权限不对）不该让其余几百个留在原地。
-fn delete_workspace_files(files: &[String]) -> Result<()> {
-    // par_iter 是 indexed，filter_map 保序，失败清单的顺序因此与扫描顺序一致。
-    let failures: Vec<String> = files
-        .par_iter()
-        .filter_map(|file| {
-            remove_workspace_entry(Path::new(file))
-                .err()
-                .map(|error| format!("\n  {file}: {error}"))
-        })
-        .collect();
-
-    if failures.is_empty() {
-        return Ok(());
-    }
-
-    bail!(
-        "Failed to delete {} file(s):{}",
-        failures.len(),
-        failures.join("")
-    )
-}
-
 /// 把一批文件写回它们的 have revision。
 ///
 /// 传 depot 路径而不是 client 路径：have revision 本来就长在 depot 记录上，而且同一个
@@ -372,7 +310,7 @@ mod tests {
     use super::*;
 
     use crate::model::DepotFileRecord;
-    use crate::test_util::{TempTree, depot_record, symlink_file};
+    use crate::test_util::depot_record;
 
     /// 建一个带好映射的 [DepotState]。两个索引字段是 model 私有的，只能这样填。
     fn depot_with(records: Vec<DepotFileRecord>) -> DepotState {
@@ -541,82 +479,6 @@ mod tests {
         assert_eq!(specs, ["//depot/a.txt#3", "//depot/b.txt#7"]);
     }
 
-    // ---- 删除 ----
-
-    #[test]
-    fn deleting_a_workspace_file_removes_it() {
-        let tree = TempTree::new("clean-delete");
-        let file = tree.file("a.txt", "x");
-
-        remove_workspace_entry(&file).unwrap();
-
-        assert!(!file.exists());
-    }
-
-    /// 幂等：大小写冲突下同一个文件可能被推入两次，第二次不能算失败。
-    #[test]
-    fn deleting_a_missing_file_is_not_an_error() {
-        let tree = TempTree::new("clean-delete-missing");
-
-        remove_workspace_entry(&tree.root.join("never-existed.txt")).unwrap();
-    }
-
-    #[test]
-    fn a_read_only_file_is_deleted() {
-        let tree = TempTree::new("clean-delete-read-only");
-        let file = tree.file("a.txt", "x");
-
-        let mut permissions = std::fs::metadata(&file).unwrap().permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&file, permissions).unwrap();
-
-        remove_workspace_entry(&file).unwrap();
-
-        assert!(!file.exists());
-    }
-
-    #[test]
-    fn deleting_a_symlink_removes_the_link_not_the_target() {
-        let tree = TempTree::new("clean-delete-symlink");
-        let target = tree.file("target.txt", "contents");
-        let link = tree.root.join("link.txt");
-
-        if let Err(error) = symlink_file(&target, &link) {
-            eprintln!("skipping: this system does not allow symlinks: {error}");
-            return;
-        }
-
-        remove_workspace_entry(&link).unwrap();
-
-        assert!(!link.exists(), "链接本身该被删掉");
-        assert!(target.exists(), "目标不该被碰");
-    }
-
-    /// 一个文件删不掉不该让其余文件留在原地——全部尝试完再报错，并逐个点名。
-    #[test]
-    fn every_file_is_attempted_even_when_one_fails() {
-        let tree = TempTree::new("clean-delete-partial");
-        let first = tree.file("first.txt", "x");
-        let second = tree.file("second.txt", "x");
-        // 拿一个非空目录冒充要删的文件：symlink_metadata 成功，remove_file 必定失败。
-        let blocker = tree.dir("blocker");
-        std::fs::write(blocker.join("inside.txt"), "x").unwrap();
-
-        let files = vec![
-            first.display().to_string(),
-            blocker.display().to_string(),
-            second.display().to_string(),
-        ];
-
-        let error = delete_workspace_files(&files).expect_err("非空目录删不掉，必须报错");
-
-        let message = error.to_string();
-        assert!(
-            message.contains("Failed to delete 1 file(s)"),
-            "该报告恰好一个失败：{message}"
-        );
-        assert!(message.contains("blocker"), "该点名失败的路径：{message}");
-        assert!(!first.exists(), "失败之前的文件该已删除");
-        assert!(!second.exists(), "失败之后的文件也该被尝试");
-    }
+    // `remove_workspace_entry` / `delete_workspace_files` 的用例跟着函数去了
+    // `super`：sync 模式也有「从工作区删文件」这一类动作，两份实现会漂。
 }

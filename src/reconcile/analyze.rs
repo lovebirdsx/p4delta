@@ -4,10 +4,13 @@
 //! fstat / 工作区扫描 / have 三路结果凑齐，再把工作区补齐（已剪目录里 depot 已跟踪
 //! 的文件必须回到 `workspace` 里，否则会被当成被删除），然后才交给 [`analyze`]。
 
+use std::collections::HashSet;
+
 use anyhow::{Result, bail};
 
 use crate::model::{
-    DepotFileRecord, DepotState, DigestType, FileAction, FileType, WorkspaceFile, WorkspaceState,
+    DepotFileRecord, DepotState, DigestType, FileAction, FileType, TargetMap, WorkspaceFile,
+    WorkspaceState,
 };
 
 use super::changes::Changes;
@@ -275,12 +278,261 @@ pub(crate) fn analyze<'a>(
     })
 }
 
+/// sync 模式下要拉到目标版本的 depot 记录，连同目标修订。
+///
+/// 修订号单独带着而不是从记录里读：`head_rev` 是 head 的修订号，只有在 head 目标下
+/// 它才恰好等于目标修订；`--to <CL>` 下两者是不同的东西。
+#[derive(Clone, Copy)]
+pub(crate) struct SyncSource<'a> {
+    pub(crate) record: &'a DepotFileRecord,
+    pub(crate) target_rev: u32,
+}
+
+/// 一个「目标版本没变，但本地内容可能已经不是它了」的文件：要靠摘要定夺。
+pub(crate) struct DigestCheck<'a> {
+    pub(crate) file: &'a WorkspaceFile,
+    pub(crate) source: SyncSource<'a>,
+    pub(crate) digest_type: DigestType,
+}
+
+/// [`analyze_at_target`] 的全部产出。
+///
+/// 与 [`Analysis`] 平行而不是复用：那八类对着 `p4 reconcile` 的分类学，被测试逐条钉死；
+/// 这里的分法只服务于「把工作区拉到目标版本」，判据与动作都不一样。
+/// 目标时刻该路径不在库、本地却有的文件。
+///
+/// 两个路径都有用处，且都不是摆设：本地路径用来删文件，depot 路径用来让 p4 清掉 have
+/// 记录（两者各有一种对方覆盖不到的情形，见 `sync::SyncChanges` 里删除组的注释）。
+pub(crate) struct DeletedAtTarget<'a> {
+    pub(crate) record: &'a DepotFileRecord,
+    pub(crate) file: &'a WorkspaceFile,
+}
+
+/// [`analyze_at_target`] 的全部产出。
+///
+/// 与 [`Analysis`] 平行而不是复用：那八类对着 `p4 reconcile` 的分类学，被测试逐条钉死；
+/// 这里的分法只服务于「把工作区拉到目标版本」，判据与动作都不一样。
+#[derive(Default)]
+pub(crate) struct SyncAnalysis<'a> {
+    /// 本地有一份、但不是目标版本：拉到目标版本覆盖它，摘要在这里没有意义。
+    pub(crate) update: Vec<SyncSource<'a>>,
+
+    /// 二进制长度就已经不符，确定要还原的。不必再读一遍内容。
+    pub(crate) revert: Vec<SyncSource<'a>>,
+
+    /// 目标版本没变，本地内容要对摘要才知道对不对的。
+    pub(crate) check: Vec<DigestCheck<'a>>,
+
+    /// 本地没有（或被忽略规则盖着）：写回来。与 have 是哪一版无关。
+    pub(crate) restore: Vec<SyncSource<'a>>,
+
+    /// 目标时刻该路径不在库，本地却有的：删掉。
+    pub(crate) delete: Vec<DeletedAtTarget<'a>>,
+
+    /// 算不出摘要的类型，转交原生 `p4 sync`。
+    pub(crate) unsupported: Vec<&'a DepotFileRecord>,
+
+    /// 目标版本是归档版本的文件。内容已经移出 depot，摘要无从谈起，只能跳过；
+    /// 但要汇报一声，否则用户看到「一切正常」而文件其实没被检查过。
+    pub(crate) archived: Vec<&'a DepotFileRecord>,
+}
+
+/// 目标时刻不在库的路径：本地有一份就收进删除组。
+///
+/// 被忽略的本地文件视同不存在——与其余各组「filtered 当作本地没有」的口径一致，
+/// 而对这一组来说，那个口径的含义正好是「不去删被忽略的东西」。
+fn push_deleted<'a>(
+    analysis: &mut SyncAnalysis<'a>,
+    record: &'a DepotFileRecord,
+    workspace: &'a WorkspaceState,
+) {
+    if let Some(file) = workspace.get_filtered(&record.client_file_lower) {
+        analysis.delete.push(DeletedAtTarget { record, file });
+    }
+}
+
+/// 按**目标版本**分类，而不是按 have 版本。
+///
+/// 与 [`analyze`] 是两条平行路径，刻意不合并（理由见 [`SyncAnalysis`]）。判定表：
+///
+/// | 条件 | 落点 |
+/// |---|---|
+/// | 已打开 | 不动作、不汇报（`p4 sync -f` 也不碰已打开的文件，这里更彻底） |
+/// | 目标时刻该路径不在库 | `delete`（本地有才落） |
+/// | 目标是归档版本 | `archived` |
+/// | 本地缺失（或被忽略规则盖着） | `restore`——不论 have 是哪一版 |
+/// | `have != target_rev` | `update` |
+/// | 二进制长度不符 | `revert` |
+/// | 其余 | `check`（摘要说了算） |
+///
+/// `target` 里查不到即视为目标时刻不在库。两种来源都归此列：目标时刻已是删除版本，
+/// 或（只有 changelist 目标才可能）目标时刻它还没进 depot——实测过 `p4 sync -f ./...@CL`
+/// 对这两种都报 `deleted as`，把本地文件删掉。
+pub(crate) fn analyze_at_target<'a>(
+    depot: &'a DepotState,
+    workspace: &'a WorkspaceState,
+    target: &TargetMap,
+) -> Result<SyncAnalysis<'a>> {
+    use FileAction::*;
+
+    let mut analysis = SyncAnalysis::default();
+
+    for record in &depot.file_records {
+        // 已打开的文件一律不碰。`p4 sync -f` 的官方口径也是 "does not affect open files"，
+        // 而这里更彻底：既不动作也不汇报——打开的文件归用户，工具不参与。
+        if record.action.is_some() {
+            continue;
+        }
+
+        // 大小写冲突下同一个 client 路径可能对上多条记录，只处理 build_mapping 选出的
+        // 胜者。否则同一个本地文件会被两条 depot 路径各下发一次（`p4 sync -f` 来两遍）。
+        let is_winner = depot
+            .get_client_record(&record.client_file_lower)
+            .is_some_and(|winner| winner.depot_file_lower == record.depot_file_lower);
+        if !is_winner {
+            continue;
+        }
+
+        // 类型名认不出来就算不了摘要，和其它算不出摘要的一起转交原生 sync。
+        if record.unsupported_type.is_some() {
+            analysis.unsupported.push(record);
+            continue;
+        }
+
+        // 目标时刻该路径不在库：本地不该留着它。
+        let Some(target_record) = target.get(&record.depot_file_lower) else {
+            push_deleted(&mut analysis, record, workspace);
+            continue;
+        };
+        match target_record.action {
+            Delete | MoveDelete => {
+                push_deleted(&mut analysis, record, workspace);
+                continue;
+            }
+            // 内容已经移出 depot，摘要无从谈起。跳过并汇报，而不是中止整轮。
+            Archive => {
+                analysis.archived.push(record);
+                continue;
+            }
+            Add | Edit | MoveAdd | Branch | Integrate | Import | Purge => {}
+        }
+
+        let source = SyncSource {
+            record,
+            target_rev: target_record.rev,
+        };
+
+        // 本地没有这一份（文件缺失，或被忽略规则盖着、按本模块的口径视同不存在）：
+        // 从 depot 写回。判断放在 have 之前是刻意的——这四组按**本地状态**分，不按 have
+        // 状态分：本地压根没有的文件报成「Updating ... in workspace」既不准确，也丢掉了
+        // 「它不在你本地」这个信息。原生 `p4 sync -f` 那边对应的是 `added as`。
+        //
+        // 被忽略的文件也走这里，不另外单列：实测 p4 自己会照常写回这类文件
+        // （`.p4ignore` 拦不住 `p4 sync -f`），交给它做，工具不单方面覆盖。
+        let Some(file) = workspace.get_filtered(&record.client_file_lower) else {
+            analysis.restore.push(source);
+            continue;
+        };
+
+        // have 与目标不一致：本地这一份不是目标版本（更新的，或 `--to <CL>` 下更旧的），
+        // 传就是了。摘要在这里没有意义——算出来「不一样」也还是要传。
+        if record.have_rev != Some(target_record.rev) {
+            analysis.update.push(source);
+            continue;
+        }
+
+        let (Some(file_type), Some(size)) = (record.head_type, record.file_size) else {
+            bail!("Cannot handle \"{}\" (sync)", record.client_file);
+        };
+
+        // 二进制长度不符就已经能判定内容变了，不必再读一遍内容。
+        // 文本不能这么判：换行归一化会改变字节数，长度不同不代表内容不同。
+        if size != file.size && file_type == FileType::Binary {
+            analysis.revert.push(source);
+            continue;
+        }
+
+        let digest_type = match file_type.digest_type() {
+            Ok(digest_type) => digest_type,
+            // Apple / Resource 的摘要算不出来，和认不出类型名的记录一样转交。
+            Err(_) => {
+                analysis.unsupported.push(record);
+                continue;
+            }
+        };
+
+        analysis.check.push(DigestCheck {
+            file,
+            source,
+            digest_type,
+        });
+    }
+
+    guard_case_conflicts(&analysis, depot, target)?;
+
+    Ok(analysis)
+}
+
+/// 挡住「大小写冲突 + 目标态与 head 态背离」这个会误删本地文件的组合。
+///
+/// [`build_mapping`] 选出的胜者是按 **head** 事实定的（在世的优先、有 have 记录的优先），
+/// 而「该路径在不在目标处」由目标快照决定——两者可以背离。depot 里做过一次只改大小写的
+/// 改名（`//D/Snow.uasset` 已删、`//D/snow.uasset` 在世），`--to` 又指向改名之前时：按 head
+/// 选出的胜者在目标处不在库，于是本地文件被收进删除组，可目标处其实有另一条路径的内容
+/// 该落下来。删掉它是错的，而且不可逆。
+///
+/// 不做自动择一——那要定义一套「按目标态重新决胜」的新语义，而这里只是不想**默不作声**
+/// 地删错东西。罕见组合，所以只在真的出现删除候选时才回头查一遍。
+///
+/// [`build_mapping`]: crate::model::DepotState::build_mapping
+fn guard_case_conflicts(
+    analysis: &SyncAnalysis<'_>,
+    depot: &DepotState,
+    target: &TargetMap,
+) -> Result<()> {
+    use FileAction::*;
+
+    if analysis.delete.is_empty() {
+        return Ok(());
+    }
+
+    let doomed: HashSet<&str> = analysis
+        .delete
+        .iter()
+        .map(|entry| entry.record.client_file_lower.as_str())
+        .collect();
+
+    for record in &depot.file_records {
+        if !doomed.contains(record.client_file_lower.as_str()) {
+            continue;
+        }
+
+        // 同一条本地路径上，只要还有另一条记录在目标处留着内容，就不能删。
+        let alive_at_target = target
+            .get(&record.depot_file_lower)
+            .is_some_and(|target_record| !matches!(target_record.action, Delete | MoveDelete));
+        if alive_at_target {
+            bail!(
+                "Refusing to sync: the local path \"{}\" maps to more than one depot path, \
+                 and {} still has content at the target revision while the record chosen for \
+                 this workspace has none. Syncing would delete the local file even though the \
+                 depot has something to put there. Resolve the case conflict by hand.",
+                record.client_file,
+                record.depot_file
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::time::UNIX_EPOCH;
 
+    use crate::model::TargetRecord;
     use crate::path::local_path_key;
 
     const PATH: &str = r"C:\ws\a.txt";
@@ -750,5 +1002,340 @@ mod tests {
         assert_eq!(analysis.unsupported_files[0].depot_file, "//depot/a.txt");
         assert!(non_empty_groups(&analysis.changes).is_empty());
         assert_eq!(pending_digests(&analysis), [0, 0, 0]);
+    }
+
+    // ---- analyze_at_target：按目标版本分类 ----
+
+    /// 目标版本快照里的一条记录。
+    fn target_entry(depot_file: &str, rev: u32, action: FileAction) -> (String, TargetRecord) {
+        (
+            depot_file.to_ascii_lowercase(),
+            TargetRecord { rev, action },
+        )
+    }
+
+    /// 目标就是 head 时，快照与 head 记录同源。
+    ///
+    /// 刻意转调生产实现而不是在这里复刻一份：复刻的话，`snapshot_target` 取错了字段
+    /// （比如把 `have_rev` 当成 `rev`）这套单测照样全绿——那正是「用实现的重述验证实现」。
+    fn head_target(records: &[DepotFileRecord]) -> TargetMap {
+        crate::p4::fstat::snapshot_target(records)
+    }
+
+    /// sync 分类下哪些组非空——用来一眼看出一个文件有没有落进唯一的一组。
+    fn non_empty_sync_groups(analysis: &SyncAnalysis) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        for (label, len) in [
+            ("update", analysis.update.len()),
+            ("revert", analysis.revert.len()),
+            ("check", analysis.check.len()),
+            ("restore", analysis.restore.len()),
+            ("delete", analysis.delete.len()),
+            ("unsupported", analysis.unsupported.len()),
+            ("archived", analysis.archived.len()),
+        ] {
+            if len > 0 {
+                labels.push(label);
+            }
+        }
+        labels
+    }
+
+    /// **「目标版本不需要摘要」的单测化身**：have 与目标不一致的文件直接进 `update`，
+    /// 绝不能进 `check`——真进去的话，`check` 组会去拿 have 版本的摘要比对一个
+    /// 将来才要下载的目标版本，得出一个没有意义的结论。
+    #[test]
+    fn a_file_behind_the_target_is_updated_without_a_digest() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target: TargetMap = [target_entry("//depot/a.txt", 2, FileAction::Edit)]
+            .into_iter()
+            .collect();
+
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["update"]);
+        assert_eq!(analysis.update[0].target_rev, 2);
+    }
+
+    /// 从没同步过的文件同理：没有 have 摘要可比，只有「拉」这一个选项。
+    #[test]
+    fn a_file_never_synced_is_updated_without_a_digest() {
+        let depot = depot_state(vec![DepotFileRecord {
+            have_rev: None,
+            ..synced_record(PATH)
+        }]);
+        let target: TargetMap = [target_entry("//depot/a.txt", 1, FileAction::Edit)]
+            .into_iter()
+            .collect();
+
+        // 本地已经有一份同名文件：会被 depot 内容整份覆盖（已拍板照 -f 的行为）。
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["update"]);
+    }
+
+    /// have 与目标一致、本地在位：只有这一种情况需要对摘要。
+    #[test]
+    fn a_file_at_the_target_is_checked_with_a_digest() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target = head_target(&depot.file_records);
+
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["check"]);
+        assert_eq!(analysis.check[0].digest_type, DigestType::Text);
+    }
+
+    /// 本地缺失压过 have 状态：不论 have 停在哪一版，本地没有就是「写回」。
+    ///
+    /// 判据按**本地状态**分而不是 have 状态分的理由见 `analyze_at_target` 的文档；
+    /// 原生 `p4 sync -f` 那边对应的是 `added as` 而不是 `updating`。
+    #[test]
+    fn a_missing_local_file_is_restored_even_when_have_is_behind() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target: TargetMap = [target_entry("//depot/a.txt", 2, FileAction::Edit)]
+            .into_iter()
+            .collect();
+
+        let workspace = workspace_state(&[]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["restore"]);
+    }
+
+    /// 二进制长度不符就已经能断定内容变了：不必再读一遍内容。
+    #[test]
+    fn a_binary_of_the_wrong_size_is_reverted_without_a_digest() {
+        let depot = depot_state(vec![DepotFileRecord {
+            head_type: Some(FileType::Binary),
+            ..synced_record(PATH)
+        }]);
+        let target = head_target(&depot.file_records);
+
+        let workspace = workspace_state(&[(PATH, SIZE - 1, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["revert"]);
+    }
+
+    /// 文本不能这么判：换行归一化会改变字节数，长度不同不代表内容不同。
+    #[test]
+    fn a_text_of_the_wrong_size_is_still_checked() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target = head_target(&depot.file_records);
+
+        let workspace = workspace_state(&[(PATH, SIZE - 1, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["check"]);
+    }
+
+    #[test]
+    fn a_file_missing_locally_is_restored() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target = head_target(&depot.file_records);
+
+        let workspace = workspace_state(&[]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["restore"]);
+    }
+
+    /// 被忽略规则覆盖的本地文件视同不存在：实测 p4 自己会照常写回这类文件
+    /// （`.p4ignore` 拦不住 `p4 sync -f`），交给它做，工具不单方面覆盖。
+    #[test]
+    fn an_ignored_local_copy_is_restored_not_checked() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target = head_target(&depot.file_records);
+
+        let workspace = workspace_state(&[(PATH, SIZE, true)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["restore"]);
+    }
+
+    /// 目标时刻该路径已是删除版本：本地那份要删掉。
+    #[test]
+    fn a_file_deleted_at_the_target_is_deleted_locally() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target: TargetMap = [target_entry("//depot/a.txt", 1, FileAction::Delete)]
+            .into_iter()
+            .collect();
+
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["delete"]);
+    }
+
+    /// 同一个「被忽略」标记，在删除组里的方向与 Restore 组**相反**：那里交给 p4 覆盖写回，
+    /// 这里则放过它、不删。
+    ///
+    /// 这个不对称是刻意的——本地构建产物是用户明确表达过「别管它」的东西，而删除不可逆。
+    /// 口径写反就是删用户的 `build/`，所以它必须有一条用例守着。
+    #[test]
+    fn an_ignored_local_file_is_not_deleted_at_the_target() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target: TargetMap = [target_entry("//depot/a.txt", 1, FileAction::Delete)]
+            .into_iter()
+            .collect();
+
+        let workspace = workspace_state(&[(PATH, SIZE, true)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert!(analysis.delete.is_empty(), "被忽略的文件不该进删除组");
+        assert!(non_empty_sync_groups(&analysis).is_empty());
+    }
+
+    /// `--to <CL>` 下「目标时刻还没创建」的形态：@CL 的结果里压根没有这条记录，
+    /// 但 head 记录里有、本地也有。实测 p4 自己也是删（`deleted as`）。
+    #[test]
+    fn a_path_created_after_the_target_changelist_is_deleted_locally() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target: TargetMap = TargetMap::new();
+
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["delete"]);
+    }
+
+    /// 目标时刻不在库、本地也没有：没有动作可言。
+    #[test]
+    fn a_deleted_target_without_a_local_copy_has_nothing_to_do() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target: TargetMap = [target_entry("//depot/a.txt", 1, FileAction::Delete)]
+            .into_iter()
+            .collect();
+
+        let workspace = workspace_state(&[]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert!(non_empty_sync_groups(&analysis).is_empty());
+    }
+
+    /// 已打开的文件一律不碰（`p4 sync -f` 的官方口径同样如此），而且不汇报。
+    #[test]
+    fn an_opened_file_is_left_alone() {
+        let depot = depot_state(vec![
+            DepotFileRecord {
+                action: Some(FileAction::Edit),
+                ..synced_record(PATH)
+            },
+            open_add_record(r"C:\ws\added.txt"),
+        ]);
+        let target = head_target(&depot.file_records);
+
+        // 本地内容与目标不同、也被改过，但对已打开的文件这些都不构成理由。
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert!(non_empty_sync_groups(&analysis).is_empty());
+    }
+
+    /// 已打开 × 目标时刻不在库：仍然不碰。
+    ///
+    /// 这是「已打开优先」最要命的一种组合——用户 `p4 edit` 一个在 head 处已删除的文件
+    /// （等于「我要把它加回来」），本地有他没提交的工作。S1 的判断若被挪到目标判断之后，
+    /// 这份工作会被当成「目标时刻不在库」删掉。
+    #[test]
+    fn an_opened_file_is_left_alone_even_when_the_target_has_none() {
+        let depot = depot_state(vec![DepotFileRecord {
+            action: Some(FileAction::Edit),
+            ..synced_record(PATH)
+        }]);
+        let target: TargetMap = [target_entry("//depot/a.txt", 2, FileAction::Delete)]
+            .into_iter()
+            .collect();
+
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert!(analysis.delete.is_empty(), "已打开的文件不该进删除组");
+        assert!(non_empty_sync_groups(&analysis).is_empty());
+    }
+
+    /// 未跟踪的本地文件（depot 里压根没有这个路径）不动作——这与 clean 是最要紧的分水岭。
+    #[test]
+    fn an_untracked_local_file_is_left_alone() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target = head_target(&depot.file_records);
+
+        let workspace =
+            workspace_state(&[(PATH, SIZE, false), (r"C:\ws\untracked.txt", 10, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["check"]);
+        assert!(
+            analysis
+                .delete
+                .iter()
+                .all(|entry| !entry.file.path.ends_with("untracked.txt")),
+            "未跟踪的文件绝不能进删除组"
+        );
+    }
+
+    #[test]
+    fn an_archived_target_is_reported_not_synced() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target: TargetMap = [target_entry("//depot/a.txt", 1, FileAction::Archive)]
+            .into_iter()
+            .collect();
+
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["archived"]);
+    }
+
+    /// 类型名认不出来 → 转交；Apple / Resource 算不出摘要 → 同样转交。
+    #[test]
+    fn types_without_a_digest_are_handed_to_p4_sync() {
+        let unknown = DepotFileRecord {
+            head_type: None,
+            unsupported_type: Some("tempobj".to_owned()),
+            ..synced_record(PATH)
+        };
+        let apple = DepotFileRecord {
+            head_type: Some(FileType::Apple),
+            ..synced_record(r"C:\ws\b.txt")
+        };
+        let depot = depot_state(vec![unknown, apple]);
+        let target = head_target(&depot.file_records);
+
+        let workspace = workspace_state(&[(PATH, SIZE, false), (r"C:\ws\b.txt", SIZE, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["unsupported"]);
+        // 汇报一次，不是两次：每条记录只落一类。
+        assert_eq!(analysis.unsupported.len(), 2);
+    }
+
+    /// 大小写冲突下同一个 client 路径对上两条记录，只处理 build_mapping 选出的胜者，
+    /// 否则同一个本地文件会被两条 depot 路径各下发一次。
+    #[test]
+    fn a_case_collision_only_processes_the_winning_record() {
+        let winner = DepotFileRecord {
+            depot_file: "//depot/Snow.uasset".to_owned(),
+            depot_file_lower: "//depot/snow.uasset".to_owned(),
+            head_rev: Some(2),
+            ..synced_record(PATH)
+        };
+        let loser = DepotFileRecord {
+            depot_file: "//depot/snow_normal.uasset".to_owned(),
+            depot_file_lower: "//depot/snow_normal.uasset".to_owned(),
+            ..synced_record(PATH)
+        };
+        let depot = depot_state(vec![winner, loser]);
+        let target = head_target(&depot.file_records);
+
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["update"]);
+        assert_eq!(analysis.update.len(), 1);
     }
 }

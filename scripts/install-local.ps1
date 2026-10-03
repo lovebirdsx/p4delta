@@ -35,6 +35,10 @@
 .PARAMETER WithoutCleanApply
     透传给 install.ps1：不注册不可逆的「clean 实际清理」（默认注册；以前装过的会被摘掉）。
 
+.PARAMETER WithoutSyncApply
+    透传给 install.ps1：不注册不可逆的「sync 到指定 changelist 实际执行」（默认注册；
+    以前装过的会被摘掉）。
+
 .PARAMETER Quiet
     透传给 install.ps1：只输出警告与错误。
 
@@ -62,6 +66,7 @@ param(
     [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\p4delta'),
     [string] $CustomToolsPath = (Join-Path $env:USERPROFILE '.p4qt\customtools.xml'),
     [switch] $WithoutCleanApply,
+    [switch] $WithoutSyncApply,
     [switch] $Quiet
 )
 
@@ -215,6 +220,9 @@ function Invoke-LocalInstall {
     }
     if ($WithoutCleanApply) {
         $installArgs.WithoutCleanApply = $true
+    }
+    if ($WithoutSyncApply) {
+        $installArgs.WithoutSyncApply = $true
     }
     if ($Quiet) {
         $installArgs.Quiet = $true

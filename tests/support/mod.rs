@@ -478,8 +478,10 @@ impl Sandbox {
 }
 
 /// `-l` 清单里可能出现的动作标签：前八个来自 `src/reconcile/changes.rs` 的
-/// `GROUPS`，后两个来自 `src/reconcile/clean.rs` 的 `CLEAN_GROUPS`。
-const CHANGE_LABELS: [&str; 10] = [
+/// `GROUPS`，后三个来自 `src/reconcile/clean.rs` 的 `CLEAN_GROUPS` 与
+/// `src/reconcile/sync.rs` 的 `SYNC_GROUPS`（两组共用 `Revert` / `Restore` / `Delete`，
+/// 只有 `Update` 是 sync 独有的）。
+const CHANGE_LABELS: [&str; 11] = [
     "Add",
     "Edit",
     "Reopen Edit",
@@ -491,6 +493,8 @@ const CHANGE_LABELS: [&str; 10] = [
     // clean 模式
     "Revert",
     "Restore",
+    // sync 模式独有
+    "Update",
 ];
 
 /// 从 `-l` 的输出里取出 (动作标签, 文件路径)。
