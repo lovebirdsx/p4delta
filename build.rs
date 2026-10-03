@@ -2,7 +2,6 @@ fn main() {
     println!("cargo:rerun-if-changed=p4delta.rc");
     println!("cargo:rerun-if-changed=p4delta.exe.manifest");
 
-    // Only embed manifest on Windows
     #[cfg(windows)]
     {
         // VERSIONINFO 里的版本号从 Cargo.toml 算出来、编译期注入，仓库里不再有第二份

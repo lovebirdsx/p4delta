@@ -10,12 +10,12 @@ use std::sync::OnceLock;
 
 use encoding_rs::{Encoding, UTF_8, WINDOWS_1252};
 
-/// The charset p4 writes its output in, resolved once at startup.
-/// p4 translates all metadata through P4CHARSET, so decoding with anything else turns
-/// non-ASCII paths into mojibake that can never match the local filesystem.
+/// p4 写输出用的字符集，启动时解析一次。
+/// p4 按 P4CHARSET 翻译它输出的全部元数据，用别的字符集解码会把非 ASCII 路径
+/// 变成永远匹配不上本地文件系统的乱码。
 static P4_ENCODING: OnceLock<&'static Encoding> = OnceLock::new();
 
-/// The charset to decode p4 output with. Falls back to UTF-8 when never initialized.
+/// 解码 p4 输出用的字符集。从未初始化时回落到 UTF-8。
 pub(crate) fn p4_encoding() -> &'static Encoding {
     P4_ENCODING.get().copied().unwrap_or(UTF_8)
 }
@@ -28,8 +28,7 @@ pub(crate) fn p4_encoding() -> &'static Encoding {
 /// 而输出仍按内容字符集解码——那等于把问题从参数搬到输出上。）
 static P4_COMMAND_ENCODING: OnceLock<&'static Encoding> = OnceLock::new();
 
-/// The charset p4 decodes arguments with. Falls back to the content charset, which is what
-/// p4 itself does when `P4COMMANDCHARSET` is unset.
+/// p4 解码参数用的字符集。回落到内容字符集——`P4COMMANDCHARSET` 没设时 p4 自己就是这么做的。
 pub(crate) fn p4_command_encoding() -> &'static Encoding {
     P4_COMMAND_ENCODING
         .get()
@@ -37,8 +36,8 @@ pub(crate) fn p4_command_encoding() -> &'static Encoding {
         .unwrap_or_else(|| p4_encoding())
 }
 
-/// Resolves and caches the p4 charsets. Idempotent; the first caller wins.
-/// `cwd` matters because p4 looks for a `.p4config` in its working directory.
+/// 解析并缓存 p4 的两套字符集。幂等；先到者胜。
+/// `cwd` 有意义是因为 p4 会在自己的工作目录里找 `.p4config`。
 pub(crate) fn init_p4_encoding(explicit: Option<&str>, cwd: &Path) -> &'static Encoding {
     if let Some(encoding) = P4_ENCODING.get() {
         return encoding;
@@ -83,9 +82,8 @@ fn non_empty_env(name: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-/// Picks the charset p4 is using, in the order p4 itself resolves its own settings:
-/// explicit option, environment, then `p4 set`. Port-level variables are only consulted
-/// when the general one is absent, which matches the observed behavior.
+/// 挑出 p4 正在用的字符集，顺序照抄 p4 解析自己设置的顺序：显式选项、环境变量、`p4 set`。
+/// 端口级变量只在通用变量缺席时才看，与观察到的行为一致。
 ///
 /// 环境变量与 `p4 set` 的值都由调用方传进来，不是为了好看：单元测试里改进程环境是全局操作，
 /// 会和并行跑的用例互相踩。
@@ -158,8 +156,7 @@ struct P4SetCharsets {
     command_charset: Option<String>,
 }
 
-/// Reads the charsets from `p4 set`. Values configured that way live in the registry rather
-/// than the environment, so `env::var` cannot see them.
+/// 从 `p4 set` 读回字符集。这样配的值在注册表里而不在环境变量里，`env::var` 看不到。
 fn query_p4_set_charsets(cwd: &Path) -> P4SetCharsets {
     // 定位不到 p4 与起不来是同一件事，都退回默认字符集——这里不该打断整轮，
     // P4_EXE 配错由入口处的前置校验负责报出来。
@@ -211,19 +208,21 @@ fn port_level_charset(text: &str) -> Option<String> {
     port_level
 }
 
-/// Maps a `P4CHARSET` value to an encoding. p4 uses hyphen-less names that are not WHATWG
-/// labels, so most of them cannot go through `Encoding::for_label` and need explicit mapping.
-/// `None` means "unknown", and the caller should fall back.
+/// 把 `P4CHARSET` 的值映射成编码。p4 的名字不带连字符、多数不是 WHATWG 标签，
+/// 所以大部分要走下面这张显式映射表。`None` 表示「认不出」，调用方应当回落。
+///
+/// 兜底用 `Encoding::for_label_no_replacement` 而不是 `for_label`：后者连 `replacement`
+/// 这个标签也认成一种编码，而那个「编码」解码出来全是 U+FFFD，等于把文件名整个毁掉。
 pub(crate) fn p4_charset_to_encoding(name: &str) -> Option<&'static Encoding> {
     use encoding_rs::*;
 
     let name = name.trim().trim_matches('"').to_ascii_lowercase();
 
     let mapped = match name.as_str() {
-        // "none" disables translation and "auto" is resolved by p4 from the OS locale.
-        // Neither tells us the actual byte encoding, so let the caller fall back.
+        // "none" 关掉翻译，"auto" 由 p4 按系统区域解析。两者都不告诉我们真实的字节编码，
+        // 所以交给调用方回落。
         "none" | "auto" | "" => return None,
-        // encoding_rs has no UTF-32 support; refuse rather than silently mangle paths.
+        // encoding_rs 不支持 UTF-32；宁可拒绝，也不要静默毁掉路径。
         "utf32" | "utf32-nobom" | "utf32le" | "utf32le-bom" | "utf32be" | "utf32be-bom" => {
             return None;
         }
@@ -248,29 +247,29 @@ pub(crate) fn p4_charset_to_encoding(name: &str) -> Option<&'static Encoding> {
         "eucjp" => EUC_JP,
         "macosroman" => MACINTOSH,
         "koi8-r" => KOI8_R,
-        "iso8859-1" => WINDOWS_1252, // WHATWG treats ISO-8859-1 as an alias of windows-1252
+        "iso8859-1" => WINDOWS_1252, // WHATWG 把 ISO-8859-1 当作 windows-1252 的别名
         "iso8859-2" => ISO_8859_2,
         "iso8859-5" => ISO_8859_5,
         "iso8859-7" => ISO_8859_7,
         "iso8859-15" => ISO_8859_15,
 
-        // cp850/cp852/cp858 and the remaining iso8859 variants have no encoding_rs
-        // equivalent. Try a WHATWG label as a last resort.
+        // cp850/cp852/cp858 及其余 iso8859 变体在 encoding_rs 里没有对应项。
+        // 最后再按 WHATWG 标签试一次。
         _ => return Encoding::for_label_no_replacement(name.as_bytes()),
     };
 
     Some(mapped)
 }
 
-/// Decodes p4 output bytes to text, reporting whether replacement characters were produced.
-/// That flag is the only reliable wrong-charset signal: encoding_rs never returns an error,
-/// and for single-byte encodings every byte maps to something, so nothing is ever "invalid".
+/// 把 p4 输出的字节解码成文本，同时报告有没有产生替换字符。
+/// 那个标志是唯一可靠的「字符集用错」信号：encoding_rs 从不返回错误，
+/// 单字节编码里每个字节都有对应的字符，永远谈不上「非法」。
 pub(crate) fn decode_p4_bytes<'a>(
     bytes: &'a [u8],
     encoding: &'static Encoding,
 ) -> (Cow<'a, str>, bool) {
-    // UTF-8 is by far the common case. Decode it strictly first so that a legacy non-unicode
-    // client degrades to the previous windows-1252 behavior instead of producing U+FFFD.
+    // UTF-8 是绝大多数情况。先严格解码一次，好让使用旧的非 Unicode 客户端的场景
+    // 退回此前的 windows-1252 行为，而不是吐出一堆 U+FFFD。
     if encoding == UTF_8 {
         return match std::str::from_utf8(bytes) {
             Ok(text) => (Cow::Borrowed(text), false),
@@ -278,13 +277,13 @@ pub(crate) fn decode_p4_bytes<'a>(
         };
     }
 
-    // Not `decode`: its BOM sniffing overrides the caller's encoding, which would misread a
-    // cp936 stream that happens to start with EF BB BF. BOMs are stripped explicitly instead.
+    // 不用 `decode`：它的 BOM 嗅探会覆盖调用方指定的编码，碰到恰好以 EF BB BF 开头的
+    // cp936 流就会读错。BOM 改由 [`strip_bom`] 显式剥掉。
     encoding.decode_without_bom_handling(bytes)
 }
 
-/// Strips a byte order mark matching `encoding`, which p4 emits when configured with a
-/// `-bom` charset. Left in place it would corrupt the first key of a response.
+/// 剥掉与 `encoding` 相符的字节序标记：p4 配了带 `-bom` 的字符集时会写它。
+/// 留着会污染响应里的第一个键。
 pub(crate) fn strip_bom<'a>(bytes: &'a [u8], encoding: &'static Encoding) -> &'a [u8] {
     match Encoding::for_bom(bytes) {
         Some((bom_encoding, len)) if bom_encoding == encoding => &bytes[len..],
@@ -292,9 +291,11 @@ pub(crate) fn strip_bom<'a>(bytes: &'a [u8], encoding: &'static Encoding) -> &'a
     }
 }
 
-/// Drops a single trailing line ending, mirroring `std::io::BufRead::lines`.
-/// p4 writes CRLF, so leaving the `\r` on would corrupt parsed numbers and shift the
-/// fixed-width slicing done on `p4 ignores` output.
+/// 剥掉末尾的一个换行。与 `std::io::BufRead::lines` 相近但不完全相同：这里是先剥 `\n`
+/// 再剥 `\r`，所以对没有 `\n` 结尾的 `"value\r"` 也会剥掉那个 `\r`，而 `lines` 不会。
+///
+/// p4 写的是 CRLF：留着 `\r` 会污染解析出来的数字，也会让 `p4 ignores` 输出上的定宽切片
+/// 整体错位。
 pub(crate) fn trim_line_ending(bytes: &[u8]) -> &[u8] {
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     bytes.strip_suffix(b"\r").unwrap_or(bytes)
@@ -362,9 +363,8 @@ mod tests {
 
     #[test]
     fn windows_1252_decoding_produces_mojibake() {
-        // The exact corruption this fix removes. Those same bytes read as windows-1252 can
-        // never equal the name the local filesystem reports, which is why every Chinese file
-        // used to look like it had been both added and deleted.
+        // 正是这次修复要消除的那种损坏。同一串字节按 windows-1252 读出来，
+        // 永远不等于本地文件系统报告的名字——这就是每个中文文件过去既像新增又像删除的原因。
         let (text, _) = decode_p4_bytes(CHINESE_NAME_UTF8, WINDOWS_1252);
         assert_eq!(text, "ä½¿ç”¨è¯´æ˜Ž.txt");
         assert_ne!(text, "使用说明.txt");
@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn invalid_utf8_falls_back_to_windows_1252() {
-        // A legacy non-unicode client. Degrading to the previous behavior beats emitting U+FFFD.
+        // 使用旧的非 Unicode 客户端。退回此前行为，好过吐出一堆 U+FFFD。
         let (text, had_replacements) = decode_p4_bytes(b"caf\xe9.txt", UTF_8);
         assert_eq!(text, "café.txt");
         assert!(!had_replacements);
@@ -397,11 +397,11 @@ mod tests {
 
     #[test]
     fn unmappable_charsets_are_rejected() {
-        // p4 resolves these from the OS locale, so we cannot know the byte encoding.
+        // p4 按系统区域解析这几个，我们无从知道真实字节编码。
         assert_eq!(p4_charset_to_encoding("auto"), None);
         assert_eq!(p4_charset_to_encoding("none"), None);
         assert_eq!(p4_charset_to_encoding(""), None);
-        // encoding_rs has no UTF-32 decoder.
+        // encoding_rs 没有 UTF-32 解码器。
         assert_eq!(p4_charset_to_encoding("utf32le"), None);
     }
 
@@ -583,8 +583,7 @@ mod tests {
 
     #[test]
     fn trims_line_endings() {
-        // p4 writes CRLF. Leaving the \r on corrupts numeric fields and shifts the
-        // fixed-width slicing done on `p4 ignores` output.
+        // p4 写的是 CRLF。留着 \r 会污染数字字段，也会让 `p4 ignores` 输出上的定宽切片错位。
         assert_eq!(trim_line_ending(b"value\r\n"), b"value");
         assert_eq!(trim_line_ending(b"value\n"), b"value");
         assert_eq!(trim_line_ending(b"value"), b"value");
@@ -596,7 +595,7 @@ mod tests {
     fn strips_only_a_matching_bom() {
         assert_eq!(strip_bom(b"\xef\xbb\xbfabc", UTF_8), b"abc");
         assert_eq!(strip_bom(b"abc", UTF_8), b"abc");
-        // A BOM belonging to a different encoding is data, not a marker.
+        // 属于另一种编码的 BOM 是数据，不是标记。
         assert_eq!(
             strip_bom(b"\xef\xbb\xbfabc", WINDOWS_1252),
             b"\xef\xbb\xbfabc"

@@ -38,10 +38,10 @@ pub(crate) fn collect_workspace_files(
             }
 
             num_dirs += 1;
-        // Symlinks count as files: Perforce tracks them as `symlink` revisions, and a directory
-        // symlink is one of those revisions too. Leaving them out made every tracked symlink
-        // look deleted from the workspace, because phase one only sees what was collected here.
-        // `entry.metadata()` is lstat-like, so size and date describe the link itself.
+        // 符号链接算文件：Perforce 把它们作为 `symlink` 修订跟踪，指向目录的符号链接
+        // 也是其中一种。漏掉它们会让每个被跟踪的符号链接看起来像从工作区删掉了——
+        // 第一阶段只看得见这里收集到的东西。`entry.metadata()` 是 lstat 语义，
+        // 大小与时间描述的是链接本身。
         } else if file_type.is_file() || file_type.is_symlink() {
             let path_string = normalize_local_path_owned(entry.path().display().to_string());
             let meta = entry.metadata()?;
@@ -318,8 +318,7 @@ pub(crate) async fn filter_unmapped_paths(
     Ok(drop_unmapped(files, &unmapped_path_keys(&lines)))
 }
 
-/// Scans workspace for files that are not ignored.
-/// 返回工作区状态和本次实际应用的目录剪枝结果。
+/// 扫描工作区，返回收集到的文件状态与本次实际应用的剪枝计划。
 pub(crate) async fn gather_workspace(
     options: &Options,
     work_dir: &str,
@@ -350,7 +349,6 @@ pub(crate) async fn gather_workspace(
 
     let ignored_count = apply_file_ignores(options, work_dir, &mut files).await?;
 
-    // 建立路径索引
     let mut workspace_state = WorkspaceState {
         num_files: files.len() - ignored_count,
         files,

@@ -8,13 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Error, Result, anyhow, bail};
 use bincode::{Decode, Encode};
 
-/// Record from `p4 -G have` output
+/// `p4 -G have` 输出里的一条记录。
 #[derive(Debug, Clone)]
 pub(crate) struct HaveRecord {
-    pub(crate) sync_time: Option<u64>, // Unix timestamp (optional)
+    /// Unix 时间戳。
+    pub(crate) sync_time: Option<u64>,
 }
 
-/// Possible actions of file records in p4 fstat response.
+/// p4 fstat 响应里文件记录可能的动作。
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum FileAction {
     Add,
@@ -29,7 +30,7 @@ pub(crate) enum FileAction {
     Archive,
 }
 
-// This helps us parse the actions from the p4 fstat response text.
+/// 从 p4 fstat 的输出文本解析动作。
 impl std::str::FromStr for FileAction {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -50,7 +51,7 @@ impl std::str::FromStr for FileAction {
     }
 }
 
-/// Possible types of file records with regards to how we should compute the digest.
+/// 从摘要计算方式的角度划分的文件记录类型。
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum DigestType {
     Binary,
@@ -59,7 +60,7 @@ pub(crate) enum DigestType {
     Symlink,
 }
 
-/// Possible types of file records from Perforce
+/// Perforce 的文件类型。
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum FileType {
     Binary,
@@ -72,7 +73,6 @@ pub(crate) enum FileType {
     Symlink,
 }
 
-// This determines the appropriate digest type to use for a Perforce file type.
 impl FileType {
     pub(crate) fn digest_type(&self) -> Result<DigestType> {
         Ok(match self {
@@ -80,20 +80,19 @@ impl FileType {
             FileType::Text | FileType::Unicode => DigestType::Text,
             FileType::Utf8 => DigestType::Utf8,
 
-            // These are mysteriously also using an utf8 digest.
+            // 这些也在用 utf8 摘要——原因不明。
             FileType::Utf16 => DigestType::Utf8,
 
-            // A symlink revision holds the link target, not the contents of what it points at.
+            // 符号链接的修订存的是链接目标，不是所指文件的内容。
             FileType::Symlink => DigestType::Symlink,
 
-            // These do not match the underlying MD5 sum when calculated on Windows, so unclear how
-            // to calculate the digest.
+            // 在 Windows 上算出来的值与底层 MD5 对不上，怎么算还不清楚。
             FileType::Apple | FileType::Resource => bail!("Apple legacy formats are not supported"),
         })
     }
 }
 
-// This helps us parse the digest type from the p4 fstat response text.
+/// 从 p4 fstat 的输出文本解析文件类型。
 impl std::str::FromStr for FileType {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -120,8 +119,8 @@ impl std::str::FromStr for FileType {
     }
 }
 
-/// Information about a single file in the depot, returned by p4 fstat queries.
-/// Many of the fields are optional and only appear in specific situations.
+/// depot 里单个文件的信息，由 p4 fstat 查询返回。
+/// 多数字段是可选的，只在特定情况下出现。
 ///
 /// **补查会改写一部分字段的版本语义**：本地落后的记录会被 fstat 补查（见 `p4/fstat.rs`
 /// 的回填），之后 `head_type` / `head_action` / `file_size` / `digest`（连同
@@ -130,19 +129,19 @@ impl std::str::FromStr for FileType {
 /// 落后」的判据。
 #[derive(Default, Debug)]
 pub(crate) struct DepotFileRecord {
-    /// Path in depot syntax, such as "//Depot/Stream/File.ext".
+    /// depot 语法路径，保留原始大小写，如 "//Depot/Stream/File.ext"。
     pub(crate) depot_file: String,
 
-    /// Path in depot syntax, such as "//depot/stream/file.ext".
+    /// depot 语法路径的小写形式，用作匹配键。
     pub(crate) depot_file_lower: String,
 
-    /// Path in workspace syntax, such as "C:\Workspace\File.ext" on windows.
+    /// 工作区语法路径，保留原始大小写，如 Windows 上的 "C:\Workspace\File.ext"。
     pub(crate) client_file: String,
 
-    /// Path in workspace syntax, such as "c:\workspace\file.ext" on windows.
+    /// 工作区语法路径的小写形式，用作匹配键。
     pub(crate) client_file_lower: String,
 
-    /// If the file is in the depot, holds the current file type, such as text+w or binary+l.
+    /// 文件在 depot 里时是它的当前类型，如 text+w、binary+l。
     ///
     /// 补查后是 **have 版本**的类型：摘要要按本地那一版算，见结构体文档。
     pub(crate) head_type: Option<FileType>,
@@ -153,49 +152,48 @@ pub(crate) struct DepotFileRecord {
     /// 于是它也是 have 版本的原始串。
     pub(crate) unsupported_type: Option<String>,
 
-    /// If the file is in the depot, holds the type of the last change made in the depot.
-    /// This tells us if the file existed once but was deleted from the depot.
+    /// 文件在 depot 里时是它最后一次改动的动作。据此判断一个文件是否曾经存在、
+    /// 后来在 depot 里被删掉。
     ///
     /// 补查后是 **have 版本**的动作，见结构体文档。
     pub(crate) head_action: Option<FileAction>,
 
-    /// If the file is in the depot, holds the most recent revision number on the server.
+    /// 文件在 depot 里时是服务器上的最新修订号。
     ///
     /// 补查**不动**这一项：它始终是真实 head，被换成 have 版本的是类型/动作/大小/摘要
     /// 那几项，见结构体文档。
     pub(crate) head_rev: Option<u32>,
 
-    /// If the file is in the workspace, holds the latest revision that we synced.
-    /// This may be different from head_rev if we are behind.
+    /// 文件在工作区里时是我们最后一次同步下来的修订号。本地落后时它与 `head_rev` 不同。
     ///
     /// 补查之后，`head_type` / `head_action` / `file_size` / `digest` 描述的就是这一版
     /// （比较基线），见结构体文档。
     pub(crate) have_rev: Option<u32>,
 
-    /// If the file is in a pending changelist, holds what we are doing with it.
+    /// 文件在待提交 changelist 里时，是我们对它做的动作。
     pub(crate) action: Option<FileAction>,
 
-    /// If the file is in the depot, holds the expected size on disk.
+    /// 文件在 depot 里时期望的磁盘大小。
     ///
     /// 补查后是 **have 版本**的大小，见结构体文档。
     pub(crate) file_size: Option<u64>,
 
-    /// If the file is in the depot, holds the expected normalized MD5 digest.
+    /// 文件在 depot 里时期望的归一化 MD5 摘要。
     ///
     /// 补查后是 **have 版本**的摘要——正是拿来和本地文件比对的那个基线，见结构体文档。
     pub(crate) digest: Option<[u8; 16]>,
 }
 
-/// Information about the entire depot, returned by fstat queries.
+/// 整个 depot 的信息，由 fstat 查询返回。
 #[derive(Default, Debug)]
 pub(crate) struct DepotState {
-    /// All file records in the depot.
+    /// depot 里的全部文件记录。
     pub(crate) file_records: Vec<DepotFileRecord>,
 
-    /// Map used to index file_records by depot_file_lower.
+    /// 按 `depot_file_lower` 给 `file_records` 建索引。
     depot_map: HashMap<String, usize>,
 
-    /// Map used to index file_records by client_file_lower.
+    /// 按 `client_file_lower` 给 `file_records` 建索引。
     client_map: HashMap<String, usize>,
 }
 
@@ -207,8 +205,8 @@ impl DepotState {
         for (i, record) in self.file_records.iter().enumerate() {
             self.depot_map.insert(record.depot_file_lower.clone(), i);
 
-            // Handle case-sensitivity collisions on Windows (e.g., Snow_Normal.uasset vs Snow_normal.uasset)
-            // If there's already an entry, prefer the non-deleted one with haveRev
+            // Windows 上的大小写冲突（如 Snow_Normal.uasset 与 Snow_normal.uasset）：
+            // 键已被占用时靠下面两条规则决胜，否则后插入的记录直接顶掉先来的。
             if let Some(&existing_idx) = self.client_map.get(&record.client_file_lower) {
                 let existing = &self.file_records[existing_idx];
                 let existing_is_deleted = matches!(
@@ -220,7 +218,7 @@ impl DepotState {
                     Some(FileAction::Delete | FileAction::MoveDelete)
                 );
 
-                // Prefer non-deleted over deleted, or the one with haveRev
+                // 在库的胜过已删除的；同为在库或同为删除时，有 haveRev 的胜出。
                 let should_replace = (!current_is_deleted && existing_is_deleted)
                     || (current_is_deleted == existing_is_deleted
                         && record.have_rev.is_some()
@@ -264,26 +262,26 @@ pub(crate) struct TargetRecord {
 /// 目标版本的全部记录，键是 `depot_file_lower`（与 [`DepotState`] 的 depot 索引同口径）。
 pub(crate) type TargetMap = HashMap<String, TargetRecord>;
 
-/// Information about a single file in the workspace.
+/// 工作区里单个文件的信息。
 #[derive(Debug)]
 pub(crate) struct WorkspaceFile {
-    /// Path in workspace syntax, such as C:\Workspace\File.ext on windows.
+    /// 工作区语法路径，保留原始大小写，如 Windows 上的 C:\Workspace\File.ext。
     pub(crate) path: String,
 
-    /// Path in workspace syntax, such as c:\workspace\file.ext on windows.
+    /// 工作区语法路径的小写形式，用作匹配键。
     pub(crate) path_lower: String,
 
-    /// The size of the file on disk.
+    /// 文件在磁盘上的大小。
     pub(crate) size: u64,
 
-    /// The modified time of the file on disk.
+    /// 文件在磁盘上的修改时间。
     pub(crate) date: SystemTime,
 
-    /// Whether this file has been eliminated by one of the ignore filters.
+    /// 该文件是否已被某个忽略规则排除。
     pub(crate) filtered: bool,
 }
 
-// Needed because SystemTime sucks
+// `SystemTime` 没有 `Default` 实现，手写一个：默认取 UNIX_EPOCH。
 impl Default for WorkspaceFile {
     fn default() -> Self {
         WorkspaceFile {
@@ -296,33 +294,32 @@ impl Default for WorkspaceFile {
     }
 }
 
-/// Information about the entire workspace.
+/// 整个工作区的信息。
 #[derive(Default, Debug)]
 pub(crate) struct WorkspaceState {
-    /// All files in the workspace.
+    /// 工作区里的全部文件。
     pub(crate) files: Vec<WorkspaceFile>,
 
-    /// Map used to index files by path_lower.
+    /// 按 `path_lower` 给 `files` 建索引。
     pub(crate) file_map: HashMap<String, usize>,
 
-    // The number of files not filtered.
+    /// 未被过滤的文件数。
     pub(crate) num_files: usize,
 }
 
-/// Used to store cached digest for a file.
 #[derive(Debug, Encode, Decode)]
 pub(crate) struct WorkspaceCacheEntry {
-    /// File size during last run.
+    /// 上一轮运行时的文件大小。
     pub(crate) size: u64,
 
-    /// Modified date during last run.
+    /// 上一轮运行时的修改时间。
     pub(crate) date: SystemTime,
 
-    /// Digest during last run.
+    /// 上一轮运行时算出的摘要。
     pub(crate) digest: [u8; 16],
 }
 
-// Needed because SystemTime sucks
+// `SystemTime` 没有 `Default` 实现，手写一个：默认取 UNIX_EPOCH。
 impl Default for WorkspaceCacheEntry {
     fn default() -> Self {
         WorkspaceCacheEntry {
@@ -333,13 +330,13 @@ impl Default for WorkspaceCacheEntry {
     }
 }
 
-/// Used to store cached digests for a workspace.
+/// 一个工作区的摘要缓存。
 #[derive(Default, Debug, Encode, Decode)]
 pub(crate) struct WorkspaceCache {
-    /// Map used to index files by path_lower.
+    /// 按 `path_lower` 给缓存条目建索引。
     pub(crate) file_map: HashMap<String, WorkspaceCacheEntry>,
 
-    /// Whether the cache is out of date.
+    /// 缓存是否已过期。
     pub(crate) out_of_date: bool,
 }
 

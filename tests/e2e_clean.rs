@@ -7,7 +7,6 @@ mod support;
 
 use predicates::prelude::*;
 
-/// depot 没有的文件：从磁盘删掉。
 #[test]
 fn an_untracked_file_is_deleted_from_disk() {
     let Some(sandbox) = support::sandbox_or_skip() else {
@@ -32,7 +31,6 @@ fn an_untracked_file_is_deleted_from_disk() {
     assert!(sandbox.opened().is_empty(), "clean never opens files");
 }
 
-/// 改过内容、但没有打开的文件：还原成 have 版本。
 #[test]
 fn a_modified_tracked_file_is_restored_to_have() {
     let Some(sandbox) = support::sandbox_or_skip() else {
@@ -53,7 +51,6 @@ fn a_modified_tracked_file_is_restored_to_have() {
     assert_eq!(sandbox.read("readme.txt"), "hello from the depot\n");
 }
 
-/// depot 有、本地没有的文件：从 depot 写回来。
 #[test]
 fn a_missing_tracked_file_is_restored_from_the_depot() {
     let Some(sandbox) = support::sandbox_or_skip() else {

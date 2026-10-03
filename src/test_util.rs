@@ -11,7 +11,7 @@ use crate::prune::P4IGNORE_FILE_NAME;
 
 pub(crate) const CHINESE_NAME_UTF8: &[u8] = b"\xe4\xbd\xbf\xe7\x94\xa8\xe8\xaf\xb4\xe6\x98\x8e.txt";
 
-/// Builds a marshal string: 's' + little-endian length + data.
+/// 构造一条 marshal 字符串：`'s'` + 小端长度 + 数据。
 pub(crate) fn marshal_string(value: &str) -> Vec<u8> {
     let mut out = vec![TYPE_STRING];
     out.extend_from_slice(&(value.len() as i32).to_le_bytes());
@@ -19,7 +19,7 @@ pub(crate) fn marshal_string(value: &str) -> Vec<u8> {
     out
 }
 
-/// Builds a marshal dict: '{' + key/value pairs + '0'.
+/// 构造一个 marshal 字典：`'{'` + 键值对 + `'0'`。
 pub(crate) fn marshal_dict(fields: &[(&str, &str)]) -> Vec<u8> {
     let mut out = vec![TYPE_DICT];
     for (key, value) in fields {

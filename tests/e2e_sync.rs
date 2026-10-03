@@ -89,7 +89,7 @@ fn sync_dry_run_changes_nothing() {
 }
 
 /// 已打开的文件不归 sync 管，`p4 sync -f` 的官方口径也是如此
-/// （"does not affect open files"）。
+/// （`This flag doesn't affect open files.`）。
 ///
 /// 与 clean 的同名用例一样，刻意做出两个最能说明问题的情形：打开后改了内容、
 /// 打开后删了本地文件——sync 都得原样留着。

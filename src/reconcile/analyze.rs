@@ -39,10 +39,10 @@ pub(crate) struct Analysis<'a> {
 
 /// 守卫报错的统一构造：说清触发了哪条规则，再附上判断依据的记录状态。
 ///
-/// `label` 是规则短名：`analyze` 用 `rule N`，编号沿用旧消息里的数字，测试按它把每条
-/// 分支的失败行为逐条钉住；`analyze_at_target` 用 `sync`。`missing` 是该规则需要、而
-/// 记录里没有的字段（形状本身未建模的规则传空）——旧消息只有路径和编号，日志里看不出
-/// 记录是什么形状、缺了什么。
+/// `label` 是规则短名：`analyze` 用 `rule N`，`analyze_at_target` 用 `sync`。编号把
+/// 测试里的用例与源码里的守卫一一对上，所以只加不改——3 号之后直接跳到 5 号，缺的 4 号
+/// 来自迁移前的实现，别顺手补上。`missing` 是该规则需要、而记录里没有的字段（形状本身
+/// 未建模的规则传空）——旧消息只有路径和编号，日志里看不出记录是什么形状、缺了什么。
 fn guard_error(
     label: &str,
     rule: &str,
@@ -83,37 +83,36 @@ pub(crate) fn analyze<'a>(
     verbose: bool,
 ) -> Result<Analysis<'a>> {
     //
-    // Known cases. Only files added here will actually be changed in the end.
-    // Every file must be added to either no or ONE of the below categories.
+    // 已知分类。只有收进这里的文件最终才会被真的改动。
+    // 每个文件要么不进任何一类，要么只进其中一类。
     //
 
     let mut changes = Changes::default();
 
     //
-    // Cases that need digest computation to decide whether we should add them above.
-    // We want to get as few as possible files here, but it's not always that nice.
+    // 需要算摘要才能决定归入上面哪一类的文件。这里越少越好，但总有绕不开的。
     //
 
-    // Files in workspace, maybe changed from have revision, but not checked out for edit.
+    // 工作区里存在，可能相对 have 版本有改动，但没有 open for edit。
     let mut check_edit = Vec::new();
 
-    // Files in workspace, maybe not changed from have revision, but checked out for edit.
+    // 工作区里存在，可能相对 have 版本没改动，但已 open for edit。
     let mut check_revert_edit = Vec::new();
 
-    // Files in workspace, maybe not changed from have revision, but checked out for delete.
+    // 工作区里存在，可能相对 have 版本没改动，但已 open for delete。
     let mut check_revert_delete_or_reopen_edit = Vec::new();
 
-    // Files in workspace, with file types we do not support calculating checksums for
+    // 工作区里类型不支持算摘要的文件。
     let mut unsupported_files = Vec::new();
 
-    // Depot files this client never synced that a local file happens to share a name with.
+    // depot 里有、但这个客户端从没同步过，本地只是重名的文件。
     let mut unsynced_files = Vec::new();
 
-    // Files whose head revision is archived; we have no way to check them.
+    // head 是归档版本的文件，无从检查。
     let mut archived_files = Vec::new();
 
     //
-    // Analysis phase one: Check depot records against workspace files.
+    // 阶段一：拿 depot 记录去查工作区里缺了什么。
     //
 
     use FileAction::*;
@@ -127,17 +126,17 @@ pub(crate) fn analyze<'a>(
         }
 
         match record.head_action {
-            // These are either irrelevant or will get caught in phase two, skip those.
+            // 这些要么无关紧要，要么阶段二会收走，跳过。
             Some(Delete | MoveDelete) => (),
             // 归档版本的内容已经移出 depot，没有摘要可比。跳过而不是中止整轮：
             // 一个归档文件不该让整个工作区没法 reconcile。
             Some(Archive) => archived_files.push(record.client_file.clone()),
-            // These exist in the depot, check if we still have them.
+            // 这些在 depot 里存在，查查本地是否还在。
             Some(Add | Edit | MoveAdd | Branch | Integrate | Import | Purge) => {
-                // The depot state may contain new files we haven't synced yet, skip those.
+                // depot 状态里可能有我们还没同步的新文件，跳过。
                 if record.have_rev.is_some() {
                     match record.action {
-                        // If we have them open for delete, but still have the file, revert that.
+                        // 已 open for delete 但本地文件还在：撤掉这个 delete。
                         Some(Delete | MoveDelete) => {
                             if let Some(file) = workspace.get_filtered(&record.client_file_lower) {
                                 if let (Some(file_type), Some(size)) =
@@ -176,16 +175,16 @@ pub(crate) fn analyze<'a>(
                                 }
                             }
                         }
-                        // If we have them open for edit in some way, but don't have the file, reopen as delete.
+                        // 以某种方式 open for edit，但本地文件没了：改成待删除。
                         Some(Edit | Integrate) => {
-                            // No filter, adding a new ignore rule should not cause edits to reopen as deletions.
+                            // 不用过滤版查询：新加一条忽略规则不该让 edit 翻成待删除。
                             if !workspace.has_file(&record.client_file_lower) {
                                 changes.reopen_delete.push(record.client_file.clone());
                             }
                         }
-                        // Otherwise, if we don't have the file, open as delete.
+                        // 其余情况：本地没了就开成待删除。
                         None => {
-                            // No filter, adding a new ignore rule should not cause deletions.
+                            // 不用过滤版查询：新加一条忽略规则不该造成删除。
                             if !workspace.has_file(&record.client_file_lower) {
                                 changes.delete.push(record.client_file.clone());
                             }
@@ -204,7 +203,7 @@ pub(crate) fn analyze<'a>(
                     }
                 }
             }
-            // These don't exist in the depot and can only be here because we opened them for add.
+            // depot 里没有这些文件，只可能是因为我们把它 open for add 了。
             None => match record.action {
                 Some(Add | MoveAdd | Branch) => {
                     // 本地既不存在、又是被忽略的文件时，这个 pending add 已经失去意义。
@@ -228,35 +227,35 @@ pub(crate) fn analyze<'a>(
     }
 
     //
-    // Analysis phase two: Check workspace files against depot records.
+    // 阶段二：反过来，拿工作区文件去查 depot 记录。
     //
 
     for file in workspace.files.iter().filter(|f| !f.filtered) {
-        // First check if the file is present in the depot state.
+        // 先看这个文件在 depot 状态里有没有。
         if let Some(record) = depot.get_client_record(&file.path_lower) {
             // phase one 已经把它收进 unsupported_files 了，这里跳过，免得重复汇报。
             if record.unsupported_type.is_some() {
                 continue;
             }
 
-            // Skip files we don't know how to calculate the checksum of
+            // 算不出摘要的类型，跳过。
             if let Some(FileType::Apple | FileType::Resource) = record.head_type {
                 unsupported_files.push(record);
                 continue;
             }
 
-            // Check what the depot states the file should be.
+            // 看 depot 说这个文件应该是什么状态。
             match record.head_action {
-                // We already took care of files we opened for add in phase one.
+                // open for add 的文件阶段一已经处理过了。
                 None => (),
                 // 归档版本没有可比的内容，phase one 已经汇报过了。
                 Some(Archive) => (),
-                // It's deleted at head, but we have the file.
+                // head 是删除版本，但本地有这个文件。
                 Some(Delete | MoveDelete) => {
                     match record.action {
-                        // We already have it marked for add, skip.
+                        // 已经标了待添加，跳过。
                         Some(Add | MoveAdd | Branch) => (),
-                        // We don't have it marked for add yet.
+                        // 还没标待添加。
                         None => {
                             changes.add.push(file.path.clone());
                         }
@@ -273,23 +272,22 @@ pub(crate) fn analyze<'a>(
                         ),
                     }
                 }
-                // It already exists in the depot, check if we need to do something.
+                // depot 里已经有了，看看要不要做点什么。
                 Some(Add | Edit | MoveAdd | Branch | Integrate | Import | Purge) => {
-                    // Phase one skips depot records the client never synced; phase two has to
-                    // do the same from the other direction. A local file that merely shares the
-                    // name is not a modification of the depot revision - `p4 edit` rejects it
-                    // with "file(s) not on client" - so leave it for the user to sync or
-                    // resolve, exactly as `p4 reconcile` does.
+                    // 阶段一跳过「客户端从没同步过」的 depot 记录，阶段二从另一头过来
+                    // 得做同样的判断。仅仅同名的本地文件不是 depot 修订的修改——`p4 edit`
+                    // 会用 `file(s) not on client` 拒绝它——所以留给用户去同步或处理，
+                    // 与 `p4 reconcile` 的做法一致。
                     if record.have_rev.is_none() {
                         unsynced_files.push(record.client_file.clone());
                         continue;
                     }
                     match record.action {
-                        // We should leave these alone as they can submit even with no changes made.
+                        // 这些不碰：即使没做任何改动它们也能提交。
                         Some(Integrate) => (),
-                        // We already took care of these in phase one.
+                        // 这些阶段一已经处理过了。
                         Some(Delete | MoveDelete) => (),
-                        // We have it open for edit, check if we reverted the change.
+                        // 已 open for edit，查查是不是把改动撤回去了。
                         Some(Edit) => {
                             if let (Some(file_type), Some(size)) =
                                 (record.head_type, record.file_size)
@@ -315,7 +313,7 @@ pub(crate) fn analyze<'a>(
                                 bail!("{error}");
                             }
                         }
-                        // We don't have it open, check if we should.
+                        // 没打开，查查该不该打开。
                         None => {
                             if let (Some(file_type), Some(size)) =
                                 (record.head_type, record.file_size)
@@ -356,7 +354,7 @@ pub(crate) fn analyze<'a>(
                 }
             }
         } else {
-            // The file is not in the depot at all and not ignored, mark for add.
+            // depot 里压根没有、也没被忽略：标为待添加。
             changes.add.push(file.path.clone());
         }
     }
@@ -468,8 +466,9 @@ pub(crate) fn analyze_at_target<'a>(
     let mut analysis = SyncAnalysis::default();
 
     for record in &depot.file_records {
-        // 已打开的文件一律不碰。`p4 sync -f` 的官方口径也是 "does not affect open files"，
-        // 而这里更彻底：既不动作也不汇报——打开的文件归用户，工具不参与。
+        // 已打开的文件一律不碰。`p4 sync -f` 的官方口径也是如此（`p4 help sync`：
+        // `This flag doesn't affect open files.`），而这里更彻底：既不动作也不汇报——
+        // 打开的文件归用户，工具不参与。
         if record.action.is_some() {
             continue;
         }
@@ -921,7 +920,7 @@ mod tests {
     }
 
     /// depot 里有、但这个客户端从没同步过：本地那个只是重名，不能当改动用。
-    /// `p4 edit` 对这类文件会直接报 "file(s) not on client"。
+    /// `p4 edit` 对这类文件会直接报 `file(s) not on client`。
     #[test]
     fn a_local_file_sharing_a_name_with_an_unsynced_depot_file_is_reported_not_edited() {
         let depot = depot_state(vec![DepotFileRecord {

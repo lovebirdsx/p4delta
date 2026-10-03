@@ -84,7 +84,6 @@ fn resolve_p4_exe(
     Err(not_found_message())
 }
 
-/// 在 `PATH` 的各个目录里找 `name`。
 fn find_in_path(path_var: &OsStr, name: &str) -> Option<PathBuf> {
     env::split_paths(path_var)
         .map(|dir| dir.join(name))
@@ -99,7 +98,6 @@ fn absolute(path: PathBuf) -> PathBuf {
     std::path::absolute(&path).unwrap_or(path)
 }
 
-/// 可执行文件在各平台上的名字。
 fn exe_name() -> &'static str {
     if cfg!(windows) { "p4.exe" } else { "p4" }
 }

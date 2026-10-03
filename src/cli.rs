@@ -6,23 +6,23 @@ use clap::Parser;
 // 版本号取自 Cargo.toml，不再手写副本，见 CONTRIBUTING.md 的发布检查清单。
 #[command(version)]
 pub struct Options {
-    /// The workspace to use. If not set, will try to use P4CLIENT. If that is also not set, will try the default one.
+    /// 要使用的 workspace（p4 client 名）。没设时读环境变量 P4CLIENT；两个都没有则报错退出。
     #[arg(short, long)]
     pub(crate) workspace: Option<String>,
 
-    /// The pending changelist to add to. If 0, will add to the default pending changelist.
+    /// 变更要加入的 pending changelist。为 0 时加入默认的那一个。
     #[arg(short, long, default_value = "0")]
     pub(crate) changelist: u32,
 
-    /// Whether we should list file names to stdout. Verbose implies this as well.
+    /// 是否把文件名清单打到 stdout。`--verbose` 也隐含打开它。
     #[arg(short, long)]
     pub(crate) list: bool,
 
-    /// Whether we should output verbose logs to stdout. You should redirect the output to a file if you use this.
+    /// 是否输出详细日志到 stdout。用这个开关时建议把输出重定向到文件。
     #[arg(short, long)]
     pub(crate) verbose: bool,
 
-    /// If not set, we still do all the work, but don't apply the changes to p4.
+    /// 不加这个开关时照样做完全部工作，只是不把变更应用到 p4。
     #[arg(short, long)]
     pub(crate) apply: bool,
 
@@ -36,7 +36,7 @@ pub struct Options {
     #[arg(long, conflicts_with = "clean")]
     pub(crate) sync: bool,
 
-    /// 同步的目标 changelist（仅 `--sync`）。缺省是 head。
+    /// 同步的目标 changelist（仅 `--sync`）。默认是 head。
     ///
     /// 不接受 0：`-c 0` 在本工具里是「默认 changelist」，照搬成 `--to 0` 太容易，而
     /// `@0` 在 p4 语法里是「第一个修订版之前」——目标时刻什么都不存在，`--sync` 会据此
@@ -50,16 +50,16 @@ pub struct Options {
     #[arg(long, requires = "sync")]
     pub(crate) verify_all: bool,
 
-    /// The folders to start from. A path that does not exist, or that is a file rather than a
-    /// folder, is reported and does not count as work; if no folder is usable the run fails.
+    /// 起始目录。不存在的路径、或指向文件而不是目录的路径会被报告且不算作工作；
+    /// 一个可用的目录都没有时整轮失败。
     pub(crate) paths: Vec<String>,
 
     /// 关闭忽略目录剪枝，回退到完整扫描（默认自动判断）。仅在结果异常时用来对比。
     #[arg(long)]
     pub(crate) no_prune_ignored_dirs: bool,
 
-    /// The charset p4 output is decoded with, see `p4 help charset` (for example utf8, cp936,
-    /// shiftjis). Defaults to P4CHARSET from the environment or from `p4 set`.
+    /// 解码 p4 输出所用的字符集，见 `p4 help charset`（例如 utf8、cp936、shiftjis）。
+    /// 默认取环境变量或 `p4 set` 里的 P4CHARSET。
     #[arg(long)]
     pub(crate) charset: Option<String>,
 }

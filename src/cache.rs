@@ -22,7 +22,7 @@ pub(crate) struct CacheWriter {
     entries_at_last_save: usize,
 }
 
-/// Saving after every batch would thrash the disk, so a save happens when either of these trips.
+/// 每批都存会让磁盘反复读写、得不偿失，所以这两个阈值任一触发才存一次。
 pub(crate) const CACHE_SAVE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const CACHE_SAVE_MIN_NEW_ENTRIES: usize = 100_000;
 
@@ -109,7 +109,7 @@ impl CacheWriter {
     pub(crate) fn new(path: PathBuf) -> Self {
         CacheWriter {
             path,
-            // Backdate so the first call is allowed to save immediately.
+            // 把时间回拨，好让第一次调用就能立即保存。
             last_save: Instant::now() - CACHE_SAVE_MIN_INTERVAL,
             entries_at_last_save: 0,
         }
@@ -179,7 +179,7 @@ impl CacheWriter {
     }
 }
 
-/// Saves the cache when a cache location could be determined.
+/// 能确定缓存位置时保存缓存。
 pub(crate) fn save_cache(
     cache_writer: &mut Option<CacheWriter>,
     cache: &mut WorkspaceCache,
@@ -310,14 +310,13 @@ mod tests {
         let mut writer = CacheWriter::new(path.clone());
 
         writer.maybe_save(&mut cache, true).unwrap();
-        // Delete the file: anything the second call writes has to recreate it.
+        // 把文件删掉：第二次调用若真写了什么，就必须把它重建出来。
         std::fs::remove_file(&path).unwrap();
         // 又脏了，但条目数与时钟都没动过：两个阈值都没触发，这次调用该被挡回去。
         cache.out_of_date = true;
         writer.maybe_save(&mut cache, false).unwrap();
 
-        // Neither the entry count nor the clock has moved past its threshold, so there was
-        // nothing worth paying a disk write for.
+        // 条目数与时钟都没越过各自的阈值，不值得为它付一次磁盘写。
         assert!(!path.exists());
     }
 
@@ -347,8 +346,8 @@ mod tests {
     fn cache_writer_skips_an_up_to_date_cache() {
         let (_tree, path) = temp_cache_path();
 
-        // A cache loaded from disk and never added to. Saving it would rewrite the same bytes,
-        // and a run that computed nothing must not look like a run that did.
+        // 从磁盘加载、之后一条都没加过的缓存。存它只会把同样的字节重写一遍，
+        // 而「什么都没算」的运行不能看起来像算过。
         CacheWriter::new(path.clone())
             .maybe_save(&mut cache_with(4, false), true)
             .unwrap();

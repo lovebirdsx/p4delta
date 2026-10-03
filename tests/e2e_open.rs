@@ -50,7 +50,6 @@ fn an_edited_file_is_reported_and_applied_as_edit() {
     assert!(opened[0].contains(" - edit "), "{opened:?}");
 }
 
-/// 工作区里多出一个 depot 没有的文件。
 #[test]
 fn a_new_file_is_reported_and_applied_as_add() {
     let Some(sandbox) = support::sandbox_or_skip() else {
@@ -97,7 +96,6 @@ fn a_deleted_file_is_reported_and_applied_as_delete() {
     assert!(opened[0].contains(" - delete "), "{opened:?}");
 }
 
-/// 打开了但内容没动：这属于「多余的打开」，reconcile 要把它撤掉。
 #[test]
 fn an_unmodified_opened_file_is_reverted() {
     let Some(sandbox) = support::sandbox_or_skip() else {
@@ -123,7 +121,6 @@ fn an_unmodified_opened_file_is_reverted() {
     assert!(sandbox.exists("readme.txt"), "revert -k must keep the file");
 }
 
-/// 已 checkout 待删除，本地却又改了内容——该改成待编辑，而不是删掉改动。
 #[test]
 fn a_changed_file_opened_for_delete_is_reopened_as_edit() {
     let Some(sandbox) = support::sandbox_or_skip() else {
@@ -151,7 +148,6 @@ fn a_changed_file_opened_for_delete_is_reopened_as_edit() {
     );
 }
 
-/// 已 checkout 待编辑，本地却把文件删了——该改成待删除。
 #[test]
 fn a_deleted_file_opened_for_edit_is_reopened_as_delete() {
     let Some(sandbox) = support::sandbox_or_skip() else {
@@ -174,7 +170,6 @@ fn a_deleted_file_opened_for_edit_is_reopened_as_delete() {
     assert!(opened[0].contains(" - delete "), "{opened:?}");
 }
 
-/// 加进 depot 的文件又被本地删了：这个 add 已经没有意义，撤掉。
 #[test]
 fn a_missing_file_opened_for_add_is_reverted() {
     let Some(sandbox) = support::sandbox_or_skip() else {
@@ -200,7 +195,6 @@ fn a_missing_file_opened_for_add_is_reverted() {
     );
 }
 
-/// 标了待删除，本地文件其实没动：这个 delete 同样没有意义。
 #[test]
 fn a_restored_file_opened_for_delete_is_reverted() {
     let Some(sandbox) = support::sandbox_or_skip() else {

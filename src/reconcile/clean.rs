@@ -155,7 +155,6 @@ impl CleanChanges {
         ])
     }
 
-    /// 待清理的文件总数。
     pub(crate) fn total(&self) -> usize {
         self.delete.len() + self.revert.len() + self.restore.len()
     }
@@ -203,7 +202,7 @@ fn restore_specs(files: &[RestoreFile]) -> Vec<String> {
 async fn restore_to_have(options: &Options, work_dir: &str, files: &[RestoreFile]) -> Result<()> {
     let specs = restore_specs(files);
 
-    // 不带 changelist：clean 不产生 changelist，`p4 sync` 也没有意义。
+    // 不带 changelist：`p4 sync -f` 不开文件、不产生 changelist，`-c` 也就没有意义。
     // 只在 -a 时被调用，所以永远是「真改状态」：sync 失败必须让整轮失败，
     // 否则工作区会停在一个既没还原干净、也没人知道的状态上。
     // 判据同 [`crate::reconcile::changes::apply_changes`]：p4 的逐文件错误不改退出码。

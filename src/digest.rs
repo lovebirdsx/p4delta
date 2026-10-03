@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use crate::READ_BUFFER_SIZE;
 use crate::model::{DigestType, HaveRecord, WorkspaceCache, WorkspaceCacheEntry, WorkspaceFile};
 
-/// Computes the digest for a binary file, simple MD5.
+/// 算二进制文件的摘要：直接对内容做 MD5。
 pub(crate) fn compute_digest_binary(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
     let mut file = File::open(&file.path)?;
     let mut buffer = [0; READ_BUFFER_SIZE];
@@ -28,7 +28,10 @@ pub(crate) fn compute_digest_binary(file: &WorkspaceFile, hasher: &mut Md5) -> R
     }
 }
 
-/// Computes the digest for a text buffer, normalized line endings MD5.
+/// 按行更新文本摘要：每行先归一化换行，再喂给 hasher。
+///
+/// 名字里的 utf8 是历史遗留——这个辅助函数不做任何解码，`compute_digest_text` 与
+/// `compute_digest_utf8` 都调它；需要解码的是后者，它把解码器接在调用方那一侧。
 pub(crate) fn update_text_digest_utf8<R: BufRead + Read>(
     input: &mut R,
     line_buffer: &mut Vec<u8>,
@@ -39,7 +42,7 @@ pub(crate) fn update_text_digest_utf8<R: BufRead + Read>(
             Ok(0) => return Ok(()),
             Ok(_n) => {
                 if line_buffer.ends_with(b"\r\n") {
-                    // Remove only the \r, keeping the \n (Perforce normalizes CRLF -> LF)
+                    // 只删 `\r`、保留 `\n`（Perforce 把 CRLF 归一化成 LF）。
                     line_buffer.remove(line_buffer.len() - 2);
                 }
                 md5::digest::Update::update(hasher, line_buffer);
@@ -50,7 +53,7 @@ pub(crate) fn update_text_digest_utf8<R: BufRead + Read>(
     }
 }
 
-/// Computes the digest for a text file, normalized line endings MD5.
+/// 算文本文件的摘要：按行归一化换行后再 MD5。
 pub(crate) fn compute_digest_text(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
     let file = File::open(&file.path)?;
     let mut read = BufReader::with_capacity(READ_BUFFER_SIZE, file);
@@ -59,7 +62,7 @@ pub(crate) fn compute_digest_text(file: &WorkspaceFile, hasher: &mut Md5) -> Res
     update_text_digest_utf8(&mut read, &mut line_buffer, hasher)
 }
 
-/// Computes the digest for a utf8 file, normalized line endings MD5 without BOM.
+/// 算 utf8 文件的摘要：解码、剥 BOM、按行归一化换行后再 MD5。
 ///
 /// 解码配置与整份读入时逐条相同（`utf8_passthru(false)`、BOM 嗅探、剥 BOM），改动只在
 /// 「不再把整个文件读进内存」：解码器流式接进 `BufReader`，未完成的多字节序列由解码器
@@ -80,15 +83,15 @@ pub(crate) fn compute_digest_utf8(file: &WorkspaceFile, hasher: &mut Md5) -> Res
     update_text_digest_utf8(&mut read, &mut line_buffer, hasher)
 }
 
-/// Computes the digest for a symlink.
+/// 算符号链接的摘要。
 ///
-/// Perforce stores a symlink revision as its target path, written with forward slashes and a
-/// trailing newline, so that one revision can be synced on both unix and Windows. Verified
-/// against a live depot: `libjsig.so` symlinked to `../libjsig.so` has size 14 and digest
-/// `md5("../libjsig.so\n")` (the Windows client reports the target as `..\libjsig.so`).
+/// Perforce 把符号链接的修订存成它的目标路径，用正斜杠书写、带一个结尾换行，
+/// 好让同一份修订在 unix 与 Windows 上都能同步。对着真实 depot 校验过：`libjsig.so`
+/// 链到 `../libjsig.so`，size 14，摘要是 `md5("../libjsig.so\n")`——Windows 客户端把
+/// 目标报告成 `..\libjsig.so`，但摘要按正斜杠算。
 ///
-/// A workspace synced without symlink support holds the target as a plain text file instead;
-/// that form is read as text, which is what this used to do for every symlink.
+/// 在不支持符号链接的平台上同步出来的工作区，会把目标存成一个普通文本文件；
+/// 那种形态按文本读——这也是本函数从前对所有符号链接的做法。
 pub(crate) fn compute_digest_symlink(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
     let metadata = std::fs::symlink_metadata(&file.path)?;
 
@@ -96,8 +99,8 @@ pub(crate) fn compute_digest_symlink(file: &WorkspaceFile, hasher: &mut Md5) -> 
         return compute_digest_utf8(file, hasher);
     }
 
-    // `read_link` reads the link itself, so a dangling symlink still hashes correctly - and
-    // reading it as a file would have failed or hashed whatever it points at.
+    // `read_link` 读的是链接本身，所以悬空链接也能算出正确的摘要——若当普通文件读，
+    // 要么失败，要么哈希成它所指向的那个文件。
     let target = std::fs::read_link(&file.path)?;
     let mut content = target.to_string_lossy().replace('\\', "/");
     content.push('\n');
@@ -106,7 +109,7 @@ pub(crate) fn compute_digest_symlink(file: &WorkspaceFile, hasher: &mut Md5) -> 
     Ok(())
 }
 
-/// Check if a file is unchanged since last sync
+/// 判断文件自上次同步以来是否没被改过。
 pub(crate) fn is_unchanged_since_sync(
     file: &WorkspaceFile,
     have_records: &HashMap<String, HaveRecord>,
@@ -114,7 +117,7 @@ pub(crate) fn is_unchanged_since_sync(
     if let Some(have_rec) = have_records.get(&file.path_lower)
         && let Some(sync_time) = have_rec.sync_time
     {
-        // Truncate to second precision (Perforce uses seconds, SystemTime has nanos)
+        // 截到秒：Perforce 用秒，SystemTime 带纳秒。
         let file_time_secs = match file.date.duration_since(UNIX_EPOCH) {
             Ok(duration) => duration.as_secs(),
             Err(_) => return false,
@@ -145,7 +148,7 @@ pub(crate) struct DigestOutcome<'a> {
     pub(crate) from_cache: bool,
 }
 
-/// Computes digests for a number of files in the workspace.
+/// 为工作区里的多个文件算摘要。
 ///
 /// 返回的结果与传入的 `files` 按位对应（rayon 收进 Vec 保序）。
 /// `policy` 为 [`CachePolicy::Ignore`] 时跳过缓存查找、逐个重算；重算的结果照常写回缓存，
@@ -159,7 +162,6 @@ pub(crate) fn parallel_compute_digests<'a>(
         .into_par_iter()
         .with_max_len(1)
         .map(|(file, digest_type)| -> Result<DigestOutcome<'a>> {
-            // Check cache first
             if policy == CachePolicy::Use
                 && let Some(cache_entry) = cache.file_map.get(&file.path_lower)
                 && cache_entry.size == file.size
@@ -176,7 +178,7 @@ pub(crate) fn parallel_compute_digests<'a>(
             let mut digest: [u8; 16] = Default::default();
 
             let file_data = std::fs::symlink_metadata(&file.path)?;
-            // Perforce tracks symlinks as revisions of their own, so they are files here too.
+            // Perforce 把符号链接当作独立修订跟踪，所以这里它们也算文件。
             if !file_data.is_file() && !file_data.file_type().is_symlink() {
                 bail!(
                     "Unsupported local file type for calculating digest ({:?})",
@@ -202,7 +204,6 @@ pub(crate) fn parallel_compute_digests<'a>(
 
     let results = results?;
 
-    // Update cache
     for result in &results {
         if !result.from_cache {
             cache.file_map.insert(

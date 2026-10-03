@@ -1,6 +1,6 @@
 //! reconcile 找出的变更分类，以及它们的报告与应用。
 //!
-//! 八类变更在"打印标题、列清单、下发 p4 命令"上只有细节差异，
+//! 八类变更在「打印标题、列清单、下发 p4 命令」上只有细节差异，
 //! 集中成一张 [GROUPS] 表，避免同一套控制流重复八遍。
 
 use std::time::Instant;
@@ -14,28 +14,28 @@ use crate::p4::process::{FailureMode, run_p4_command_batched};
 /// 每个文件最多只落在其中一类里。
 #[derive(Default)]
 pub(crate) struct Changes {
-    /// Files in workspace, not in depot or deleted at have revision, but not checked out for add.
+    /// 工作区里有，但 depot 里没有或 have 版本已删除，且没有 open for add。
     pub(crate) add: Vec<String>,
 
-    /// Files in workspace, changed from have revision, but not checked out for edit.
+    /// 工作区里有，相对 have 版本有改动，但没有 open for edit。
     pub(crate) edit: Vec<String>,
 
-    /// Files in workspace, changed from have revision, but checked out for delete.
+    /// 工作区里有，相对 have 版本有改动，但已 open for delete（先 revert 再 edit）。
     pub(crate) reopen_edit: Vec<String>,
 
-    /// Files not in workspace, but not checked out for delete.
+    /// 工作区里没有，且没有 open for delete。
     pub(crate) delete: Vec<String>,
 
-    /// Files not in workspace, but checked out for edit.
+    /// 工作区里没有，但已 open for edit（先 revert 再 delete）。
     pub(crate) reopen_delete: Vec<String>,
 
-    /// Files not in workspace, but checked out for add.
+    /// 工作区里没有，但已 open for add。
     pub(crate) revert_add: Vec<String>,
 
-    /// Files in workspace, not changed from have revision, but checked out for edit.
+    /// 工作区里有，相对 have 版本没改动，但已 open for edit。
     pub(crate) revert_edit: Vec<String>,
 
-    /// Files in workspace, not changed from have revision, but checked out for delete.
+    /// 工作区里有，相对 have 版本没改动，但已 open for delete。
     pub(crate) revert_delete: Vec<String>,
 }
 
@@ -51,51 +51,44 @@ struct GroupSpec {
     commands: &'static [(&'static [&'static str], bool)],
 }
 
-/// 八类变更的处理方式。顺序即输出顺序，必须与 [Changes::groups] 一一对应。
+/// 八类变更的处理方式。顺序即输出顺序，必须与 [Changes::groups] 一一对应；
+/// 每一类是什么意思，见 [Changes] 对应字段的文档。
 const GROUPS: [GroupSpec; 8] = [
-    // Files in workspace, not in depot or deleted at have revision, but not checked out for add.
     GroupSpec {
         label: "Add",
         title: "      Adding {} files in workspace, not in depot or deleted at have revision, but not checked out for add.",
         commands: &[(&["add"], true)],
     },
-    // Files in workspace, changed from have revision, but not checked out for edit.
     GroupSpec {
         label: "Edit",
         title: "      Editing {} files in workspace, changed from have revision, but not checked out for edit.",
         commands: &[(&["edit"], true)],
     },
-    // Files in workspace, changed from have revision, but checked out for delete.
     GroupSpec {
         label: "Reopen Edit",
         title: "      Revert+Editing {} files in workspace, changed from have revision, but checked out for delete.",
         commands: &[(&["revert", "-k"], false), (&["edit"], true)],
     },
-    // Files not in workspace, but not checked out for delete.
     GroupSpec {
         label: "Delete",
         title: "      Deleting {} files not in workspace, but not checked out for delete.",
         commands: &[(&["delete", "-k"], true)],
     },
-    // Files not in workspace, but checked out for edit.
     GroupSpec {
         label: "Reopen Delete",
         title: "      Revert+Deleting {} files not in workspace, but checked out for edit.",
         commands: &[(&["revert", "-k"], false), (&["delete", "-k"], true)],
     },
-    // Files not in workspace, but checked out for add.
     GroupSpec {
         label: "Revert Add",
         title: "      Reverting {} files not in workspace, but checked out for add.",
         commands: &[(&["revert", "-k"], false)],
     },
-    // Files in workspace, not changed from have revision, but checked out for edit.
     GroupSpec {
         label: "Revert Edit",
         title: "      Reverting {} files in workspace, not changed from have revision, but checked out for edit.",
         commands: &[(&["revert", "-k"], false)],
     },
-    // Files in workspace, not changed from have revision, but checked out for delete.
     GroupSpec {
         label: "Revert Delete",
         title: "      Reverting {} files in workspace, not changed from have revision, but checked out for delete.",
@@ -104,13 +97,11 @@ const GROUPS: [GroupSpec; 8] = [
 ];
 
 impl GroupSpec {
-    /// 渲染标题，把 `{}` 换成文件数量。
     fn title_with(&self, count: usize) -> String {
         render_title(self.title, count)
     }
 }
 
-/// 渲染标题模板，把 `{}` 换成文件数量。
 pub(crate) fn render_title(template: &str, count: usize) -> String {
     template.replace("{}", &count.to_string())
 }
@@ -135,7 +126,6 @@ pub(crate) fn report_group<'a>(
 }
 
 impl Changes {
-    /// 待处理的变更总数。
     pub(crate) fn total(&self) -> usize {
         self.add.len()
             + self.edit.len()

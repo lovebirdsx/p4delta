@@ -31,7 +31,8 @@ use crate::p4::process::{FailureMode, run_p4_command_batched, run_p4_have};
 use crate::prune::PrunePlan;
 use crate::workspace::{filter_unmapped_paths, gather_workspace, rescan_tracked_pruned_dirs};
 
-/// Performs reconcile for a single directory. Ties everything else together.
+/// 单个目录的 reconcile 编排：拉齐 fstat / 工作区 / have 三路数据，分析、算摘要，
+/// 最后把变更下发给 p4。
 pub(crate) async fn reconcile_dir(
     options: &Options,
     work_dir: &str,
@@ -192,16 +193,13 @@ pub(crate) async fn reconcile_dir(
         println!("{summary}");
     }
 
-    // Phase 2: Compute digests for files that need checking
-
-    // Compute digests to see if we need to open files for edit.
+    // 算摘要，看是否需要 open for edit。
     if !edit.needs_digest.is_empty() {
         println!("   Checking digests for {} files.", edit.needs_digest.len());
 
         let mut hashed = HashStats::new();
         let results = parallel_compute_digests(edit.needs_digest, cache, CachePolicy::Use)?;
-        // Persist as we go: this phase dominates the runtime, and a later failure must not
-        // discard everything it produced.
+        // 边算边存：这个阶段占了绝大部分运行时间，后面某步失败不该把它的成果整个丢掉。
         save_cache(cache_writer, cache, false)?;
         for outcome in results {
             hashed.record(outcome.from_cache, outcome.file.size);
@@ -218,8 +216,7 @@ pub(crate) async fn reconcile_dir(
         hashed.report();
     }
 
-    // Compute digests to see if we need to revert files open for edit.
-    // First add the files we already know are unchanged
+    // 未改动的那批直接 revert，其余算摘要定夺。
     for (file, _) in revert_edit.unchanged {
         changes.revert_edit.push(file.path.clone());
         if options.verbose {
@@ -254,8 +251,7 @@ pub(crate) async fn reconcile_dir(
         hashed.report();
     }
 
-    // Compute digests to see if we need to revert deletes or reopen files for edit.
-    // First add the files we already know are unchanged (revert delete)
+    // 未改动的那批直接 revert delete，其余算摘要定夺。
     for (file, _) in revert_delete.unchanged {
         changes.revert_delete.push(file.path.clone());
         if options.verbose {

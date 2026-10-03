@@ -38,8 +38,10 @@ use crate::p4::process::{FailureMode, run_p4_command_slice};
 use crate::path::{absolute_local_path, normalize_local_path_owned, strip_depot_wildcard_suffix};
 use crate::reconcile::reconcile_dir;
 
-// Seemingly optimal buffer size for reading large data on a PCIe 4.0 SSD.
-// Need non-blocking queued IO for small files, but is not available in rust.
+/// 读写文件的缓冲区大小：缓存读写、摘要计算、p4 输出流三处共用。
+///
+/// 128 KiB 是经验值——原注释说它「在 PCIe 4.0 SSD 上实测最优」，那个结论只在一块盘上量过，
+/// 没有可复现的基准，别把它当调优结论看。
 pub(crate) const READ_BUFFER_SIZE: usize = 128 * 1024;
 
 /// 按给定的参数跑一次 reconcile。
@@ -52,8 +54,8 @@ pub fn run(mut options: Options) -> Result<()> {
     // 「这台机器没有 p4」由各个调用点的 strict / lenient 策略分别处理。
     check_p4_exe_env()?;
 
-    // Resolve the charset p4 writes its output in before anything reads that output.
-    // Probing from inside the workspace lets a P4CHARSET defined in its .p4config take effect.
+    // 在任何人读 p4 输出之前，先把它的输出字符集定下来。从工作区目录里探测，
+    // 是为了让 `.p4config` 里定义的 P4CHARSET 生效。
     let probe_dir = match options.paths.first().map(PathBuf::from) {
         Some(path) if path.is_dir() => path,
         Some(path) => path.parent().map(Path::to_path_buf).unwrap_or(path),
@@ -61,7 +63,6 @@ pub fn run(mut options: Options) -> Result<()> {
     };
     init_p4_encoding(options.charset.as_deref(), &probe_dir);
 
-    // Workspace input
     if options.workspace.is_none() {
         println!("No workspace passed, trying P4CLIENT.");
         options.workspace = env::var("P4CLIENT").ok();
@@ -96,7 +97,6 @@ pub fn run(mut options: Options) -> Result<()> {
         }
     }
 
-    // Changelist input
     match options.changelist {
         0 => println!("Using default pending changelist."),
         // clean 不打开任何文件，也就没有 changelist 可进；`p4 clean` 本身也不接受 -c。
@@ -112,7 +112,6 @@ pub fn run(mut options: Options) -> Result<()> {
         n => println!("Using pending changelist {}.", n),
     }
 
-    // Verbose input
     if options.verbose {
         options.list = true;
     }
@@ -125,13 +124,11 @@ pub fn run(mut options: Options) -> Result<()> {
             .join("digests_".to_owned() + workspace_name + ".bin")
     });
 
-    // Load digest cache
     if let Some(cache_path) = &cache_path
         && cache_path.exists()
     {
         println!("Loading cache from {}.", cache_path.display());
-        // Stream the cache in: it reaches hundreds of MB on a large workspace, and reading
-        // it whole would double the memory needed to load it.
+        // 流式加载：大工作区的缓存有几百 MB，整份读进内存会让加载峰值翻倍。
         match (|| -> Result<WorkspaceCache> {
             let config = bincode::config::standard();
             let mut cache_file =
@@ -149,7 +146,6 @@ pub fn run(mut options: Options) -> Result<()> {
                     "Warning: Failed to load cache ({}), will rebuild from scratch",
                     e
                 );
-                // Cache remains empty, will be rebuilt
             }
         }
     }
@@ -165,7 +161,7 @@ pub fn run(mut options: Options) -> Result<()> {
     for original_path in &options.paths {
         let mut path: String = original_path.to_owned();
 
-        // Convert depot paths to workspace paths
+        // depot 路径转工作区路径。
         if original_path.starts_with("//") {
             let args = ["-Mj", "-Ztag", "where"];
             let paths = [original_path.to_owned()];
@@ -201,7 +197,6 @@ pub fn run(mut options: Options) -> Result<()> {
         // 统一本地路径：P4V 等工具会传来正斜杠，本地键必须与 p4 返回的 clientFile 一致。
         path = normalize_local_path_owned(path);
 
-        // Correct the path since P4V tends to give us a bad one
         path = strip_depot_wildcard_suffix(&path).to_owned();
 
         // 相对路径转绝对：扫描结果的路径前缀必须与 p4 返回的 clientFile 相同。
@@ -210,7 +205,6 @@ pub fn run(mut options: Options) -> Result<()> {
         if let Some(first_letter) = path.get_mut(0..1) {
             first_letter.make_ascii_uppercase();
         }
-        // Use the path
         let check_path = PathBuf::from(&path);
         if check_path.exists() {
             if check_path.is_dir() {
@@ -249,10 +243,8 @@ pub fn run(mut options: Options) -> Result<()> {
         }
     }
 
-    // Save digest cache
     save_cache(&mut cache_writer, &mut cache, true)?;
 
-    // We are done!
     println!(
         "Operation completed in {} seconds.",
         start_time.elapsed().as_secs_f32()

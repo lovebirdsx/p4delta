@@ -19,16 +19,15 @@ use crate::p4::process::{
 };
 use crate::path::{local_path_key, normalize_local_path_owned};
 
-/// Streaming parser for `p4 fstat` text output.
+/// `p4 fstat` 文本输出的流式解析器。
 ///
-/// Consumes raw, undecoded lines so that only the values of the few fields we keep are ever
-/// decoded or allocated. This replaces buffering the whole response - tens of millions of
-/// lines on a large workspace - as a `Vec<String>`.
+/// 消费未解码的原始行：只有我们要留下的那几个字段的值会被解码或分配。它取代的是把整个
+/// 响应（大工作区上几千万行）缓冲成 `Vec<String>` 的旧做法。
 pub(crate) struct FstatParser {
     encoding: &'static Encoding,
     records: Vec<DepotFileRecord>,
     pending: DepotFileRecord,
-    /// Whether `pending` has seen a field, so a trailing blank line cannot emit an empty record.
+    /// `pending` 是否已经见过字段：这样末尾的空行不会提交出一条空记录。
     started: bool,
 }
 
@@ -43,21 +42,21 @@ impl FstatParser {
     }
 
     fn push_line(&mut self, line: &[u8]) -> Result<()> {
-        // Records are separated by a blank line. The previous parser keyed off `len > 3`, so
-        // short lines ended a record too; keep that so malformed output parses the same way.
+        // 记录之间用空行分隔。旧解析器以 `len > 3` 为准，短行同样结束一条记录；
+        // 这里保持一致，好让畸形输出解析出相同的结果。
         if line.len() <= 3 {
             self.commit();
             return Ok(());
         }
 
-        // Lines look like "... key value". Keys are always ASCII.
+        // 行的形状是 "... key value"。键一律是 ASCII。
         let body = line.strip_prefix(b"... ").unwrap_or(line);
         let (key, value) = match body.iter().position(|byte| *byte == b' ') {
             Some(index) => (&body[..index], &body[index + 1..]),
             None => (body, &b""[..]),
         };
 
-        // Only the path fields can hold non-ASCII, so only they need charset decoding.
+        // 只有路径字段可能含非 ASCII，所以只有它们需要按字符集解码。
         match key {
             b"depotFile" => {
                 let value = decode_p4_bytes(value, self.encoding).0.into_owned();
@@ -86,8 +85,8 @@ impl FstatParser {
                 self.pending.digest = Some(<[u8; 16]>::from_hex(std::str::from_utf8(value)?)?)
             }
             b"fileSize" => self.pending.file_size = Some(std::str::from_utf8(value)?.parse()?),
-            // Unknown keys, including error lines, are ignored as before - and must not mark
-            // the record as started, or the following blank line would emit an empty record.
+            // 认不出的键（含错误行）照旧忽略——且不能把它算作「记录已开始」，
+            // 否则紧随其后的空行会提交出一条空记录。
             _ => return Ok(()),
         }
 
@@ -102,17 +101,15 @@ impl FstatParser {
         }
     }
 
-    /// Flushes a trailing record that was not followed by a blank line. Dropping it made the
-    /// last file of a response look like it was not in the depot at all, which reported a
-    /// spurious "add" for a file that already existed.
+    /// 补交末尾那条没有空行收尾的记录。丢掉它会让响应里的最后一个文件看起来根本不在
+    /// depot 里，从而给一个已存在的文件报出假的新增。
     fn finish(mut self) -> Vec<DepotFileRecord> {
         self.commit();
         self.records
     }
 }
 
-/// Runs one fstat batch, parsing records as they stream in.
-/// `strict` 为真时非零退出直接失败，而不是只告警。
+/// 跑一批 fstat，边收边解析。`strict` 为真时非零退出直接失败，而不是只告警。
 pub(crate) async fn run_p4_fstat_slice(
     options: &Options,
     work_dir: &str,
@@ -202,7 +199,7 @@ pub(crate) async fn run_p4_fstat_slice(
     Ok(records)
 }
 
-/// Runs `p4 fstat` over batched arguments with bounded concurrency, returning parsed records.
+/// 分批跑 `p4 fstat`（并发有上限），返回解析好的记录。
 pub(crate) async fn run_p4_fstat_batched(
     options: &Options,
     work_dir: &str,
@@ -245,7 +242,7 @@ pub(crate) async fn run_p4_fstat_batched(
     }
 }
 
-/// Parses a complete set of fstat lines. Kept as a single entry point for tests.
+/// 解析一整组 fstat 行。留作测试的单一入口。
 #[cfg(test)]
 pub(crate) fn parse_p4_fstat_lines<'a>(
     lines: impl IntoIterator<Item = &'a [u8]>,
@@ -265,8 +262,8 @@ pub(crate) const FSTAT_FIELDS: &str =
 /// 初次查询：一次拿到整个工作区的 depot 状态。
 pub(crate) const FSTAT_ARGS: [&str; 5] = [
     "fstat",
-    "-Rc", // Only files mapped into current workspace
-    "-Ol", // Include file size and digest for files in depot
+    "-Rc", // 只取映射进当前工作区的文件
+    "-Ol", // 附上 depot 里文件的大小与摘要
     "-T",
     FSTAT_FIELDS,
 ];
@@ -411,13 +408,11 @@ pub(crate) async fn run_p4_fstat_all(
     println!("   Requesting depot state for all files.");
     let start_time = Instant::now();
 
-    // First get latest depot state for everything in one slice
     let initial_args = [String::from("./...")];
     let mut depot_state: DepotState = Default::default();
     depot_state.file_records =
         run_p4_fstat_batched(options, work_dir, &FSTAT_ARGS, &initial_args, false).await?;
 
-    // Build hashmaps to find records
     depot_state.build_mapping();
 
     // 趁 `head_action` 还是初次查询的原值先取走目标版本的事实：下面的补查会把它连同
@@ -426,7 +421,7 @@ pub(crate) async fn run_p4_fstat_all(
     let target =
         (options.sync && options.to.is_none()).then(|| snapshot_target(&depot_state.file_records));
 
-    // Find records with out of date revisions
+    // 找出本地版本落后的记录。
     let mut old_records = Vec::new();
     for record in &depot_state.file_records {
         let (Some(head_rev), Some(have_rev)) = (record.head_rev, record.have_rev) else {
@@ -452,7 +447,7 @@ pub(crate) async fn run_p4_fstat_all(
         start_time.elapsed().as_secs_f32()
     );
 
-    // Request new records for them and update the digests
+    // 为这些落后的文件补查记录，把摘要换成本地那一版的。
     if !old_records.is_empty() {
         println!(
             "   Requesting depot state for {} outdated files.",
@@ -524,9 +519,8 @@ mod tests {
 
     #[test]
     fn parses_fstat_records_with_a_trailing_record_lacking_a_blank_line() {
-        // The last record has no trailing blank line. The previous parser only committed on a
-        // blank line, so it silently dropped that record - which reported a spurious "add"
-        // for a file that already existed in the depot.
+        // 最后一条记录后面没有空行。旧解析器只在空行处提交，于是静默丢掉了那条记录——
+        // 结果就是给一个 depot 里已经存在的文件报出假的新增。
         let lines: Vec<&[u8]> = vec![
             b"... depotFile //depot/a.txt",
             b"... clientFile E:\\ws\\a.txt",
@@ -546,7 +540,7 @@ mod tests {
         assert_eq!(records[0].head_rev, Some(3));
         assert_eq!(records[0].have_rev, Some(3));
         assert_eq!(records[0].file_size, Some(1234));
-        // Non-ASCII paths survive decoding, and the lookup keys stay ASCII-folded.
+        // 非 ASCII 路径解码后原样保留，查询键照旧折成小写。
         assert_eq!(records[1].client_file, "E:\\ws\\中文.txt");
         assert_eq!(records[1].client_file_lower, "e:\\ws\\中文.txt");
     }
@@ -627,7 +621,7 @@ mod tests {
 
         let records = parse_p4_fstat_lines(lines, UTF_8).unwrap();
 
-        // The old parser pushed a record for every blank line, empty ones included.
+        // 旧解析器每遇到一个空行就推一条记录，空记录也算。
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].depot_file, "//depot/a.txt");
     }

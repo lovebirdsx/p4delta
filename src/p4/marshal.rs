@@ -9,18 +9,18 @@ use crate::charset::{decode_p4_bytes, strip_bom};
 use crate::model::HaveRecord;
 use crate::path::local_path_key;
 
-// Python marshal format type codes
+// Python marshal 格式的类型码。
 pub(crate) const TYPE_NULL: u8 = b'0';
 pub(crate) const TYPE_DICT: u8 = b'{';
 pub(crate) const TYPE_STRING: u8 = b's';
 
-/// Read one string from Python marshal format
-/// Format: 's' (type byte) + 4-byte little-endian i32 (length) + N bytes (data)
+/// 从 Python marshal 格式里读一个字符串。
+/// 格式：`'s'`（类型字节）+ 4 字节小端 i32（长度）+ N 字节（数据）。
 ///
-/// Returns `Ok(None)` when the buffer is merely truncated, so a streaming caller can wait for
-/// more bytes. `Err` is reserved for data that can never become valid.
+/// 缓冲只是被截断时返回 `Ok(None)`，让流式调用方去等更多字节；`Err` 只留给永远不可能
+/// 变合法的数据。
 pub(crate) fn read_marshal_string(cursor: &mut &[u8]) -> Result<Option<Vec<u8>>> {
-    // Probe on a copy so a truncated read leaves the caller's cursor untouched.
+    // 在副本上试探：读到一半失败时调用方的游标保持不动。
     let mut probe = *cursor;
 
     if probe.is_empty() {
@@ -50,11 +50,11 @@ pub(crate) fn read_marshal_string(cursor: &mut &[u8]) -> Result<Option<Vec<u8>>>
     Ok(Some(data))
 }
 
-/// Read one dictionary from Python marshal format
-/// Format: '{' (type byte) + (key string + value string)* + '0' (null terminator)
+/// 从 Python marshal 格式里读一个字典。
+/// 格式：`'{'`（类型字节）+（键字符串 + 值字符串）* + `'0'`（终止符）。
 ///
-/// `dict` is cleared and filled in place so a streaming caller can reuse a single map instead
-/// of allocating a new one (plus two `Vec`s per field) for every one of millions of records.
+/// `dict` 是清空后原地填充的：流式调用方复用一个 map，不必为几百万条记录里的每一条
+/// 重新分配（那还会连带每条记录每个字段两个 `Vec`）。
 pub(crate) fn read_marshal_dict_into(
     cursor: &mut &[u8],
     dict: &mut HashMap<Vec<u8>, Vec<u8>>,
@@ -77,13 +77,11 @@ pub(crate) fn read_marshal_dict_into(
             return Ok(None);
         }
 
-        // Check for dict terminator
         if probe[0] == TYPE_NULL {
             probe = &probe[1..];
             break;
         }
 
-        // Read key-value pair
         let Some(key) = read_marshal_string(&mut probe)? else {
             return Ok(None);
         };
@@ -97,8 +95,8 @@ pub(crate) fn read_marshal_dict_into(
     Ok(Some(()))
 }
 
-/// Extracts one have record from a parsed marshal dict.
-/// Returns `Ok(None)` for non-stat records (errors, info messages).
+/// 从解析好的 marshal 字典里取出一条 have 记录。
+/// 非 stat 记录（错误、提示消息）返回 `Ok(None)`。
 pub(crate) fn have_record_from_dict(
     dict: &HashMap<Vec<u8>, Vec<u8>>,
     encoding: &'static Encoding,
@@ -111,8 +109,8 @@ pub(crate) fn have_record_from_dict(
         .get(b"path".as_ref())
         .ok_or_else(|| anyhow!("Record missing 'path' field"))?;
 
-    // Paths come back in whatever charset p4 is configured with. Decoding them as anything
-    // else silently produces mojibake that never matches the local filesystem.
+    // 路径按 p4 配置的字符集返回。用别的字符集解码会静默产生乱码，
+    // 永远匹配不上本地文件系统。
     let (path_str, _had_replacements) = decode_p4_bytes(path, encoding);
 
     let sync_time = match dict.get(b"syncTime".as_ref()) {
@@ -129,25 +127,24 @@ pub(crate) fn have_record_from_dict(
         None => None,
     };
 
-    // Lowercase for case-insensitive matching on Windows, and unify the separator so these keys
-    // match the ones built from the local filesystem and from fstat's clientFile.
+    // 转小写以支持 Windows 上的大小写不敏感匹配，同时统一分隔符，让这些键与本地文件系统、
+    // fstat 的 clientFile 建出来的键落在同一处。
     Ok(Some((local_path_key(&path_str), HaveRecord { sync_time })))
 }
 
-/// Incremental parser for the `p4 -G have` marshal stream.
+/// `p4 -G have` marshal 流的增量解析器。
 ///
-/// The full response reaches several GB on a large workspace, so it is consumed in chunks and
-/// parsed record by record. A single scratch dict is reused across all records.
+/// 大工作区的完整响应有好几 GB，所以按块消费、逐条解析；所有记录复用同一个 scratch 字典。
 pub(crate) struct MarshalStreamParser {
     encoding: &'static Encoding,
     buffer: Vec<u8>,
-    /// Offset of the first unconsumed byte within `buffer`.
+    /// `buffer` 里第一个未消费字节的偏移。
     consumed: usize,
     scratch: HashMap<Vec<u8>, Vec<u8>>,
     records: HashMap<String, HaveRecord>,
     total_parsed: usize,
     missing_sync_time: usize,
-    /// Whether any chunk has been seen, so a BOM is only stripped once, at the very start.
+    /// 是否已经见过数据块：BOM 只在最开头剥一次。
     started: bool,
 }
 
@@ -166,7 +163,7 @@ impl MarshalStreamParser {
     }
 
     pub(crate) fn push_chunk(&mut self, chunk: &[u8]) -> Result<()> {
-        // A BOM can only ever appear at the very start of the stream.
+        // BOM 只会出现在流的最开头。
         let chunk = if self.started {
             chunk
         } else {
@@ -181,7 +178,7 @@ impl MarshalStreamParser {
                 let mut cursor = &self.buffer[self.consumed..];
                 match read_marshal_dict_into(&mut cursor, &mut self.scratch)? {
                     Some(()) => Some(self.buffer.len() - self.consumed - cursor.len()),
-                    // Truncated record: wait for the next chunk.
+                    // 记录被截断：等下一块数据。
                     None => None,
                 }
             };
@@ -200,7 +197,7 @@ impl MarshalStreamParser {
             }
         }
 
-        // Compact once most of the buffer is consumed, so it does not grow with the stream.
+        // 缓冲区大部分消费掉之后就压缩一次，避免它随流一直增长。
         if self.consumed >= (1 << 20) && self.consumed * 2 >= self.buffer.len() {
             self.buffer.drain(..self.consumed);
             self.consumed = 0;
@@ -225,7 +222,7 @@ impl MarshalStreamParser {
     }
 }
 
-/// Parses a complete `p4 -G have` response. Kept as a single entry point for tests.
+/// 解析一份完整的 `p4 -G have` 响应。留作测试的单一入口。
 #[cfg(test)]
 pub(crate) fn parse_p4_have_output(
     data: &[u8],
@@ -250,7 +247,7 @@ mod tests {
             ("path", "E:\\中文\\私服使用说明.docx"),
             ("syncTime", "1700000000"),
         ]);
-        // Non-stat records (errors, info messages) are still skipped.
+        // 非 stat 记录（错误、提示消息）照样跳过。
         data.extend_from_slice(&marshal_dict(&[
             ("code", "error"),
             ("path", "E:\\ignored.txt"),
@@ -267,8 +264,8 @@ mod tests {
 
     #[test]
     fn wrong_charset_yields_a_different_key() {
-        // Regression guard for the original bug: a wrong charset silently produces a different
-        // key, which is what made every non-ASCII file look both added and deleted.
+        // 原始 bug 的回归守卫：字符集用错会静默产生另一个键，
+        // 那正是「每个非 ASCII 文件既像新增又像删除」的成因。
         let data = marshal_dict(&[
             ("code", "stat"),
             ("path", "E:\\中文.txt"),
@@ -291,7 +288,7 @@ mod tests {
     fn marshal_reader_reports_truncation_instead_of_failing() {
         let full = marshal_string("hello");
 
-        // Every strict prefix means "need more bytes", and must never be an error.
+        // 每个真前缀都表示「还需要更多字节」，绝不能算错误。
         for length in 0..full.len() {
             let mut cursor = &full[..length];
             assert_eq!(
@@ -317,8 +314,7 @@ mod tests {
 
     #[test]
     fn streaming_marshal_parsing_matches_a_single_shot_parse() {
-        // The chunked parser must produce identical results regardless of how the byte stream
-        // is split, which is what makes it safe to read straight off the pipe.
+        // 字节流怎么切都不该影响分块解析的结果——这正是它能直接对着管道读的前提。
         let mut data = marshal_dict(&[
             ("code", "stat"),
             ("path", "E:\\中文\\a.txt"),
@@ -355,15 +351,14 @@ mod tests {
     #[test]
     fn streaming_parser_drops_a_truncated_trailing_record() {
         let mut data = marshal_dict(&[("code", "stat"), ("path", "E:\\a.txt"), ("syncTime", "1")]);
-        // A final record that gets cut off mid-way, as a killed p4 would produce.
+        // 最后一条记录从中间被切断，就像 p4 被杀掉时那样。
         data.extend_from_slice(&marshal_dict(&[("code", "stat"), ("path", "E:\\b.txt")])[..10]);
 
         let mut parser = MarshalStreamParser::new(UTF_8);
         parser.push_chunk(&data).unwrap();
         let records = parser.finish();
 
-        // The complete record survives and the truncated one is discarded rather than
-        // corrupting the parse.
+        // 完整的记录留了下来，被截断的那条丢弃，而不是污染这次解析。
         assert_eq!(records.len(), 1);
         assert!(records.contains_key("e:\\a.txt"));
     }

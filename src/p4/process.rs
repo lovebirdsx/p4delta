@@ -110,7 +110,7 @@ pub(crate) async fn write_p4_arguments(arguments: Option<(ChildStdin, Vec<u8>)>)
     let _ = stdin.close().await;
 }
 
-/// Run `p4 -G have` and parse the binary marshal output to get sync timestamps
+/// 跑 `p4 -G have`，解析它的 marshal 二进制输出，取回同步时间戳。
 pub(crate) async fn run_p4_have(
     options: &Options,
     work_dir: &str,
@@ -144,8 +144,7 @@ pub(crate) async fn run_p4_have(
     // 参数是 `...`，用不上 stdin。
     let P4Pipes { stdout, stderr, .. } = take_p4_pipes(&mut child, None)?;
 
-    // Parse while reading: the raw response is several GB on a large workspace, so buffering
-    // it whole before parsing is what made this run out of memory.
+    // 边读边解析：大工作区的原始响应有好几 GB，整份缓冲下来正是当初把内存撑爆的原因。
     let read_stdout = async move {
         let mut parser = MarshalStreamParser::new(p4_encoding());
         let mut stdout = stdout;
@@ -416,7 +415,7 @@ fn p4_failure_message(
         .then(|| format!("p4 {command} reported: {stderr}"))
 }
 
-/// Runs one slice of a batched p4 command (eg. p4 stuff a100 a101 ... a198 a199)
+/// 跑一批 p4 调用中的一片（例如 `p4 stuff a100 a101 ... a198 a199`）。
 pub(crate) async fn run_p4_command_slice(
     options: &Options,
     work_dir: &str,
@@ -498,12 +497,12 @@ pub(crate) async fn run_p4_command_slice(
     Ok(lines)
 }
 
-/// Reads a p4 output stream line by line, decoding each line with the resolved charset.
+/// 逐行读 p4 的输出流，每行按解析好的字符集解码。
 ///
-/// Reading line by line keeps the raw bytes of a large response (fstat on a big workspace is
-/// tens of millions of lines) from being buffered whole, but it does not stream the response
-/// to the caller: every decoded line is accumulated, and the returned Vec holds the entire
-/// response.
+/// 逐行读让大响应的原始字节不必整份缓冲，但**并没有**把结果流式交给调用方：解码后的每一行
+/// 都攒在内存里，返回的 `Vec` 装着整个响应。所以它只适合响应规模可控的命令——转交批次、
+/// `p4 ignores`、`p4 add -n`、`p4 where`；`p4 fstat` 那种几千万行的响应走 `p4/fstat.rs`
+/// 里边读边解析的 `FstatParser`，不经过这里。
 pub(crate) async fn read_p4_lines(stream: async_process::ChildStdout) -> io::Result<Vec<String>> {
     let encoding = p4_encoding();
     let mut reader = futures::io::BufReader::with_capacity(READ_BUFFER_SIZE, stream);
@@ -517,7 +516,7 @@ pub(crate) async fn read_p4_lines(stream: async_process::ChildStdout) -> io::Res
             break;
         }
 
-        // A BOM can only ever appear at the very start of the stream.
+        // BOM 只会出现在流的最开头。
         let line = if is_first_line {
             is_first_line = false;
             strip_bom(&raw, encoding)
@@ -544,14 +543,12 @@ pub(crate) async fn read_p4_stderr(stream: ChildStderr) -> Vec<u8> {
     buffer
 }
 
-/// Upper bound on how many p4 processes one batched call keeps in flight: it is the
-/// `buffered(..)` width inside [`run_p4_command_batched`], and the same width is used by
-/// `run_p4_fstat_batched`. It is a per-call cap, not a global one: it bounds that one call's
-/// stream and says nothing about batched calls running at the same time elsewhere.
+/// 一次批量调用最多同时跑多少个 p4 进程：它就是 [`run_p4_command_batched`] 里
+/// `buffered(..)` 的宽度，`run_p4_fstat_batched` 也用同一个值。这是**单次调用**的上限，
+/// 不是全局上限：它只管那一次调用的流，别处同时跑的批量调用不在其内。
 ///
-/// The server is configured with maxParallel=8, and running more clients than that only adds
-/// process startup overhead and memory pressure. Unbounded spawning previously put tens of
-/// thousands of p4.exe processes in flight at once.
+/// 服务端配的是 maxParallel=8，比这更宽的并发只会白白增加进程启动开销与内存压力。
+/// 早先不限并发时，同时在飞的 p4.exe 有过几万个。
 pub(crate) const MAX_PARALLEL_P4_COMMANDS: usize = 8;
 
 /// 按参数长度把参数切成若干片：每片交给一个 p4 进程，片数也就是并发度。
@@ -596,10 +593,9 @@ pub(crate) async fn run_p4_command_batched(
         batches.len()
     );
 
-    // `buffered` polls at most MAX_PARALLEL_P4_COMMANDS futures at a time. The child processes
-    // still run in parallel, because async-process dispatches pipe reads to a blocking thread
-    // pool, so this does not need task::spawn - and therefore does not need the 'static
-    // transmutes that unbounded spawning required to satisfy the borrow checker.
+    // `buffered` 一次最多轮询 MAX_PARALLEL_P4_COMMANDS 个 future。子进程仍然并行跑：
+    // async-process 把管道读取派给阻塞线程池，所以这里不需要 task::spawn，
+    // 也就不需要当初不限并发时、为满足借用检查而写的那套 'static transmute。
     let mut slices = futures::stream::iter(batches)
         .map(|range| {
             run_p4_command_slice(
@@ -616,14 +612,12 @@ pub(crate) async fn run_p4_command_batched(
     let mut results = Vec::new();
     let mut first_error: Option<Error> = None;
 
-    // Drain every batch even after a failure, which matches the previous behavior of running
-    // all batches to completion before reporting. Dropping the stream instead would cancel
-    // in-flight batches, leaving a write command partially applied with no way to tell which
-    // parts landed.
+    // 失败之后仍把每一批收完，与「先跑完所有批次再报告」的旧行为一致。中途 drop 掉流会
+    // 取消在途批次，留下「部分应用、且无从判断哪些落地」的写命令。
     while let Some(slice) = slices.next().await {
         match slice {
             Ok(lines) if first_error.is_none() => results.extend(lines),
-            // Results are pointless once a failure is being reported, so stop accumulating.
+            // 既然已经在报告失败了，再攒结果没有意义。
             Ok(_) => {}
             Err(e) => {
                 if first_error.is_none() {
@@ -801,8 +795,8 @@ mod tests {
         let small = vec!["a".to_string(), "b".to_string()];
         assert_eq!(compute_batches(&small), vec![0..2]);
 
-        // An argument longer than the limit gets a batch to itself. This used to emit an
-        // empty batch as well, which ran `p4 ignores` with no arguments at all.
+        // 超过上限的参数独占一批。这里过去还会多切出一个空批，
+        // 那个空批会以零参数去跑 `p4 ignores`。
         let huge = vec!["x".repeat(ARGUMENT_LENGTH_MAX + 1)];
         assert_eq!(compute_batches(&huge), vec![0..1]);
     }
@@ -860,7 +854,7 @@ mod tests {
             .collect();
 
         for range in compute_batches(&args) {
-            // Each argument contributes its length plus a separating space.
+            // 每个参数贡献自己的长度，外加一个分隔空格。
             let size: usize = args[range].iter().map(|arg| arg.len() + 1).sum();
             assert!(
                 size <= ARGUMENT_LENGTH_MAX,
