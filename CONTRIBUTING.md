@@ -32,6 +32,8 @@ pwsh -File scripts/test-install.ps1        # 或 powershell -File ...
 
 CI 用 Windows PowerShell 5.1 与 PowerShell 7 各跑一遍。两个脚本都**必须带 UTF-8 BOM**：5.1 对没有 BOM 的文件按系统 ANSI 代码页解析，里面的中文会全变乱码（`test-install.ps1` 有一条断言拦着）。
 
+最后一条用例（`Test-UserPathIsManagedByDefault`）是唯一碰真实用户配置的：它临时改写 `HKCU\Environment\Path` 来验默认安装会加进去、卸载会摘掉，先快照、`finally` 还原。**别同时跑两份测试**（两份快照会互相覆盖），也别在它跑的当口手工改 PATH；其余用例一律带 `-WithoutPath`，绝不碰这台机器的 PATH。
+
 ### 预览性能测量（PowerShell 7）
 
 `scripts/benchmark.ps1` 固定执行预览（`-l`，不传 `-a`），先预热一次，再计时 5 轮：
@@ -167,7 +169,7 @@ tests/
   e2e_paths.rs         路径形式 / changelist / 缓存复用 / unmap
   e2e_charset.rs       非 ASCII 文件名与输出契约
   e2e_scope.rs         操作范围：多入口合并、文件入口、排除、配置与参数的组合
-install.ps1            安装脚本：铺 exe + 注册 P4V 自定义工具
+install.ps1            安装脚本：铺 exe + 注册 P4V 自定义工具 + 把安装目录写进用户级 PATH
 scripts/
   benchmark.ps1        仅预览的多轮计时、动作多重集比对与日志留存（PowerShell 7）
   test-benchmark.ps1   测量脚本的假 CLI 黑盒测试
@@ -246,4 +248,10 @@ $env:RUSTDOCFLAGS = "-D warnings"; cargo doc --no-deps --document-private-items
    `install.ps1` 里元素形状或 Arguments 的改动，这一段就再走一遍。同样要留意 README 里那条：
    团队那个 `RunTaskAndSyncFiles.bat` 会拿 depot 的 `tools.xml` 覆盖 `customtools.xml`，跑过
    一次它之后 p4delta 的七条就全没了，别把"菜单里没有"误判成工具定义写错了。
+
+   PATH 那条也要手工过一遍——自动化验得了注册表里的值，验不了广播的实际效果：装完**不重新
+   登录**，从开始菜单开一个终端（Windows Terminal 若已经在跑，得整个退掉再开：在旧窗口里开
+   新标签拿的还是它启动时的旧环境块），`p4delta --version` 应当直接跑起来。再跑一次带
+   `-WithoutPath` 的安装确认条目被摘掉、`(Get-Item HKCU:\Environment).GetValueKind('Path')`
+   与装之前一致（原值是 `REG_SZ` 的机器上尤其要看一眼：写回时不该被改成 `REG_EXPAND_SZ`）。
 

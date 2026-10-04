@@ -4,13 +4,15 @@
     把 p4delta 注册成 P4V 的自定义工具。
 
 .DESCRIPTION
-    两件事：把 p4delta.exe 铺到安装目录，再把工具定义写进 P4V 的自定义工具文件
-    （默认 %USERPROFILE%\.p4qt\customtools.xml），用户不用碰 Manage Tools 对话框。
+    三件事：把 p4delta.exe 铺到安装目录，把工具定义写进 P4V 的自定义工具文件
+    （默认 %USERPROFILE%\.p4qt\customtools.xml），再把安装目录加进用户级 PATH——用户
+    不用碰 Manage Tools 对话框，也不用自己配环境变量。
 
-    写入是幂等的：只动自己那几个节点，用户已有的其它自定义工具原样保留；内容没变时
-    整个文件都不重写。写之前会备份一份。
+    写入都是幂等的：只动自己那几个节点，用户已有的其它自定义工具原样保留；内容没变时
+    整个文件都不重写。写之前会备份一份。PATH 里已经有安装目录时同样不重写。
 
-    装完要重启 P4V —— 它只在启动时读那个文件。
+    装完要重启 P4V —— 它只在启动时读那个文件。PATH 那边不用：写完注册表会广播通知，
+    新开的终端立刻能用（已经开着的终端拿不到，新开一个）。
 
 .PARAMETER InstallDir
     exe 的安装目录，默认 %LOCALAPPDATA%\Programs\p4delta（per-user，不需要管理员）。
@@ -35,14 +37,16 @@
     被摘掉。
 
 .PARAMETER Uninstall
-    卸载：摘掉工具定义、清掉安装目录。不会动摘要缓存（%LOCALAPPDATA%\p4delta）。
+    卸载：摘掉工具定义、把安装目录从用户级 PATH 里摘掉、清掉安装目录。不会动摘要缓存
+    （%LOCALAPPDATA%\p4delta）。摘 PATH 这条不受 -WithoutPath 影响——exe 都删了，留着
+    是条死路径。
 
 .PARAMETER Force
     P4V 正在运行时也照样写。默认中止——P4V 退出时可能用它内存里的工具列表覆盖这次写入。
 
-.PARAMETER AddToPath
-    把安装目录加进用户级 PATH，方便在命令行里直接敲 p4delta。默认不加：P4V 那边用的是
-    绝对路径，PATH 只对命令行用户有意义。
+.PARAMETER WithoutPath
+    装完不让安装目录进用户级 PATH；以前默认装过、现在想去掉，也用它（在就摘掉）。默认
+    会加进去：P4V 那边用的是绝对路径，加 PATH 是为了让命令行里能直接敲 p4delta。
 
 .PARAMETER NoP4Check
     跳过 p4 可用性检查（CI 与自动化测试用）。
@@ -52,7 +56,8 @@
 
 .EXAMPLE
     .\install.ps1
-    装到默认位置，注册七个工具（reconcile + clean 预演/实际清理 + sync 的两条入口各预演/实际清理）。
+    装到默认位置，注册七个工具（reconcile + clean 预演/实际清理 + sync 的两条入口各预演/实际清理），
+    并把安装目录加进用户级 PATH。
 
 .EXAMPLE
     .\install.ps1 -WithoutCleanApply
@@ -61,6 +66,10 @@
 .EXAMPLE
     .\install.ps1 -WithoutCleanApply -WithoutSyncApply
     所有不可逆的工具都不注册（预演那三条照常）。
+
+.EXAMPLE
+    .\install.ps1 -WithoutPath
+    不碰用户级 PATH：不加进去，以前加过的会被摘掉。
 
 .EXAMPLE
     .\install.ps1 -Uninstall
@@ -75,7 +84,7 @@ param(
     [switch] $WithoutSyncApply,
     [switch] $Uninstall,
     [switch] $Force,
-    [switch] $AddToPath,
+    [switch] $WithoutPath,
     [switch] $NoP4Check,
     [switch] $Quiet
 )
@@ -553,6 +562,91 @@ function Test-PathEntry($Entries, [string] $Dir) {
     return $false
 }
 
+# 原值的类型。REG_SZ 与 REG_EXPAND_SZ 语义不同——后者里的 %VAR% 会被系统展开——写回时
+# 必须照原样，不能一律写 ExpandString：那等于顺手改了用户其它条目的语义。值不存在时
+# GetValueKind 会抛（实测 MethodInvocationException），回落到 ExpandString，也就是 Windows
+# 给新用户写 PATH 用的类型。
+function Get-UserPathKind($Key) {
+    try {
+        return $Key.GetValueKind('Path')
+    } catch {
+        return [Microsoft.Win32.RegistryValueKind]::ExpandString
+    }
+}
+
+# 打开可写的 Environment 键。真缺席时 OpenSubKey 返回 $null，直接 SetValue 会以
+# "cannot call a method on a null-valued expression" 中止安装（$ErrorActionPreference='Stop'），
+# 所以补一个 CreateSubKey。
+function Open-UserEnvironmentKey {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    if (-not $key) {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+    }
+    return $key
+}
+
+# 写回 PATH 再广播通知：新开的进程立刻拿到新值，不必等重新登录。已经开着的终端拿不到，
+# 它们的环境块在启动时就定下了。
+function Set-UserPathEntry([string] $Value) {
+    $key = Open-UserEnvironmentKey
+    try {
+        $key.SetValue('Path', $Value, (Get-UserPathKind $key))
+    } finally {
+        $key.Dispose()
+    }
+    Send-EnvironmentChangedBroadcast
+}
+
+# 把 $Entry 从用户级 PATH 里摘掉。不在里面时什么也不做、什么也不说（幂等）。
+function Remove-UserPathEntry([string] $Entry) {
+    $current = Get-UserPathEntry
+    $entries = @($current -split ';')
+    if (-not (Test-PathEntry $entries $Entry)) {
+        return
+    }
+    if (-not $PSCmdlet.ShouldProcess('HKCU:\Environment', "把 $Entry 从用户级 PATH 里摘掉")) {
+        return
+    }
+    $updated = (@($entries | Where-Object { $_ -ne '' -and ($_.TrimEnd('\') -ine $Entry.TrimEnd('\')) }) -join ';')
+    Set-UserPathEntry $updated
+    Write-Info "已从用户级 PATH 里摘掉 $Entry（已通知系统，新开的终端不会再看到它）"
+}
+
+# 把「环境变量变了」告诉所有顶层窗口：资源管理器收到后会刷新自己的环境块，之后它拉起的进程
+# 就是新 PATH。Add-Type 在同一个会话里对同名类型再来一次会报「类型已存在」，所以先查——脚本
+# 可能被同一个会话反复执行。
+#
+# 广播失败只是警告：值已经落在注册表里，最坏退回「重新登录才生效」，不该因此中断安装。
+function Send-EnvironmentChangedBroadcast {
+    try {
+        if (-not ('P4Delta.NativeMethods' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace P4Delta {
+    public static class NativeMethods {
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr SendMessageTimeout(
+            IntPtr hWnd, uint Msg, IntPtr wParam, string lParam,
+            uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+    }
+}
+'@
+        }
+
+        # HWND_BROADCAST=0xffff、WM_SETTINGCHANGE=0x001a、SMTO_ABORTIFHUNG=0x0002，超时 5 秒。
+        # 返回 0 只表示「没有窗口接住」——没有顶层窗口的会话（服务式 CI）天然如此——值已经写好，
+        # 不当失败报。
+        $result = [IntPtr]::Zero
+        [void][P4Delta.NativeMethods]::SendMessageTimeout(
+            [IntPtr] 0xffff, 0x001a, [IntPtr]::Zero, 'Environment', 0x0002, 5000, [ref] $result)
+    } catch {
+        # 消息里留着 ASCII 的 WM_SETTINGCHANGE：测试按它断言（中文过 CI 的管道会被打散成 ?）。
+        Write-Warning "环境变量变更通知（WM_SETTINGCHANGE）没发出去：$($_.Exception.Message)  PATH 已经写进注册表，重新登录后一样生效。"
+    }
+}
+
 # ---- 主流程 ----
 
 function Invoke-Install {
@@ -626,21 +720,21 @@ function Invoke-Install {
         Test-P4Availability
     }
 
-    if ($AddToPath) {
-        $entry = [System.IO.Path]::GetFullPath($InstallDir)
+    $entry = [System.IO.Path]::GetFullPath($InstallDir)
+    if ($WithoutPath) {
+        # 「确保不在」：以前默认装过、现在改主意了，重跑一次就能撤回。
+        Remove-UserPathEntry $entry
+    } else {
         $current = Get-UserPathEntry
         $entries = @($current -split ';')
         if (Test-PathEntry $entries $entry) {
             Write-Info "PATH 里已经有 $entry"
         } elseif ($PSCmdlet.ShouldProcess('HKCU:\Environment', "把 $entry 加进用户级 PATH")) {
-            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
-            try {
-                $updated = (@($entries | Where-Object { $_ -ne '' }) + $entry) -join ';'
-                $key.SetValue('Path', $updated, [Microsoft.Win32.RegistryValueKind]::ExpandString)
-            } finally {
-                $key.Dispose()
-            }
-            Write-Info "已加入用户级 PATH：$entry（新开的终端才会看到）"
+            # 顺带把空条目（;;）滤掉：空条目在 PATH 里表示「当前目录」，是历史遗留的坏东西，
+            # 而它本来就只在这次拼接里被顺手发现。其余条目一字不动。
+            $updated = (@($entries | Where-Object { $_ -ne '' }) + $entry) -join ';'
+            Set-UserPathEntry $updated
+            Write-Info "已加入用户级 PATH：$entry（已通知系统，新开的终端就能用）"
         }
     }
 
@@ -664,6 +758,9 @@ function Invoke-Install {
     if ($skipped.Count -gt 0) {
         Write-Info "（按开关没注册 $($skipped -join '、')；以前装过的话这次已经摘掉。）"
     }
+    if ($WithoutPath) {
+        Write-Info '（按开关没把安装目录加进用户级 PATH；以前加过的话这次已经摘掉。）'
+    }
 }
 
 function Invoke-Uninstall {
@@ -684,23 +781,8 @@ function Invoke-Uninstall {
         Write-Info '工具定义里没有 p4delta，无需改动。'
     }
 
-    if ($AddToPath) {
-        $entry = [System.IO.Path]::GetFullPath($InstallDir)
-        $current = Get-UserPathEntry
-        $entries = @($current -split ';')
-        if (Test-PathEntry $entries $entry) {
-            if ($PSCmdlet.ShouldProcess('HKCU:\Environment', "把 $entry 从用户级 PATH 里摘掉")) {
-                $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
-                try {
-                    $updated = (@($entries | Where-Object { $_ -ne '' -and ($_.TrimEnd('\') -ine $entry.TrimEnd('\')) }) -join ';')
-                    $key.SetValue('Path', $updated, [Microsoft.Win32.RegistryValueKind]::ExpandString)
-                } finally {
-                    $key.Dispose()
-                }
-                Write-Info "已从用户级 PATH 里摘掉 $entry"
-            }
-        }
-    }
+    # 卸载总会摘掉自己那条——exe 都要删了，留着是死条目。这条不受 -WithoutPath 影响。
+    Remove-UserPathEntry ([System.IO.Path]::GetFullPath($InstallDir))
 
     if (Test-Path -LiteralPath $InstallDir) {
         if ($PSCmdlet.ShouldProcess($InstallDir, '删除安装目录')) {

@@ -79,6 +79,8 @@ jobs:
 
   # 安装脚本的黑盒测试：把 install.ps1 与一个人造 exe 拷进临时目录再跑，
   # 断言生成的 customtools.xml 与幂等/卸载行为。不需要构建产物，所以独立于 test。
+  # 最后一条用例会临时改写 runner 上的 HKCU\Environment\Path（验默认加 PATH、卸载摘掉，
+  # 先快照、finally 还原）——一次性环境，用完还回去；其余用例一律带 -WithoutPath。
   installer:
     runs-on: windows-latest
     steps:

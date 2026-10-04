@@ -11,7 +11,9 @@
     断言失败即 throw，退出码非 0；风格对齐 scripts/fetch-p4-tools.sh。
 
     不碰真实用户配置：安装目录与 customtools.xml 都重定向到临时目录，且一律带
-    -NoP4Check。注册表只在 -AddToPath 时才会被碰，这里不测那条路径。
+    -NoP4Check。PATH 上，除最后一条用例（唯一碰真注册表的：先快照、finally 还原）外，
+    其余一律带 -WithoutPath，绝不碰这台机器的 PATH。也**别同时跑两份测试**——两份快照
+    会互相覆盖。
 #>
 [CmdletBinding()]
 param(
@@ -90,15 +92,30 @@ function Reset-Root {
     Write-Utf8NoBom (Join-Path $DistDir 'p4delta.exe') "this is not a real executable$([Environment]::NewLine)"
 }
 
-function Invoke-Installer([string[]] $ExtraArguments = @()) {
+function Get-InstallerArguments([string[]] $ExtraArguments = @(), [switch] $WithPath) {
     # -NoP4Check 与 -Force 都是**消除机器状态**，不是被测对象：这几条用例测的是写文件的
     # 行为。前者跳过 p4 可用性检查；后者跳过「P4V 正在运行」那道守卫——开发机上 P4V 常驻
     # 是常态，而那道守卫的判据（Get-Process p4v）在别处没有用例覆盖，不该让它把整套用例
     # 拦在门外。
+    #
+    # -WithoutPath 同理：install.ps1 现在**默认**会往这台机器的用户级 PATH 里写东西，而这
+    # 些用例测的是写文件——不能让整套用例污染开发机（多数用例装完并不卸载）。真注册表那条
+    # 用例显式用 -WithPath 打开，于是「谁碰了真注册表」在代码里一眼可数。
+    #
+    # 注意：**别**把 -WithoutPath 写进 $ExtraArguments——重复指定同一个开关，PowerShell 会
+    # 直接报参数绑定错误。
     $arguments = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $DistDir 'install.ps1'),
         '-InstallDir', $InstallDir, '-CustomToolsPath', $ToolsPath, '-NoP4Check', '-Force', '-Quiet'
     ) + $ExtraArguments
+    if (-not $WithPath) {
+        $arguments += '-WithoutPath'
+    }
+    return $arguments
+}
+
+function Invoke-Installer([string[]] $ExtraArguments = @(), [switch] $WithPath) {
+    $arguments = Get-InstallerArguments $ExtraArguments -WithPath:$WithPath
 
     & $HostExe @arguments
     if ($LASTEXITCODE -ne 0) {
@@ -532,6 +549,101 @@ function Test-WhatIfChangesNothing {
     Assert-True (-not (Test-Path -LiteralPath $ToolsPath)) '-WhatIf 不该写自定义工具文件'
 }
 
+# ---- 真注册表：HKCU\Environment\Path ----
+
+# 全套里唯一碰真实用户配置的用例：先快照、finally 还原（断言失败、被 Ctrl+C 打断也会还回去）。
+# 中途被强杀会在 PATH 里留一条带旧 PID 的临时目录，不影响下次运行——判据是当前 PID 的目录。
+
+function Get-RealUserPathSnapshot {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $false)
+    if (-not $key) { return @{ Exists = $false; Value = $null; Kind = $null } }
+    try {
+        $raw = $key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($null -eq $raw) { return @{ Exists = $false; Value = $null; Kind = $null } }
+        return @{ Exists = $true; Value = [string] $raw; Kind = $key.GetValueKind('Path') }
+    } finally {
+        $key.Dispose()
+    }
+}
+
+function Restore-RealUserPathSnapshot($Snapshot) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+    try {
+        if ($Snapshot.Exists) {
+            $key.SetValue('Path', $Snapshot.Value, $Snapshot.Kind)
+        } else {
+            $key.DeleteValue('Path', $false)
+        }
+    } finally {
+        $key.Dispose()
+    }
+}
+
+# 与 install.ps1 的 Test-PathEntry 同一套判据：大小写不敏感、忽略尾反斜杠。刻意另写一份
+# （同上面 prompt 文本的处理）：测试要是从 install.ps1 里读，改坏了也测不出来。
+function Test-PathValueHasEntry([string] $PathValue, [string] $Dir) {
+    foreach ($entry in @($PathValue -split ';')) {
+        if ($entry -and $entry.TrimEnd('\') -ieq $Dir.TrimEnd('\')) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-UserPathIsManagedByDefault {
+    $snapshot = Get-RealUserPathSnapshot
+    try {
+        # 1) -WithoutPath 而条目本来就不在：注册表逐字符不动（用 -ceq：-ne 不分大小写）
+        Reset-Root
+        Invoke-Installer
+        Assert-True ($snapshot.Value -ceq (Get-RealUserPathSnapshot).Value) '-WithoutPath 改动了注册表里的 PATH'
+
+        # 2) 默认安装 + -WhatIf：只说不做。这里必须 -WithPath，否则走不到 PATH 那条分支。
+        #    （上一句是真装，铺出了安装目录，先重置现场再验「不该创建」。）
+        Reset-Root
+        Invoke-Installer @('-WhatIf') -WithPath
+        Assert-True (-not (Test-Path -LiteralPath $InstallDir)) '-WhatIf 不该创建安装目录'
+        Assert-True ($snapshot.Value -ceq (Get-RealUserPathSnapshot).Value) '-WhatIf 改动了注册表里的 PATH'
+
+        # 3) 默认安装：条目出现、别人的条目一条不丢、值类型不变。顺带抓子进程输出断言广播没
+        #    报错——那段 C# 没有任何编译期校验，只有这条能拦住「装完静默退化」。匹配 ASCII 的
+        #    WM_SETTINGCHANGE 而不是中文：CI 上中文过管道会被打散，那样断言等于永远通过。
+        $output = (& $HostExe @(Get-InstallerArguments -WithPath) 2>&1 | Out-String)
+        Assert-Equal 0 $LASTEXITCODE "默认安装该成功：$output"
+        Assert-True ($output -notlike '*WM_SETTINGCHANGE*') "安装不该在广播上报错：$output"
+
+        $after = Get-RealUserPathSnapshot
+        Assert-True (Test-PathValueHasEntry $after.Value $InstallDir) '默认安装应当把安装目录写进用户级 PATH'
+        foreach ($original in @($snapshot.Value -split ';' | Where-Object { $_ -ne '' })) {
+            Assert-True (Test-PathValueHasEntry $after.Value $original) "原有的 PATH 条目不该丢：$original"
+        }
+        if ($snapshot.Exists) {
+            Assert-Equal $snapshot.Kind $after.Kind 'PATH 的值类型不该被改动'
+        }
+
+        # 4) 幂等：已经有那条就不重写
+        Invoke-Installer -WithPath
+        Assert-True ($after.Value -ceq (Get-RealUserPathSnapshot).Value) 'PATH 里已有那条时不该重写'
+
+        # 5) 卸载总会摘掉自己那条，别人的原样留着
+        Invoke-Installer @('-Uninstall') -WithPath
+        Assert-True (-not (Test-Path -LiteralPath $InstallDir)) '卸载该删掉安装目录'
+        $final = Get-RealUserPathSnapshot
+        Assert-True (-not (Test-PathValueHasEntry $final.Value $InstallDir)) '卸载应当把安装目录从 PATH 里摘掉'
+        foreach ($original in @($snapshot.Value -split ';' | Where-Object { $_ -ne '' })) {
+            Assert-True (Test-PathValueHasEntry $final.Value $original) "卸载不该带走别人的 PATH 条目：$original"
+        }
+
+        # 6) -WithoutPath 的「确保不在」：已经在里面就摘掉
+        Invoke-Installer -WithPath
+        Assert-True (Test-PathValueHasEntry (Get-RealUserPathSnapshot).Value $InstallDir) '先决条件：这次安装该把条目加回去'
+        Invoke-Installer
+        Assert-True (-not (Test-PathValueHasEntry (Get-RealUserPathSnapshot).Value $InstallDir)) '-WithoutPath 应当把已有的那条摘掉'
+    } finally {
+        Restore-RealUserPathSnapshot $snapshot
+    }
+}
+
 $cases = @(
     'Test-InstallLayoutIsSelfContained',
     'Test-FreshInstall',
@@ -547,7 +659,9 @@ $cases = @(
     'Test-BothWithoutSwitchesClearTheFolder',
     'Test-IrreversibleFolderKeepsForeignTools',
     'Test-Uninstall',
-    'Test-WhatIfChangesNothing'
+    'Test-WhatIfChangesNothing',
+    # 唯一碰真注册表的用例，放最后：万一进程被强杀没走到 finally，也不带偏前面的用例。
+    'Test-UserPathIsManagedByDefault'
 )
 
 $failed = 0

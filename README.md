@@ -41,13 +41,17 @@ P4V 里的 `Reconcile Offline Work` 慢得令人抓狂，本程序是它的替�
 .\install.ps1
 ```
 
-它做三件事：把 `p4delta.exe` 铺到 `%LOCALAPPDATA%\Programs\p4delta\`、把工具定义写进
-`%USERPROFILE%\.p4qt\customtools.xml`（P4V 的自定义工具文件）、检查机器上有没有 `p4`。
-**装完要重启 P4V**——它只在启动时读那个文件。
+它做四件事：把 `p4delta.exe` 铺到 `%LOCALAPPDATA%\Programs\p4delta\`、把工具定义写进
+`%USERPROFILE%\.p4qt\customtools.xml`（P4V 的自定义工具文件）、把安装目录加进用户级 PATH、
+检查机器上有没有 `p4`。**装完要重启 P4V**——它只在启动时读那个文件。
 
-写入是幂等的：只动它自己那几个节点，你已有的其它自定义工具原样保留；内容没变时整个文件都不
+写入都是幂等的：只动它自己那几个节点，你已有的其它自定义工具原样保留；内容没变时整个文件都不
 重写。写之前会备份一份（`customtools.xml.p4delta-backup-<时间戳>`）。P4V 正在运行时会拒绝
 写入（`-Force` 可以强行继续）——P4V 退出时可能用它内存里的列表覆盖这次改动。
+
+PATH 那条是个例外，不用等重启：写完注册表会广播通知，**新开的终端**立刻就能敲 `p4delta`
+（已经开着的终端拿不到——环境变量在进程启动时就定下了；Windows Terminal 也一样，得整个退掉
+再开，在旧窗口里开新标签不算）。不想动 PATH 就加 `-WithoutPath`。
 
 默认注册七个。进右键菜单的四条：`p4delta Reconcile`、`p4delta Clean (preview)`、
 `p4delta Sync to changelist (preview)`、`p4delta Sync this folder to changelist (preview)`；
@@ -60,8 +64,8 @@ P4V 里的 `Reconcile Offline Work` 慢得令人抓狂，本程序是它的替�
 | --- | --- |
 | `-WithoutCleanApply` | 不注册不可逆的 clean 实际清理；已经注册过的会被摘掉（默认注册，放在不可逆子菜单里） |
 | `-WithoutSyncApply` | 不注册不可逆的 sync 实际执行（两条入口各一条）；同样默认注册、可摘掉 |
-| `-Uninstall` | 卸载：摘掉工具定义、删安装目录；摘要缓存留着 |
-| `-AddToPath` | 把安装目录加进用户级 PATH，方便在命令行里直接敲 `p4delta` |
+| `-Uninstall` | 卸载：摘掉工具定义、把安装目录从用户级 PATH 里摘掉、删安装目录；摘要缓存留着 |
+| `-WithoutPath` | 不碰用户级 PATH（默认会把安装目录加进去，方便在命令行里直接敲 `p4delta`；带上它时以前加过的会被摘掉） |
 | `-InstallDir`、`-CustomToolsPath` | 换安装位置 / 换 P4V 配置文件位置 |
 | `-ExePath` | 装指定路径的那份 exe（默认取与本脚本同目录的），自编译的产物走这里 |
 | `-WhatIf` | 只说要做什么，不落盘 |
@@ -158,7 +162,8 @@ P4V 有两类实测撞上的硬限制（多轮探针工具在真实 P4V 上跑�
 
 ### 手工安装（备选）
 
-不用安装脚本的话，在 P4V 里打开 `Tools > Manage Custom Tools`，新建一个 Local Tool，按下表填写：
+不用安装脚本的话，在 P4V 里打开 `Tools > Manage Custom Tools`，新建一个 Local Tool，按下表填写
+（手工装就没有 PATH 那一步了：想让命令行直接敲 `p4delta`，自己把 exe 所在目录加进用户级 PATH）：
 
 | 字段 | 值 |
 | --- | --- |

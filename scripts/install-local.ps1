@@ -5,7 +5,8 @@
 
 .DESCRIPTION
     四步：cargo build → 冒烟跑一次 --version → 备份安装目录里现有的 exe → 调 install.ps1
-    把它铺好并注册 P4V 工具。铺设与注册那段逻辑不在这里重写：两处各写一份迟早会漂。
+    把它铺好、注册 P4V 工具、把安装目录写进用户级 PATH。铺设与注册那段逻辑不在这里重写：
+    两处各写一份迟早会漂。
 
     装完**不用重启 P4V**：工具定义里的 Command 是 exe 的绝对路径，P4V 每次点菜单都新起一个
     进程，只要工具定义本身没变，下一次点击用的就是新 exe。只有工具定义变了（换安装目录、
@@ -24,7 +25,7 @@
 
 .PARAMETER Restore
     把 p4delta.exe.p4delta-backup-* 里最新的那份放回安装目录，回到第一次本地安装之前的状态。
-    不构建、不碰工具定义。
+    不构建、不碰工具定义，也不碰 PATH。
 
 .PARAMETER InstallDir
     安装目录，默认与 install.ps1 一致（%LOCALAPPDATA%\Programs\p4delta）。
@@ -38,6 +39,10 @@
 .PARAMETER WithoutSyncApply
     透传给 install.ps1：不注册不可逆的「sync 到指定 changelist 实际执行」（默认注册；
     以前装过的会被摘掉）。
+
+.PARAMETER WithoutPath
+    透传给 install.ps1：不碰用户级 PATH（默认会把安装目录加进去，以前加过而这次带了这个
+    开关就会被摘掉）。
 
 .PARAMETER Quiet
     透传给 install.ps1：只输出警告与错误。
@@ -67,6 +72,7 @@ param(
     [string] $CustomToolsPath = (Join-Path $env:USERPROFILE '.p4qt\customtools.xml'),
     [switch] $WithoutCleanApply,
     [switch] $WithoutSyncApply,
+    [switch] $WithoutPath,
     [switch] $Quiet
 )
 
@@ -223,6 +229,9 @@ function Invoke-LocalInstall {
     }
     if ($WithoutSyncApply) {
         $installArgs.WithoutSyncApply = $true
+    }
+    if ($WithoutPath) {
+        $installArgs.WithoutPath = $true
     }
     if ($Quiet) {
         $installArgs.Quiet = $true
