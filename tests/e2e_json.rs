@@ -225,7 +225,20 @@ fn no_revert_groups_matches_native_reconcile() {
     sandbox.remove("src/deep/a/b/c.txt"); // reopen_delete
 
     // 已打开、磁盘上与 have 一致的三类：只有 `p4 revert -a` 才管它们。
-    sandbox.p4_ok(&["edit", "src/使用说明.txt"]); // 内容没改 → revert_edit
+    //
+    // 中文名必须走 stdin：挂在命令行上会被 Windows 按系统 ANSI 代码页吃成 `????.txt`，
+    // 而 p4 对逐文件错误返回的退出码是 0，`p4_ok` 只看退出码，拦不住——文件根本没被
+    // 打开，revert_edit 就会整类消失（这一条曾在 CI 的 en-US Windows 上红过）。
+    sandbox.p4_ok_paths(&["edit"], &["src/使用说明.txt"]); // 内容没改 → revert_edit
+    // 前提，独立取证：这次 `p4 edit` 必须真的把文件开出来，后面的断言才有意义。
+    assert!(
+        sandbox
+            .opened()
+            .iter()
+            .any(|line| line.contains("使用说明.txt") && line.contains(" - edit ")),
+        "{:?}",
+        sandbox.opened()
+    );
     sandbox.p4_ok(&["delete", "-k", "readme.txt"]); // 内容没改 → revert_delete
     sandbox.write("ghost.txt", "brand new\n");
     sandbox.p4_ok(&["add", "ghost.txt"]);

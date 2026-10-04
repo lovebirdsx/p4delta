@@ -161,9 +161,11 @@ impl Sandbox {
 
     // ---- 独立取证 ----
 
-    /// 在沙箱里跑 p4。判断结论要看这里的输出，不能只看被测程序的 stdout。
-    pub fn p4(&self, args: &[&str]) -> Output {
-        let mut command = Command::new(&self.tools.p4);
+    /// 命令前那一段：`-p`/`-u`/`-c` 是全局选项，必须排在命令之前。
+    ///
+    /// 抽出来是为了让 [`Sandbox::p4_ok_paths`] 能在它们**之前**再插一段全局选项
+    /// （`-x - -b N`）——`Command` 只能按追加顺序拼参数。
+    fn p4_globals(&self, command: &mut Command, args: &[&str]) {
         command
             .arg("-p")
             .arg(self.server.address())
@@ -172,9 +174,15 @@ impl Sandbox {
             .arg("-c")
             .arg(&self.client)
             .args(args)
-            .current_dir(&self.client_root)
-            .stdin(Stdio::null());
-        apply_env(&mut command, &self.env());
+            .current_dir(&self.client_root);
+        apply_env(command, &self.env());
+    }
+
+    /// 在沙箱里跑 p4。判断结论要看这里的输出，不能只看被测程序的 stdout。
+    pub fn p4(&self, args: &[&str]) -> Output {
+        let mut command = Command::new(&self.tools.p4);
+        self.p4_globals(&mut command, args);
+        command.stdin(Stdio::null());
         command.output().expect("p4 must run")
     }
 
@@ -185,6 +193,71 @@ impl Sandbox {
             output.status.success(),
             "p4 {} failed ({})\nstdout: {}\nstderr: {}",
             args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            String::from_utf8_lossy(&output.stderr).trim_end(),
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// 同 [`Sandbox::p4_ok`]，但路径参数改从 stdin 交给 p4（`p4 -x - -b <个数>`）。
+    ///
+    /// 非 ASCII 的路径不能挂在 p4 的命令行上：Windows 会把命令行按系统 ANSI 代码页转成
+    /// 字节，`使用说明.txt` 到 p4 手里已经是 `????.txt`，而 `?` 在文件名匹配里能匹零个
+    /// 字符；p4 报的是**逐文件错误、退出码仍是 0**，[`Sandbox::p4_ok`] 只看退出码，
+    /// 于是「文件根本没被打开」会伪装成成功。生产代码为此把所有路径参数改走 stdin
+    /// （`src/p4/process.rs` 的 `argument_payload`），这里的命令行形状照抄它
+    /// ——全局选项必须排在命令之前：
+    ///
+    /// ```text
+    /// p4 -x - -b <paths.len()> -p <port> -u <user> -c <client> <命令...>
+    ///         └─ stdin：一行一个路径，UTF-8
+    /// ```
+    ///
+    /// 载荷按 UTF-8 写：p4 用命令字符集解码 `-x` 的内容，而沙箱的 `P4CHARSET` /
+    /// `P4COMMANDCHARSET` 恒为 utf8（见 [`Sandbox::env`]），`&str::as_bytes()` 正是它。
+    ///
+    /// 注意 `-x` 不是转义：这些行仍是 p4 的 file spec，`*` `?` `...` `@` `#` `%` 照旧有
+    /// 特殊含义；含换行符的路径会被拆成两条（生产侧同样的取舍）。
+    ///
+    /// 这个坑**在本机常常是隐形的**：开了「Beta: Use Unicode UTF-8 for worldwide language
+    /// support」的机器 ANSI 代码页是 65001，那一遍转写不丢字符，怎么跑都绿；只有 en-US
+    /// 的 `windows-latest`（CP1252）会红。所以在本地测不出问题时别急着下结论，
+    /// 先看 `HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 的 `ACP`。
+    ///
+    /// 路径为空时退回 [`Sandbox::p4_ok`]：`-x -` 配一个空的 stdin 会让 p4 一个参数都拿不到。
+    pub fn p4_ok_paths(&self, args: &[&str], paths: &[&str]) -> String {
+        if paths.is_empty() {
+            return self.p4_ok(args);
+        }
+
+        let mut command = Command::new(&self.tools.p4);
+        command
+            .arg("-x")
+            .arg("-")
+            .arg("-b")
+            .arg(paths.len().to_string());
+        self.p4_globals(&mut command, args);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn().expect("p4 must run");
+        {
+            let mut pipe = child.stdin.take().expect("stdin was piped");
+            for path in paths {
+                pipe.write_all(path.as_bytes()).expect("write the path");
+                pipe.write_all(b"\n").expect("write the separator");
+            }
+            // 关掉管道，p4 才读得到 EOF。
+        }
+        let output = child.wait_with_output().expect("p4 must finish");
+        assert!(
+            output.status.success(),
+            "p4 {} [{}] failed ({})\nstdout: {}\nstderr: {}",
+            args.join(" "),
+            paths.join(" "),
             output.status,
             String::from_utf8_lossy(&output.stdout).trim_end(),
             String::from_utf8_lossy(&output.stderr).trim_end(),
@@ -205,19 +278,11 @@ impl Sandbox {
     /// 同 [`Sandbox::p4`]，但往 stdin 喂一份表单。
     pub fn p4_input(&self, args: &[&str], form: &str) -> String {
         let mut command = Command::new(&self.tools.p4);
+        self.p4_globals(&mut command, args);
         command
-            .arg("-p")
-            .arg(self.server.address())
-            .arg("-u")
-            .arg(seed::USER)
-            .arg("-c")
-            .arg(&self.client)
-            .args(args)
-            .current_dir(&self.client_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        apply_env(&mut command, &self.env());
 
         let mut child = command.spawn().expect("p4 must run");
         {
