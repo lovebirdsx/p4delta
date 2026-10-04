@@ -6,7 +6,9 @@ edition = "2024"
 # 高于 edition 2024 自身的 1.85 下限。
 rust-version = "1.88"
 authors = ["lovebirdsx"]
-description = "A fast replacement for P4V's Reconcile Offline Work"
+# 这一句同时是 `--help` 的简介（cli.rs 的 #[command(about)] 取它）与 GitHub 仓库的 About，
+# 改的时候两处都要跟——仓库里只有这一份副本，别再手抄一份到别处。
+description = "Perforce Helix Core workspace tool: reconcile, clean and sync — 10–100× faster than P4V's Reconcile Offline Work, with path scoping and dry-run by default."
 license = "MIT"
 repository = "https://github.com/lovebirdsx/p4delta"
 readme = "README.md"

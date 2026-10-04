@@ -4,7 +4,8 @@ use clap::Parser;
 
 #[derive(Parser, Debug)]
 // 版本号取自 Cargo.toml，不再手写副本，见 CONTRIBUTING.md 的发布检查清单。
-#[command(version)]
+// 简介同理：不带值的 about 让 clap 去取 CARGO_PKG_DESCRIPTION，代码里不写第二份字面量。
+#[command(version, about)]
 pub struct Options {
     /// 要使用的 workspace（p4 client 名）。没设时读环境变量 P4CLIENT；两个都没有则报错退出。
     #[arg(short, long)]
@@ -141,5 +142,25 @@ mod tests {
             manifest.contains(&expected),
             "p4delta.exe.manifest 里需要 {expected}"
         );
+    }
+
+    /// `p4delta.rc` 里这几个名字是任务管理器「名称」列和 exe 属性页显示的东西，不该各写各的。
+    /// 这条用例把它们钉在包名上：改名时漏改 `.rc` 会当场失败，而不是等到翻开属性页才发现
+    /// 进程列表里顶着上一代的定位句。
+    #[test]
+    fn version_resource_names_match_the_crate() {
+        let rc = include_str!("../p4delta.rc");
+        let name = env!("CARGO_PKG_NAME");
+
+        for (field, expected) in [
+            ("FileDescription", name.to_owned()),
+            ("InternalName", name.to_owned()),
+            ("ProductName", name.to_owned()),
+            ("OriginalFilename", format!("{name}.exe")),
+        ] {
+            // 模式里必须是字面量的 `\0`（两个字符）：.rc 的字符串值以它结尾，rc.exe 不替你补。
+            let expected = format!(r#"VALUE "{field}", "{expected}\0""#);
+            assert!(rc.contains(&expected), "p4delta.rc 里需要 {expected}");
+        }
     }
 }

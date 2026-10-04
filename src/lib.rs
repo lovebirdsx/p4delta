@@ -1,7 +1,8 @@
-//! p4delta：P4V 的 Reconcile Offline Work 的快速替代实现。
+//! p4delta：Perforce Helix Core 工作区工具。
 //!
-//! 从服务器取 depot 状态、扫描本地工作区、计算并缓存文件摘要，再比对两者，
-//! 更新指定的待提交 changelist。
+//! reconcile 模式等价 P4V 的 `Reconcile Offline Work`（快 10–100 倍），`--clean` 等价
+//! `p4 clean`，`--sync` 等价 `p4 sync -f`；三者共用同一条扫描与摘要缓存管线：从服务器取
+//! depot 状态、扫描本地工作区、计算并缓存文件摘要，再比对两者。
 
 use std::env;
 use std::fs::File;
