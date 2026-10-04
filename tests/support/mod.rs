@@ -319,6 +319,52 @@ impl Sandbox {
         self.p4_ok(&["submit", "-d", "e2e fixture"]);
     }
 
+    /// 造 `total` 个两百字节上下的文本文件（每目录 100 个）：入库、同步，然后把本地
+    /// mtime 整体顶出 `have.syncTime ±1s` 的窗口——也就是「这一批文件的摘要都得真算」。
+    ///
+    /// 三处刻意不按 [`Sandbox::commit`] 那样逐文件来：
+    ///
+    /// 1. **一次 add、一次 submit**：两万个文件逐个 `commit()` 要起几万个 p4 进程，
+    ///    慢到没法当回归测试；`p4 add bulk/...` 一条命令就能全收。
+    /// 2. **sync 之后再回拨**：sync 会把本地文件重写一遍（mtime 就是同步时刻），
+    ///    所以回拨必须放在它后面，否则文件又落回窗口里、摘要被跳过。
+    /// 3. **顺手解只读位**：`noclobber` 让 sync 下来的文件只读，回拨要能写进去。
+    pub fn bulk_text_files(&self, total: usize) {
+        // 每目录一百个：真实的摘要批量重算不会是一个几十万文件的平铺目录，
+        // 分目录也让 `p4 add bulk/...` 的入库路径更像实际用法。
+        const PER_DIR: usize = 100;
+        let body = "0123456789abcdef\n".repeat(10);
+        for index in 0..total {
+            let path = self.client_root.join(format!(
+                "bulk/d{:03}/f{:03}.txt",
+                index / PER_DIR,
+                index % PER_DIR
+            ));
+            fs::create_dir_all(path.parent().expect("parent")).expect("create bulk dir");
+            // 首行带序号，**每个文件的内容都不一样**：缓冲复用哪天引入「上一个文件的残留
+            // 字节混进摘要」，每个文件的摘要会各自算错，断言里的「清单为空」立刻变红。
+            // 内容全都一样的话，这种回归算出来的摘要偏偏还是对的，等于白测。
+            fs::write(&path, format!("{index:07}\n{body}")).expect("write bulk file");
+        }
+
+        self.p4_ok(&["add", "bulk/..."]);
+        self.p4_ok(&["submit", "-d", "bulk fixture"]);
+        self.sync();
+
+        let mut pending = vec![self.client_root.join("bulk")];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).expect("read bulk dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    clear_readonly(&path);
+                    backdate(&path);
+                }
+            }
+        }
+    }
+
     /// `p4 sync -f`：把工作区强制拉回 have 状态。
     pub fn sync(&self) {
         self.p4_ok(&["sync", "-f"]);

@@ -1,5 +1,6 @@
 //! 文件摘要的计算与缓存复用。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -13,19 +14,55 @@ use rayon::prelude::*;
 use crate::READ_BUFFER_SIZE;
 use crate::model::{DigestType, HaveRecord, WorkspaceCache, WorkspaceCacheEntry, WorkspaceFile};
 
+thread_local! {
+    /// 读文件用的 128 KiB 缓冲，一个线程一块、反复用。
+    ///
+    /// **不能放栈上**：这两个函数会被内联进 rayon 的递归切分帧，而那个递归的深度随文件数
+    /// 增长（一批 N 个文件的摘要 ≈ log2(N) 层）。栈上每层一份 128 KiB，实测每层 131,592
+    /// 字节，几万个文件就能把默认 2 MiB 的工作线程栈压穿、进程直接 abort——`tests/e2e_stack.rs`
+    /// 守的就是这个。挪到堆上之后每层只剩几百字节，深度再长也和栈大小无关。
+    ///
+    /// **也不能是 `thread_local!` 里的数组**：glibc 的静态 TLS 是从线程栈顶上切出来的，
+    /// 那样等于又把 128 KiB 塞回了工作线程的栈。TLS 里只存一个 `Vec`（一个指针），
+    /// 缓冲本体在堆上。
+    ///
+    /// 之所以不是「每次 `vec![0u8; READ_BUFFER_SIZE]`」：那是最坏一档的每文件一次分配
+    /// ——正好卡在 glibc 的 mmap 阈值上，而且 `alloc_zeroed` 要白写 128 KiB。这里处理的
+    /// 恰恰是大量小文件，那笔开销不能忽略。TLS 是每线程一次。
+    ///
+    /// 不会重入：只有 [`compute_digest_binary`] 与 [`compute_digest_utf8`] 用它，两者互不调用
+    /// （[`compute_digest_symlink`] 转到 utf8 是顺序调用，那时还没有人持有借用）。真出现重入的话，
+    /// `RefCell` 会当场 panic（`already mutably borrowed`），而不是拿半块缓冲算出个错的摘要——
+    /// 对摘要工具来说，宁可炸也不能出静默的错值。
+    static READ_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 借出本线程的读缓冲，长度不足时补齐到 [`READ_BUFFER_SIZE`]。
+///
+/// 只增不减：缓冲用完不还，下个文件接着用——这正是要的效果。
+fn with_read_buffer<T>(f: impl FnOnce(&mut [u8]) -> T) -> T {
+    READ_BUFFER.with_borrow_mut(|buffer| {
+        if buffer.len() < READ_BUFFER_SIZE {
+            buffer.resize(READ_BUFFER_SIZE, 0);
+        }
+        f(buffer)
+    })
+}
+
 /// 算二进制文件的摘要：直接对内容做 MD5。
 pub(crate) fn compute_digest_binary(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
     let mut file = File::open(&file.path)?;
-    let mut buffer = [0; READ_BUFFER_SIZE];
 
-    loop {
-        match file.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(len) => hasher.update(&buffer[..len]),
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
+    with_read_buffer(|buffer| {
+        loop {
+            match file.read(buffer) {
+                Ok(0) => return Ok(()),
+                Ok(len) => hasher.update(&buffer[..len]),
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
         }
-    }
+    })
 }
 
 /// 按行更新文本摘要：每行先归一化换行，再喂给 hasher。
@@ -70,17 +107,20 @@ pub(crate) fn compute_digest_text(file: &WorkspaceFile, hasher: &mut Md5) -> Res
 /// 字节都没变。没有 BOM 的文件走解码器的透传路径，等同于直接读原始字节。
 pub(crate) fn compute_digest_utf8(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
     let file = File::open(&file.path)?;
-    let mut buffer = [0u8; READ_BUFFER_SIZE];
     let mut line_buffer = Vec::new();
 
-    let decoded = DecodeReaderBytesBuilder::new()
-        .utf8_passthru(false)
-        .bom_sniffing(true)
-        .strip_bom(true)
-        .build_with_buffer(file, &mut buffer[..])?;
+    // 缓冲为什么在 TLS 上而不是栈上，见 [`READ_BUFFER`]。解码器借用它，所以整段读循环
+    // 都得待在这个闭包里。长度必须仍是 128 KiB：`build()` 的默认缓冲只有 8 KiB。
+    with_read_buffer(|buffer| -> Result<()> {
+        let decoded = DecodeReaderBytesBuilder::new()
+            .utf8_passthru(false)
+            .bom_sniffing(true)
+            .strip_bom(true)
+            .build_with_buffer(file, &mut buffer[..])?;
 
-    let mut read = BufReader::with_capacity(READ_BUFFER_SIZE, decoded);
-    update_text_digest_utf8(&mut read, &mut line_buffer, hasher)
+        let mut read = BufReader::with_capacity(READ_BUFFER_SIZE, decoded);
+        update_text_digest_utf8(&mut read, &mut line_buffer, hasher)
+    })
 }
 
 /// 算符号链接的摘要。

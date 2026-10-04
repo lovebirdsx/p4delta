@@ -33,4 +33,22 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # `--ignore-default-filter` 把它补跑回来（见 ci.yml），门禁因此不缺这一环。
 #
 # `=` 是精确匹配，避免将来出现名字包含它的用例被连带排除。
-default-filter = 'not test(=both_delete_legs_report_their_own_failure)'
+#
+# `not binary(e2e_stack)` 排掉整个栈边界二进制（`tests/e2e_stack.rs`），理由与上一条不同：
+# 那两条用例**只在 release 档有意义**。dev 档里 `compute_digest_binary` 不进内联，128 KiB 读缓冲
+# 落在叶子帧上，递归帧只有几百字节——修复前拿 debug 跑它们是绿的，一条守不住任何东西的用例
+# 混在默认档里，只会让人以为摘要的栈边界有人看着。CI 另有一个 ubuntu + Windows 的 release job
+# 用 `--ignore-default-filter` 补跑（见 ci.yml），两万文件那条顺带在默认档省下十几秒。
+#
+# 按二进制整段排除而不是点名每一条：这个文件里的用例都是同一类（release 档才成立），
+# 将来往里加用例也不该悄悄回到快档。
+default-filter = 'not test(=both_delete_legs_report_their_own_failure) and not binary(e2e_stack)'
+
+# 两万文件那条用例自带一份两万文件的夹具，大头是造数据：建文件 + `p4 add`/`submit`/`sync`
+# （本机 8 核 release 热构建 15.6 秒，其中摘要本身不到 0.3 秒）。CI runner 只有 4 vCPU、
+# 磁盘更慢，Windows 上还要算上 Defender 逐个扫新建文件，按 3–6 倍估 45–90 秒——离上面 180 秒
+# 的全局上限不算宽裕。单独给它留 360 秒：夹具的规模正是这条用例存在的理由，不能靠缩水换时间。
+# 只放宽这一条而不是全局，别的用例卡住仍会在 180 秒被终止。
+[[profile.default.overrides]]
+filter = 'test(=twenty_thousand_files_fit_the_default_stack)'
+slow-timeout = { period = "120s", terminate-after = 3 }

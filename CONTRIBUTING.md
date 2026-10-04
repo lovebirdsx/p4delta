@@ -141,6 +141,30 @@ sync 模式的四组动作在 `tests/e2e_sync.rs` 里同样对着真实服务器
 
 这一轮是**一次性的人工核对**，没做成自动化（要连真实的 `songxiao_aki_branch_3.8_2`，CI 上跑不了），而且全程 dry run——`-a` 会动到那份真实工作区。所以它验证的是「取数、分类、集合」三者与原生一致；**「钉住的确实是目标那一版（`#34` 而非 `#35`）」只有沙箱用例有独立取证**（`p4 fstat` 读回的 `haveRev`），工具自己的输出里不打印目标版本号。
 
+### 摘要并行段的栈边界（`tests/e2e_stack.rs`）
+
+一批文件的摘要真要现算时（冷缓存 + mtime 被顶出 `have.syncTime ±1s`），rayon 的递归切分每层都会在栈上放一份读缓冲——只要那个缓冲还是 `[0u8; READ_BUFFER_SIZE]`。修复前实测：优化构建把 `compute_digest_binary` 内联进递归帧，`objdump` 里那一帧是 `sub $0x20000` + `sub $0x208` = **131,592 字节/层**，`gdb` 在 1 MiB 栈下数到的 8 层 helper 帧、相邻两层 `rsp` 差**全是 0x20420 = 132,128 字节**（多出来的 536 是 `join_context` 帧）。默认栈 2 MiB 下两万个文件必崩，进程以 `fatal runtime error: stack overflow` abort。现在缓冲在每线程的堆缓冲里（`src/digest.rs::READ_BUFFER`），那一帧降到 **968 字节**，**发布二进制**里 `sub $0x20000,%r11` 从 2 处变 0 处（release 的单测二进制里还剩 1 处，是刻意留着的对拍 oracle，理由见本节末）。
+
+**这两条用例只在 release 档有意义，dev 档是绿的、而且修复前也是绿的**——这与「栈边界」这一节的标题正好相反，值得写下来：dev 档里 `compute_digest_binary` 不进内联，那个 128 KiB 数组落在叶子帧上，递归帧只剩几百字节。所以：
+
+```bash
+# 本地复跑（会自己构建 release 的 bin 与测试）
+cargo nextest run --release --all-targets --all-features --locked \
+  --ignore-default-filter -E 'binary(e2e_stack)'
+```
+
+默认档用 `default-filter` 把整个 `e2e_stack` 二进制排掉（理由见 `.config/nextest.toml`：一条在 dev 档恒绿的用例守不住任何东西，还占十几秒），CI 由 `test-stack-release` job 在 **ubuntu-24.04 与 windows-latest** 上 `--release` 补跑。Windows 那条腿不是凑数：原始崩溃就出在 Windows（`0xC00000FD`），而 `test` 矩阵里 Windows 那份跑的是 dev 档、对这条 bug 恒绿；实测修复前的 Windows release 构建在用例参数下（1 MiB 栈 + 1000 文件）**3/3 崩**、修复后 3/3 过，这条腿有真实的红。`assert_cmd` 的 `cargo_bin("p4delta")` 读的是 `CARGO_BIN_EXE_p4delta`，所以 `--release` 一加，测的就是 release 二进制，测试代码一行不用改。
+
+崩溃**不是确定性的**：深度取决于任务被偷走的时机，同一个 N 会时崩时过（实测 2 MiB 栈下 450/520 偶发崩、480/500 不崩）。所以一千文件那条**刻意把线程栈压到 1 MiB**（`RUST_MIN_STACK=1048576`），让修复前必然触发；两万文件那条才用默认栈，量真实触发面。把栈压小不是调松测试，是把边界挪到必现的位置——在「有时崩有时不崩」的区间里做回归测试没有意义。
+
+夹具（`tests/support/mod.rs::bulk_text_files`）里**每个文件的内容都不一样**（首行是序号，后面才是那段重复正文）。理由：TLS 缓冲是跨文件复用的，万一哪天引入「上一个文件的残留字节混进摘要」，摘要会各自算错、`listed_changes` 的「清单为空」立刻红；内容全都一样的话，那种回归算出来偏偏还是对的，e2e 这一层等于白测（单测那边有对拍 oracle 兜着，但 e2e 自己该有的分辨力不该丢）。
+
+`src/digest.rs::oracle_utf8_digest` 里那个 `[0u8; READ_BUFFER_SIZE]` **刻意不动**：它是流式改造之前逐字保留的对拍 oracle，只在 `#[cfg(test)]` 里、由 `#[test]` 直接调用（叶子帧，不进 rayon 那条递归），发布二进制里没有它。改成堆分配只会稀释「与改造前逐字节一致」这个卖点——它守着的东西比它占的那 128 KiB 值钱。
+
+**深度是 log2(N) 量级，不是每文件一个固定量。** 判据是阈值随栈大小的增长方式：实测 1 MiB 栈下 64 个文件就开始崩（128 个偶尔能过），2 MiB 栈下 2000 个还稳过、4000 个必崩——栈翻一倍，能过的文件数涨三十倍以上；「每文件吃固定字节」的线性模型只允许涨两倍，对不上。`with_max_len(1)` 与这件事**无关**——把它改成 4096 或整条删掉，1 MiB 栈下 1000 与 100000 文件依旧 8/8 崩溃。原因在 rayon 的 `Splitter::try_split(stolen)`：任务一旦从别的线程注入/被偷（`parallel_compute_digests` 的根任务就是从主线程注入的），`splits` 每层都被重置回线程数、永远衰减不到 0，于是左脊一路分裂到单元素。**改切分策略不是修法**（那两条实验就是证据），修法只能是让每层不再带 128 KiB：`128 KiB × log2(N)` 换成 `968 字节 × log2(N)`——实测 10 万文件在 128 KiB 的线程栈上就稳过。
+
+**`RAYON_NUM_THREADS=1` 能让两万个文件跑过去，但那是几帧的边距，不是模型的反例。** 实测：单线程 + 默认栈 + 20000 文件 3/3 过；把栈压到 1 MiB 立刻 2/2 崩，把文件数提到 50000 / 100000 也各 3/3 崩——栈需求仍是「约 log2(N) 层 × 132 KiB」（20000 文件 ≈ 1.9 MB）这个量级，单线程恰好落在 2 MiB 预算的线内、八线程多出几帧落在线上。那几帧差在哪没有逐帧归因（rayon 调度内部的边角，与本次改动无关）；要点是**修法不能依赖「恰好没超」**。`gdb` 的回溯同时确认递归跑在 worker 线程的栈上（帧底是 `in_worker_cold` 注入的 job，往上 `ThreadBuilder::run`），不是主线程那 8 MiB。
+
 ## 项目结构
 
 ```

@@ -90,6 +90,46 @@ jobs:
           --ignore-default-filter
           -E 'test(=both_delete_legs_report_their_own_failure)'
 
+  # 摘要并行段的栈边界：`tests/e2e_stack.rs` 那两条用例只在 release 档成立（dev 档里
+  # 128 KiB 读缓冲不进递归帧，修复前也是绿的——实测同一份修复前源码 dev 档 2/2 过、
+  # release 档 2/2 崩），所以默认档用 default-filter 整段排掉，由这个 job 用
+  # `--ignore-default-filter` 补跑。
+  #
+  # 平台要 ubuntu 与 Windows 两条腿，macOS 不要：
+  # - 原始报告就是 Windows（退出码 0xC00000FD），而 test 矩阵里 Windows 那份跑的是 debug
+  #   档、对这条 bug 恒绿——不加这条腿，出事的那个平台等于没有运行时覆盖；
+  # - Windows 这条腿有真实的红：修复前的 release 构建在用例参数下（1 MiB 栈 + 1000 文件）
+  #   实测 3/3 崩，修复后 3/3 过，不是碰运气的绿；
+  # - macOS 给不出 debug 档给不了的信息（同样的 Mach-O 栈探测、同样的 2 MiB 默认栈），
+  #   一份 release 构建不便宜，不值得为它再买一条腿。
+  test-stack-release:
+    strategy:
+      # 一条腿挂了另一条腿的结果也要能看到（与 test job 同）。
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install p4 and p4d
+        shell: bash
+        run: bash scripts/fetch-p4-tools.sh
+      - uses: taiki-e/install-action@nextest
+      # `--release` 让 assert_cmd 解析到 target/release/p4delta（它读 CARGO_BIN_EXE_<name>），
+      # 测试代码一行都不用改。`--no-tests` 默认 fail 正好当护栏：用例被改名后匹配到 0 条，
+      # job 立刻红，不会悄悄退化成不跑。
+      - name: Run the stack-boundary tests against the release build
+        env:
+          P4_E2E_REQUIRED: "1"
+          # 后缀跟着平台走，只有 Windows 的二进制带 .exe（与 test job 同）。
+          P4_EXE: ${{ github.workspace }}/vendor/p4${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: >
+          cargo nextest run --release --all-targets --all-features --locked
+          --ignore-default-filter
+          -E 'binary(e2e_stack)'
+
   # 安装脚本的黑盒测试：把 install.ps1 与一个人造 exe 拷进临时目录再跑，
   # 断言生成的 customtools.xml 与幂等/卸载行为。不需要构建产物，所以独立于 test。
   # 最后一条用例会临时改写 runner 上的 HKCU\Environment\Path（验默认加 PATH、卸载摘掉，
