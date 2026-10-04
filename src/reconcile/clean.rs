@@ -14,9 +14,12 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 
-use super::changes::{Changes, render_title, report_group};
+use super::changes::{
+    Changes, GroupReport, GroupRow, NewFile, render_title, report_group, rows_from_new_files,
+};
 use super::delete_workspace_files;
 use crate::cli::Options;
+use crate::json::{Mode, sayln};
 use crate::model::DepotState;
 use crate::p4::process::{FailureMode, run_p4_command_batched};
 use crate::path::local_path_key;
@@ -47,7 +50,10 @@ pub(crate) struct RestoreFile {
 #[derive(Debug)]
 pub(crate) struct CleanChanges {
     /// 工作区有、depot 无：删掉工作区里的文件。
-    delete: Vec<String>,
+    ///
+    /// 复用 open 模式的 `add` 类：它是同一批文件的另一个方向，depot 路径的来源也一样
+    /// （`p4 where` 的映射，见 [`NewFile`]）。
+    delete: Vec<NewFile>,
 
     /// 已改动、未打开：还原成 have revision。
     revert: Vec<RestoreFile>,
@@ -68,6 +74,9 @@ enum CleanAction {
 
 /// 一类变更在报告与执行上的全部差异。
 struct CleanGroupSpec {
+    /// JSON 记录的 `class`，见 `docs/json-contract.md`。
+    id: &'static str,
+
     /// `-l` 清单里每行的前缀，例如 `Delete` / `Revert`。
     label: &'static str,
 
@@ -83,16 +92,19 @@ struct CleanGroupSpec {
 /// 在一个会毁数据的工具上就是主动误导。
 const CLEAN_GROUPS: [CleanGroupSpec; 3] = [
     CleanGroupSpec {
+        id: "delete",
         label: "Delete",
         title: "      Deleting {} files in workspace, not in depot or deleted at have revision, but not checked out for add.",
         action: CleanAction::DeleteFromDisk,
     },
     CleanGroupSpec {
+        id: "revert",
         label: "Revert",
         title: "      Reverting {} files in workspace, changed from have revision, but not checked out for edit.",
         action: CleanAction::RestoreToHave,
     },
     CleanGroupSpec {
+        id: "restore",
         label: "Restore",
         title: "      Restoring {} files not in workspace, but not checked out for delete.",
         action: CleanAction::RestoreToHave,
@@ -102,7 +114,7 @@ const CLEAN_GROUPS: [CleanGroupSpec; 3] = [
 /// 一类变更名下的文件。两类的元素类型不同（要删的路径 vs 要还原的规格），
 /// 用一个枚举把报告需要的公共部分取出来。
 enum CleanGroupFiles<'a> {
-    Delete(&'a [String]),
+    Delete(&'a [NewFile]),
     Restore(&'a [RestoreFile]),
 }
 
@@ -118,16 +130,19 @@ impl<'a> CleanGroupFiles<'a> {
         self.len() == 0
     }
 
-    /// `-l` 清单里的名字：一律是 client 路径，与 `p4 clean -l` 的 local syntax 口径一致。
-    ///
-    /// 返回的借用直接指向 `'a`（`CleanChanges`）而不是 `&self`：调用方常在遍历 `groups()`
-    /// 的闭包里用这个名字，那里拿到的 `CleanGroupFiles` 是临时值。
-    fn client_files(&self) -> Vec<&'a str> {
+    /// 这一组要报告的行。两个路径与 have 版本都从各自的元素里取：要删的那类走 `p4 where`
+    /// 的映射（它 depot 里根本没有记录），要还原的那类走 depot 记录。
+    fn rows(&self) -> Result<Vec<GroupRow<'a>>> {
         match *self {
-            CleanGroupFiles::Delete(files) => files.iter().map(String::as_str).collect(),
-            CleanGroupFiles::Restore(files) => {
-                files.iter().map(|file| file.client_file.as_str()).collect()
-            }
+            CleanGroupFiles::Delete(files) => rows_from_new_files(files),
+            CleanGroupFiles::Restore(files) => Ok(files
+                .iter()
+                .map(|file| GroupRow {
+                    client_file: file.client_file.as_str(),
+                    depot_file: file.depot_file.as_str(),
+                    rev: Some(file.have_rev),
+                })
+                .collect()),
         }
     }
 }
@@ -227,13 +242,13 @@ pub(crate) async fn apply_clean(
     clean: &CleanChanges,
 ) -> Result<()> {
     if options.apply {
-        println!("   Cleaning the workspace to match the depot.");
+        sayln!("   Cleaning the workspace to match the depot.");
         // 走 stdout 而不是 stderr：它是报告的一部分，和下面的标题、清单交织成一段话；
         // stderr 在这个项目里只用于「运行中出了意外」。
-        println!("      WARNING: this deletes files that are not in the depot and discards local");
-        println!("      changes to files that are not opened. It cannot be undone.");
+        sayln!("      WARNING: this deletes files that are not in the depot and discards local");
+        sayln!("      changes to files that are not opened. It cannot be undone.");
     } else {
-        println!("   Counting files to clean (dry run).")
+        sayln!("   Counting files to clean (dry run).")
     }
 
     let start_time = Instant::now();
@@ -244,11 +259,20 @@ pub(crate) async fn apply_clean(
             continue;
         }
 
+        // 行要在报告之前备齐：缺 depot 映射是「这一轮不该继续」的错误，不能先报一半
+        // 再失败——那半份报告会被读成完整答案。
+        let rows = files.rows()?;
+
         report_group(
-            spec.label,
-            &render_title(spec.title, files.len()),
-            options.list,
-            files.client_files(),
+            &GroupReport {
+                mode: Mode::Clean,
+                id: spec.id,
+                label: spec.label,
+                title: &render_title(spec.title, rows.len()),
+                list: options.list,
+                applied: options.apply,
+            },
+            &rows,
         );
 
         if !options.apply {
@@ -259,7 +283,12 @@ pub(crate) async fn apply_clean(
         // 不该让另外几百个留在原地。做完能做的，最后一起报。
         let result = match (spec.action, &files) {
             (CleanAction::DeleteFromDisk, CleanGroupFiles::Delete(files)) => {
-                delete_workspace_files(files)
+                delete_workspace_files(
+                    &files
+                        .iter()
+                        .map(|file| file.client_file.clone())
+                        .collect::<Vec<_>>(),
+                )
             }
             (CleanAction::RestoreToHave, CleanGroupFiles::Restore(files)) => {
                 restore_to_have(options, work_dir, files).await
@@ -288,17 +317,17 @@ pub(crate) async fn apply_clean(
             );
         }
 
-        println!(
+        sayln!(
             "      Cleaned {total} files in {} seconds.",
             start_time.elapsed().as_secs_f32()
         );
-        println!("Workspace matches the depot.");
+        sayln!("Workspace matches the depot.");
     } else {
-        println!(
+        sayln!(
             "      Counted {total} files to clean in {} seconds.",
             start_time.elapsed().as_secs_f32()
         );
-        println!("Re-run with -a to clean the workspace.");
+        sayln!("Re-run with -a to clean the workspace.");
     }
 
     Ok(())
@@ -336,10 +365,18 @@ mod tests {
         }
     }
 
+    /// 一个带 depot 映射的新增文件：clean 的 `delete` 类是它在删盘方向上的另一面。
+    fn new_file(client_file: &str) -> NewFile {
+        NewFile {
+            client_file: client_file.to_owned(),
+            depot_file: Some(format!("//depot/{client_file}")),
+        }
+    }
+
     /// 三类各放一个可区分的文件名，用来验证标签与文件的配对。
     fn clean_with_one_file_each() -> CleanChanges {
         CleanChanges {
-            delete: vec!["delete.txt".to_owned()],
+            delete: vec![new_file("delete.txt")],
             revert: vec![restore_file("revert.txt", "//depot/revert.txt", 1)],
             restore: vec![restore_file("restore.txt", "//depot/restore.txt", 2)],
         }
@@ -348,7 +385,7 @@ mod tests {
     /// 八类各放一个可区分的文件名。
     fn changes_with_one_file_each() -> Changes {
         Changes {
-            add: vec!["add.txt".to_owned()],
+            add: vec![new_file("add.txt")],
             edit: vec!["edit.txt".to_owned()],
             reopen_edit: vec!["reopen_edit.txt".to_owned()],
             delete: vec!["delete.txt".to_owned()],
@@ -367,19 +404,41 @@ mod tests {
     fn clean_group_order_matches_the_three_clean_fields() {
         let clean = clean_with_one_file_each();
 
-        let observed: Vec<(&str, Vec<&str>)> = clean
+        let observed: Vec<(&str, Vec<String>)> = clean
             .groups()
-            .map(|(spec, files)| (spec.label, files.client_files()))
+            .map(|(spec, files)| {
+                let rows = files.rows().expect("两个路径都齐，不该失败");
+                (
+                    spec.label,
+                    rows.iter().map(|row| row.client_file.to_owned()).collect(),
+                )
+            })
             .collect();
 
         assert_eq!(
             observed,
             vec![
-                ("Delete", vec!["delete.txt"]),
-                ("Revert", vec!["revert.txt"]),
-                ("Restore", vec!["restore.txt"]),
+                ("Delete", vec!["delete.txt".to_owned()]),
+                ("Revert", vec!["revert.txt".to_owned()]),
+                ("Restore", vec!["restore.txt".to_owned()]),
             ]
         );
+    }
+
+    /// 每一行都带齐两个路径：`depotFile` 在记录里是必填项，而 clean 的 `delete` 类
+    /// 是三个类里唯一没有 depot 记录、只能靠 `p4 where` 映射的一类。
+    #[test]
+    fn every_clean_row_carries_both_paths() {
+        for (spec, files) in clean_with_one_file_each().groups() {
+            let rows = files.rows().unwrap();
+            assert_eq!(rows.len(), 1, "{}", spec.label);
+            assert!(
+                rows[0].depot_file.starts_with("//depot/"),
+                "{}: {}",
+                spec.label,
+                rows[0].depot_file
+            );
+        }
     }
 
     /// 动作与字段类型必须一一配齐。配错了 `apply_clean` 会走 `bail!` 分支中止整轮，
@@ -431,7 +490,7 @@ mod tests {
         let clean = CleanChanges::project(&changes_with_one_file_each(), &depot).unwrap();
 
         assert_eq!(clean.total(), 3);
-        assert_eq!(clean.delete, ["add.txt"]);
+        assert_eq!(clean.delete, [new_file("add.txt")]);
         assert_eq!(
             clean.revert,
             [restore_file("edit.txt", "//depot/edit.txt", 3)]

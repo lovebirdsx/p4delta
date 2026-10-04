@@ -8,6 +8,7 @@ use std::env;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use crate::json::sayln;
 use encoding_rs::{Encoding, UTF_8, WINDOWS_1252};
 
 /// p4 写输出用的字符集，启动时解析一次。
@@ -57,14 +58,14 @@ pub(crate) fn init_p4_encoding(explicit: Option<&str>, cwd: &Path) -> &'static E
 
     let (encoding, source) = resolve_p4_charset(explicit, env_charset.as_deref(), &settings);
     let _ = P4_ENCODING.set(encoding);
-    println!("Using p4 charset {} ({}).", encoding.name(), source);
+    sayln!("Using p4 charset {} ({}).", encoding.name(), source);
 
     let (command_encoding, command_source) =
         resolve_command_charset(env_command_charset.as_deref(), &settings, encoding);
     let _ = P4_COMMAND_ENCODING.set(command_encoding);
     // 两者一致时不打第二行：这是绝大多数情况，多说一句只是噪音。
     if command_encoding != encoding {
-        println!(
+        sayln!(
             "Using p4 command charset {} ({}).",
             command_encoding.name(),
             command_source

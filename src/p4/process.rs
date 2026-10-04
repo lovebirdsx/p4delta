@@ -18,6 +18,7 @@ use crate::charset::{
     decode_p4_bytes, p4_command_encoding, p4_encoding, strip_bom, trim_line_ending,
 };
 use crate::cli::Options;
+use crate::json::sayln;
 use crate::model::HaveRecord;
 use crate::p4::marshal::MarshalStreamParser;
 
@@ -124,7 +125,7 @@ pub(crate) async fn run_p4_have(
     work_dir: &str,
     specs: &[String],
 ) -> Result<HashMap<String, HaveRecord>> {
-    println!("   Querying file sync timestamps.");
+    sayln!("   Querying file sync timestamps.");
     let start_time = Instant::now();
 
     let (mut cmd, payload) = build_p4_command(
@@ -137,7 +138,7 @@ pub(crate) async fn run_p4_have(
     );
 
     if options.verbose {
-        println!("    Running: p4 -G have {}", specs.join(" "));
+        sayln!("    Running: p4 -G have {}", specs.join(" "));
     }
 
     let mut child = cmd.spawn()?;
@@ -180,7 +181,7 @@ pub(crate) async fn run_p4_have(
         );
     }
 
-    println!(
+    sayln!(
         "      Query complete in {} seconds.",
         start_time.elapsed().as_secs_f32()
     );
@@ -593,7 +594,7 @@ pub(crate) async fn run_p4_command_batched(
 ) -> Result<Vec<String>> {
     let batches = compute_batches(batched_args);
 
-    println!(
+    sayln!(
         "      Running \"p4 {}\" with {} batches.",
         always_args[0],
         batches.len()

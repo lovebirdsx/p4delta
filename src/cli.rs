@@ -65,6 +65,28 @@ pub struct Options {
     /// 默认取环境变量或 `p4 set` 里的 P4CHARSET。
     #[arg(long)]
     pub(crate) charset: Option<String>,
+
+    /// 机器可读输出：stdout 只出 JSON Lines，人类可读的报告整体改道 stderr。
+    /// 契约（记录形状与硬条款）见 `docs/json-contract.md`。
+    #[arg(long)]
+    pub(crate) json: bool,
+
+    /// clientspec 的根目录。**只**用来把本地路径拼成 client 语法（记录里的 `clientFile`），
+    /// 不参与任何范围判断。不给时自己去问一次 `p4 info`——窄查询正是靠这个开关省掉那趟往返。
+    #[arg(long, value_name = "PATH")]
+    pub(crate) client_root: Option<String>,
+
+    /// 忽略工作区里的 `.p4delta-scope`，范围只认命令行。给编辑器用的：范围由它自己持有
+    /// （聚焦目录 + 排除项），不该在别人的配置上再叠一层。
+    #[arg(long)]
+    pub(crate) no_scope_file: bool,
+
+    /// 让 open 模式的三组 revert 让位给 `p4 reconcile -a -e -d` 的语义：`revert_add` /
+    /// `revert_edit` 消失，`revert_delete` 并进 `reopen_edit`（原生 `-e` 对「文件还在、
+    /// 却被 open for delete」一律改开成 edit，与内容无关）。加上这个开关，输出逐行等于原生
+    /// reconcile。
+    #[arg(long)]
+    pub(crate) no_revert_groups: bool,
 }
 
 #[cfg(test)]
@@ -128,6 +150,47 @@ mod tests {
 
         let without_flag = Options::parse_from(["p4delta", "-w", "ws"]);
         assert!(!without_flag.no_prune_ignored_dirs);
+    }
+
+    /// 编辑器的四个开关：三个布尔 + 一个取值的路径。取值那个要能缺省（缺省时自己去问
+    /// `p4 info`），不能因为没给就变成用法错误。
+    #[test]
+    fn the_programmatic_flags_are_wired_up() {
+        let parsed = Options::parse_from([
+            "p4delta",
+            "-w",
+            "ws",
+            "--json",
+            "--client-root",
+            "/ws",
+            "--no-scope-file",
+            "--no-revert-groups",
+        ]);
+        assert!(parsed.json);
+        assert_eq!(parsed.client_root.as_deref(), Some("/ws"));
+        assert!(parsed.no_scope_file);
+        assert!(parsed.no_revert_groups);
+
+        let bare = Options::parse_from(["p4delta", "-w", "ws"]);
+        assert!(!bare.json);
+        assert_eq!(bare.client_root, None);
+        assert!(!bare.no_scope_file);
+        assert!(!bare.no_revert_groups);
+    }
+
+    /// `--no-revert-groups` 是 open 模式的措辞。clean / sync 下没有那三组，但也不该是
+    /// 用法错误——编辑器对三个模式共用同一份参数拼装（照 `clean_tolerates_a_changelist`
+    /// 的立场：模式里无意义的东西放行，有意义的东西才拦）。
+    #[test]
+    fn no_revert_groups_is_tolerated_in_the_other_modes() {
+        for mode in ["--clean", "--sync"] {
+            let parsed =
+                Options::try_parse_from(["p4delta", mode, "-w", "ws", "--no-revert-groups"])
+                    .unwrap_or_else(|error| {
+                        panic!("{mode} 下给 --no-revert-groups 不该是用法错误：{error}")
+                    });
+            assert!(parsed.no_revert_groups);
+        }
     }
 
     /// `p4delta.exe.manifest` 的程序集版本是仓库里唯一没法自动生成的一处版本号

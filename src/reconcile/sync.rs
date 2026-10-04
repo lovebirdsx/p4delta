@@ -15,11 +15,12 @@ use std::time::Instant;
 use anyhow::{Result, anyhow, bail};
 
 use super::analyze::{SyncAnalysis, SyncSource, analyze_at_target};
-use super::changes::{render_title, report_group};
+use super::changes::{GroupReport, GroupRow, render_title, report_group};
 use super::{HashStats, delete_workspace_files};
 use crate::cache::{CacheWriter, save_cache};
 use crate::cli::Options;
 use crate::digest::{CachePolicy, is_unchanged_since_sync, parallel_compute_digests};
+use crate::json::{HandoffFile, Mode, sayln};
 use crate::model::{DepotState, HaveRecord, TargetMap, WorkspaceCache, WorkspaceState};
 use crate::p4::process::{FailureMode, run_p4_command_batched};
 
@@ -85,6 +86,9 @@ enum SyncAction {
 
 /// 一类变更在报告与执行上的全部差异。
 struct SyncGroupSpec {
+    /// JSON 记录的 `class`，见 `docs/json-contract.md`。
+    id: &'static str,
+
     /// `-l` 清单里每行的前缀，例如 `Update` / `Revert`。
     label: &'static str,
 
@@ -101,16 +105,19 @@ struct SyncGroupSpec {
 /// （立场同 `clean.rs` 里那段「标题与动作必须一致」的注释）。
 const SYNC_GROUPS: [SyncGroupSpec; 4] = [
     SyncGroupSpec {
+        id: "update",
         label: "Update",
         title: "      Updating {} files in workspace to the target depot revision.",
         action: SyncAction::SyncToTarget,
     },
     SyncGroupSpec {
+        id: "revert",
         label: "Revert",
         title: "      Reverting {} files in workspace, changed from the target revision, but not checked out for edit.",
         action: SyncAction::SyncToTarget,
     },
     SyncGroupSpec {
+        id: "restore",
         label: "Restore",
         title: "      Restoring {} files not in workspace, at the target depot revision.",
         action: SyncAction::SyncToTarget,
@@ -119,6 +126,7 @@ const SYNC_GROUPS: [SyncGroupSpec; 4] = [
     // 该路径不在库」的文件，其中既可能是目标处已是删除版本，也可能是（`--to <CL>` 下）
     // 目标时刻它还没进 depot。「not present」把两种都盖住了。
     SyncGroupSpec {
+        id: "delete",
         label: "Delete",
         title: "      Deleting {} files in workspace, not present in the depot at the target revision.",
         action: SyncAction::DeleteFromDisk,
@@ -144,18 +152,30 @@ impl<'a> SyncGroupFiles<'a> {
         self.len() == 0
     }
 
-    /// `-l` 清单里的名字：一律是 client 路径，与 `p4 sync -l` 的 local syntax 口径一致。
+    /// 这一组要报告的行：两个路径都在元素上（要同步的那类还带着目标修订）。
     ///
-    /// 返回的借用直接指向 `'a`（`SyncChanges`）而不是 `&self`：调用方常在遍历 `groups()`
-    /// 的闭包里用这个名字，那里拿到的 `SyncGroupFiles` 是临时值。
-    fn client_files(&self) -> Vec<&'a str> {
-        match *self {
-            SyncGroupFiles::Sync(files) => {
-                files.iter().map(|file| file.client_file.as_str()).collect()
-            }
-            SyncGroupFiles::Delete(files) => {
-                files.iter().map(|file| file.client_file.as_str()).collect()
-            }
+    /// 借用指向 `'a`（`SyncChanges`）而不是 `&self`：调用方常在遍历 `groups()` 的闭包里
+    /// 用它，那里拿到的 `SyncGroupFiles` 是临时值。
+    ///
+    /// 删除组没有 `rev`：那一行的意思是「目标时刻它不该在」，没有一个版本号说得通。
+    fn rows(&self) -> Vec<GroupRow<'a>> {
+        match self {
+            SyncGroupFiles::Sync(files) => files
+                .iter()
+                .map(|file| GroupRow {
+                    client_file: file.client_file.as_str(),
+                    depot_file: file.depot_file.as_str(),
+                    rev: Some(file.target_rev),
+                })
+                .collect(),
+            SyncGroupFiles::Delete(files) => files
+                .iter()
+                .map(|file| GroupRow {
+                    client_file: file.client_file.as_str(),
+                    depot_file: file.depot_file.as_str(),
+                    rev: None,
+                })
+                .collect(),
         }
     }
 }
@@ -335,13 +355,13 @@ pub(crate) async fn apply_sync(
     sync: &SyncChanges,
 ) -> Result<()> {
     if options.apply {
-        println!("   Syncing the workspace to the target depot revision.");
+        sayln!("   Syncing the workspace to the target depot revision.");
     } else {
-        println!("   Counting files to sync (dry run).")
+        sayln!("   Counting files to sync (dry run).")
     }
     // 预演也打这句（clean 只在 -a 时打）：sync 相对 clean 的卖点正是「不删未跟踪的文件」，
     // 而「会覆盖未打开文件的本地改动」是它的代价。授权之前就得看得见代价。
-    println!(
+    sayln!(
         "      WARNING: this overwrites local changes to files that are not opened. It cannot be undone."
     );
 
@@ -354,10 +374,15 @@ pub(crate) async fn apply_sync(
         }
 
         report_group(
-            spec.label,
-            &render_title(spec.title, files.len()),
-            options.list,
-            files.client_files(),
+            &GroupReport {
+                mode: Mode::Sync,
+                id: spec.id,
+                label: spec.label,
+                title: &render_title(spec.title, files.len()),
+                list: options.list,
+                applied: options.apply,
+            },
+            &files.rows(),
         );
 
         if !options.apply {
@@ -397,21 +422,21 @@ pub(crate) async fn apply_sync(
             );
         }
 
-        println!(
+        sayln!(
             "      Synced {total} files in {} seconds.",
             start_time.elapsed().as_secs_f32()
         );
         // 只有 --verify-all 才敢说这句话：默认档靠 mtime 捷径与摘要缓存跳过了一部分文件，
         // 那些文件的「没变」是推断出来的，没被验证过。承诺必须与档位匹配。
         if options.verify_all {
-            println!("The synced files match the target depot revision.");
+            sayln!("The synced files match the target depot revision.");
         }
     } else {
-        println!(
+        sayln!(
             "      Counted {total} files to sync in {} seconds.",
             start_time.elapsed().as_secs_f32()
         );
-        println!("Re-run with -a to sync the workspace.");
+        sayln!("Re-run with -a to sync the workspace.");
     }
 
     Ok(())
@@ -421,11 +446,14 @@ pub(crate) async fn apply_sync(
 pub(crate) struct SyncPlan {
     pub(crate) changes: SyncChanges,
 
-    /// 算不出摘要的文件（depot 语法），转交原生 `p4 sync` 处理。
+    /// 算不出摘要的文件，转交原生 `p4 sync` 处理。
     ///
     /// 交给调用方而不是在这里处理：那是一次真正的动作（预演时还要加 `-n`），
     /// 得和其余转交点一起走 `run_p4_command_batched` 那套失败判据。
-    pub(crate) unsupported: Vec<String>,
+    ///
+    /// 两个路径都带着：下发命令只用 depot 语法（与其余转交点同一口径），而记录里的
+    /// `clientFile` 只有本地路径拼得出来——client 语法要从它翻（见 [`HandoffFile`]）。
+    pub(crate) unsupported: Vec<HandoffFile>,
 }
 
 /// sync 模式的分析管线：按目标版本分类 → 只对「目标版本没变」的文件算摘要 → 投影成动作。
@@ -438,16 +466,16 @@ pub(crate) async fn build_sync_changes(
     cache: &mut WorkspaceCache,
     cache_writer: &mut Option<CacheWriter>,
 ) -> Result<SyncPlan> {
-    println!("   Analyzing files against the target depot revision.");
+    sayln!("   Analyzing files against the target depot revision.");
     let start_time = Instant::now();
     let mut analysis = analyze_at_target(depot, workspace, target)?;
-    println!(
+    sayln!(
         "      Analysis complete in {} seconds.",
         start_time.elapsed().as_secs_f32()
     );
 
     if !analysis.archived.is_empty() {
-        println!(
+        sayln!(
             "Skipped {} archived file(s): their contents live in an archive depot, so there is nothing to compare.",
             analysis.archived.len()
         );
@@ -464,7 +492,7 @@ pub(crate) async fn build_sync_changes(
         })
         .count();
     if never_synced > 0 {
-        println!(
+        sayln!(
             "Found {never_synced} file(s) this client has never synced; their local copies will be overwritten."
         );
     }
@@ -477,7 +505,7 @@ pub(crate) async fn build_sync_changes(
         .filter(|entry| entry.record.have_rev.is_none())
         .count();
     if never_synced_delete > 0 {
-        println!(
+        sayln!(
             "Found {never_synced_delete} file(s) this client has never synced; their local copies will be deleted."
         );
     }
@@ -504,7 +532,7 @@ pub(crate) async fn build_sync_changes(
             let percentage = (skipped.len() * 100)
                 .checked_div(total_candidates)
                 .unwrap_or(0);
-            println!(
+            sayln!(
                 "   Timestamp optimization: Skipped {} of {} digest computations ({}%).",
                 skipped.len(),
                 total_candidates,
@@ -513,7 +541,7 @@ pub(crate) async fn build_sync_changes(
         }
 
         if !needs_digest.is_empty() {
-            println!("   Checking digests for {} files.", needs_digest.len());
+            sayln!("   Checking digests for {} files.", needs_digest.len());
 
             let mut hashed = HashStats::new();
 
@@ -543,7 +571,7 @@ pub(crate) async fn build_sync_changes(
                     drifted.push(check.source);
 
                     if options.verbose {
-                        println!("         File \"{}\" digest is wrong.", outcome.file.path);
+                        sayln!("         File \"{}\" digest is wrong.", outcome.file.path);
                     }
                 }
             }
@@ -557,7 +585,10 @@ pub(crate) async fn build_sync_changes(
         unsupported: analysis
             .unsupported
             .iter()
-            .map(|record| record.depot_file.clone())
+            .map(|record| HandoffFile {
+                depot_file: record.depot_file.clone(),
+                client_file: record.client_file.clone(),
+            })
             .collect(),
     })
 }
@@ -629,21 +660,54 @@ mod tests {
     fn sync_group_order_matches_the_four_sync_fields() {
         let sync = sync_with_one_file_each();
 
-        let observed: Vec<(&str, Vec<&str>)> = sync
+        let observed: Vec<(&str, Vec<String>)> = sync
             .groups()
-            .map(|(spec, files)| (spec.label, files.client_files()))
+            .map(|(spec, files)| {
+                (
+                    spec.label,
+                    files
+                        .rows()
+                        .iter()
+                        .map(|row| row.client_file.to_owned())
+                        .collect(),
+                )
+            })
             .collect();
 
         assert_eq!(
             observed,
             vec![
-                ("Update", vec!["update.txt"]),
-                ("Revert", vec!["revert.txt"]),
-                ("Restore", vec!["restore.txt"]),
-                ("Delete", vec!["delete.txt"]),
+                ("Update", vec!["update.txt".to_owned()]),
+                ("Revert", vec!["revert.txt".to_owned()]),
+                ("Restore", vec!["restore.txt".to_owned()]),
+                ("Delete", vec!["delete.txt".to_owned()]),
             ]
         );
         assert_eq!(sync.total(), 4);
+    }
+
+    /// 每一行都带齐两个路径；`rev` 只有删除组缺席——那一行的意思是「目标时刻它不该在」，
+    /// 没有一个版本号说得通。
+    #[test]
+    fn every_sync_row_carries_both_paths() {
+        for (spec, files) in sync_with_one_file_each().groups() {
+            let rows = files.rows();
+            assert_eq!(rows.len(), 1, "{}", spec.label);
+            assert!(
+                rows[0].depot_file.starts_with("//depot/"),
+                "{}: {}",
+                spec.label,
+                rows[0].depot_file
+            );
+
+            let expected_rev = match spec.id {
+                "update" => Some(2),
+                "revert" => Some(3),
+                "restore" => Some(4),
+                _ => None,
+            };
+            assert_eq!(rows[0].rev, expected_rev, "{}", spec.label);
+        }
     }
 
     /// 动作与字段类型必须一一配齐。配错了 `apply_sync` 会走 `bail!` 分支中止整轮，

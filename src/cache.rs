@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::READ_BUFFER_SIZE;
+use crate::json::sayln;
 use crate::model::WorkspaceCache;
 
 /// 分阶段把摘要缓存落盘。
@@ -169,7 +170,7 @@ impl CacheWriter {
         self.last_save = Instant::now();
         self.entries_at_last_save = cache.file_map.len();
 
-        println!(
+        sayln!(
             "    Saved {} cached digests to {}.",
             cache.file_map.len(),
             self.path.display()

@@ -12,6 +12,7 @@ use hex::FromHex;
 use crate::READ_BUFFER_SIZE;
 use crate::charset::{decode_p4_bytes, p4_encoding, strip_bom, trim_line_ending};
 use crate::cli::Options;
+use crate::json::sayln;
 use crate::model::{DepotFileRecord, DepotState, FileAction, TargetMap, TargetRecord};
 use crate::p4::process::{
     MAX_PARALLEL_P4_COMMANDS, P4Pipes, build_p4_command, compute_batches, read_p4_stderr,
@@ -162,7 +163,7 @@ pub(crate) async fn run_p4_fstat_slice(
             let line = trim_line_ending(line);
 
             if verbose {
-                println!("{}", String::from_utf8_lossy(line));
+                sayln!("{}", String::from_utf8_lossy(line));
             }
 
             parser.push_line(line)?;
@@ -209,7 +210,7 @@ pub(crate) async fn run_p4_fstat_batched(
 ) -> Result<Vec<DepotFileRecord>> {
     let batches = compute_batches(batched_args);
 
-    println!(
+    sayln!(
         "      Running \"p4 {}\" with {} batches.",
         fstat_args[0],
         batches.len()
@@ -407,7 +408,7 @@ pub(crate) async fn run_p4_fstat_at_revision(
     changelist: u32,
     specs: &[String],
 ) -> Result<TargetMap> {
-    println!("   Requesting depot state for changelist {changelist}.");
+    sayln!("   Requesting depot state for changelist {changelist}.");
     let start_time = Instant::now();
 
     // 版本说明符拼在每个入口的 file spec 后面，与路径一样经 stdin 发放。
@@ -418,7 +419,7 @@ pub(crate) async fn run_p4_fstat_at_revision(
     let records = run_p4_fstat_batched(options, work_dir, &FSTAT_ARGS, &query, true).await?;
     let target = snapshot_target(&records);
 
-    println!(
+    sayln!(
         "      Received {} fstat records for changelist {} in {} seconds.",
         target.len(),
         changelist,
@@ -436,7 +437,7 @@ pub(crate) async fn run_p4_fstat_all(
     work_dir: &str,
     specs: &[String],
 ) -> Result<(DepotState, Option<TargetMap>)> {
-    println!("   Requesting depot state for all files.");
+    sayln!("   Requesting depot state for all files.");
     let start_time = Instant::now();
 
     let mut depot_state: DepotState = Default::default();
@@ -470,14 +471,16 @@ pub(crate) async fn run_p4_fstat_all(
         old_records.push([record.depot_file.clone(), have_rev.to_string()].join("#"));
 
         if options.verbose {
-            println!(
+            sayln!(
                 "         File \"{}\" is outdated (head rev {}, have rev {}",
-                record.depot_file, head_rev, have_rev
+                record.depot_file,
+                head_rev,
+                have_rev
             );
         }
     }
 
-    println!(
+    sayln!(
         "      Received {} fstat records in {} seconds.",
         depot_state.file_records.len(),
         start_time.elapsed().as_secs_f32()
@@ -485,7 +488,7 @@ pub(crate) async fn run_p4_fstat_all(
 
     // 为这些落后的文件补查记录，把摘要换成本地那一版的。
     if !old_records.is_empty() {
-        println!(
+        sayln!(
             "   Requesting depot state for {} outdated files.",
             old_records.len()
         );
@@ -520,7 +523,7 @@ pub(crate) async fn run_p4_fstat_all(
                     original_record.digest = refreshed_record.digest;
 
                     if options.verbose {
-                        println!(
+                        sayln!(
                             "         Updated record for \"{}\"",
                             original_record.depot_file
                         );
@@ -535,7 +538,7 @@ pub(crate) async fn run_p4_fstat_all(
             }
         }
 
-        println!(
+        sayln!(
             "      Updated {} fstat records in {} seconds.",
             refreshed_records.len(),
             start_time.elapsed().as_secs_f32()

@@ -20,6 +20,7 @@ mod cache;
 mod charset;
 mod cli;
 mod digest;
+mod json;
 mod locate;
 mod model;
 mod p4;
@@ -34,6 +35,7 @@ mod test_util;
 
 use crate::cache::{CacheWriter, save_cache};
 use crate::charset::init_p4_encoding;
+use crate::json::{Mode, sayln};
 use crate::locate::check_p4_exe_env;
 use crate::model::WorkspaceCache;
 use crate::reconcile::reconcile_scope;
@@ -48,7 +50,48 @@ pub(crate) const READ_BUFFER_SIZE: usize = 128 * 1024;
 /// 按给定的参数跑一次 reconcile。
 ///
 /// 参数由调用方（二进制入口）解析后传入，这样库本身不依赖进程级的参数解析。
+///
+/// 入口与 [`run_once`] 之间夹着 JSON 模式的 summary：**任何**返回路径（成功、`bail!`、
+/// 早退）都要发一条 `kind:"summary"`，消费方靠它在「跑完了」与「跑挂了」之间划线。
+/// 写成包一层而不是散在各个 `return` 上，是因为后者迟早会漏一处，而漏掉的那处会被读成
+/// 「没有结论」——那还算好的；真正糟的是漏在成功路径上，整轮工作白做。
 pub fn run(mut options: Options) -> Result<()> {
+    json::set_json_mode(options.json);
+    let start_time = Instant::now();
+
+    let result = run_once(&mut options);
+    let mode = mode_of(&options);
+
+    if let Err(error) = &result {
+        // 人读的版本仍走 stderr（`main` 那边照着既有格式再打一遍），记录里那一份是给
+        // 消费方做诊断用的：它未必去翻 stderr。
+        json::emit_error(None, &format!("{error:#}"));
+    }
+    json::emit_summary(
+        mode,
+        result.is_ok(),
+        options.apply,
+        start_time.elapsed().as_millis(),
+    );
+    // 退化的 clientFile 在记录流里看不出来（就是一个不以 `//` 开头的值），整轮结束时
+    // 汇总一句，免得消费方拿到一份「两种拼法混排」的记录流却毫无察觉。
+    json::report_degraded_client_files();
+
+    result
+}
+
+/// 本轮是哪个模式。三选一，`--clean` 与 `--sync` 互斥由 clap 保证。
+fn mode_of(options: &Options) -> Mode {
+    if options.clean {
+        Mode::Clean
+    } else if options.sync {
+        Mode::Sync
+    } else {
+        Mode::Open
+    }
+}
+
+fn run_once(options: &mut Options) -> Result<()> {
     let start_time = Instant::now();
 
     // 配置错误要在任何输出之前报出来。只校验 P4_EXE 设了的那种情况：
@@ -65,14 +108,14 @@ pub fn run(mut options: Options) -> Result<()> {
     init_p4_encoding(options.charset.as_deref(), &probe_dir);
 
     if options.workspace.is_none() {
-        println!("No workspace passed, trying P4CLIENT.");
+        sayln!("No workspace passed, trying P4CLIENT.");
         options.workspace = env::var("P4CLIENT").ok();
     }
 
     let workspace_name = match &options.workspace {
         None => bail!("No workspace found, use -w or set P4CLIENT."),
         Some(name) => {
-            println!("Using workspace \"{}\".", name);
+            sayln!("Using workspace \"{}\".", name);
             name.as_str()
         }
     };
@@ -80,24 +123,33 @@ pub fn run(mut options: Options) -> Result<()> {
     // 求值本轮范围：位置参数与 `.p4delta-scope` 取交集、去重。没有路径也没有配置、
     // 或两者交集为空，都在这里报错退出——「什么事都没做」不该报告成功。P4V 那边的
     // prompt 留空正好落到「没给路径」这一支（`-l $D` 展开成空）。
-    let scope = task::block_on(evaluate_scope(&options))?;
+    let scope = task::block_on(evaluate_scope(options))?;
+
+    // 记录里的 clientFile 是 client 语法，拼它需要 clientspec 的根。放在这里（而不是
+    // 报告层）是因为这是唯一同时握着 options 与 scope 的地方。
+    task::block_on(json::resolve_client_spec(
+        options,
+        &scope.first_dir,
+        workspace_name,
+    ));
+    json::emit_progress("start", None);
 
     if options.clean {
-        println!("Clean mode: updating the workspace to match the depot.");
+        sayln!("Clean mode: updating the workspace to match the depot.");
     }
     if options.sync {
         // 说清目标是哪个版本：head 与指定 changelist 是两种不同的结果，
         // 而用户未必记得自己没写 --to。
         match options.to {
             Some(changelist) => {
-                println!("Sync mode: updating the workspace to changelist {changelist}.")
+                sayln!("Sync mode: updating the workspace to changelist {changelist}.")
             }
-            None => println!("Sync mode: updating the workspace to the head revision."),
+            None => sayln!("Sync mode: updating the workspace to the head revision."),
         }
     }
 
     match options.changelist {
-        0 => println!("Using default pending changelist."),
+        0 => sayln!("Using default pending changelist."),
         // clean 不打开任何文件，也就没有 changelist 可进；`p4 clean` 本身也不接受 -c。
         // 静默忽略会让人以为改动进了指定的 pending changelist，所以要说一声。
         n if options.clean => {
@@ -108,7 +160,7 @@ pub fn run(mut options: Options) -> Result<()> {
         n if options.sync => eprintln!(
             "Warning: --changelist {n} is ignored, sync never opens files (use --to to pick a target changelist)."
         ),
-        n => println!("Using pending changelist {}.", n),
+        n => sayln!("Using pending changelist {}.", n),
     }
 
     if options.verbose {
@@ -126,7 +178,7 @@ pub fn run(mut options: Options) -> Result<()> {
     if let Some(cache_path) = &cache_path
         && cache_path.exists()
     {
-        println!("Loading cache from {}.", cache_path.display());
+        sayln!("Loading cache from {}.", cache_path.display());
         // 流式加载：大工作区的缓存有几百 MB，整份读进内存会让加载峰值翻倍。
         match (|| -> Result<WorkspaceCache> {
             let config = bincode::config::standard();
@@ -138,7 +190,7 @@ pub fn run(mut options: Options) -> Result<()> {
             Ok(decoded) => {
                 cache = decoded;
                 cache.out_of_date = false;
-                println!("    Loaded {} cached digests.", cache.file_map.len());
+                sayln!("    Loaded {} cached digests.", cache.file_map.len());
             }
             Err(e) => {
                 eprintln!(
@@ -154,7 +206,7 @@ pub fn run(mut options: Options) -> Result<()> {
 
     // 一次操作、一个视图：所有入口合并为一轮（exclude 的两侧过滤在 reconcile_scope 内完成）。
     task::block_on(reconcile_scope(
-        &options,
+        options,
         &scope,
         &mut cache,
         &mut cache_writer,
@@ -162,7 +214,8 @@ pub fn run(mut options: Options) -> Result<()> {
 
     save_cache(&mut cache_writer, &mut cache, true)?;
 
-    println!(
+    json::emit_progress("done", None);
+    sayln!(
         "Operation completed in {} seconds.",
         start_time.elapsed().as_secs_f32()
     );

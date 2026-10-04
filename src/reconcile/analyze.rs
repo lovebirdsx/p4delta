@@ -8,12 +8,13 @@ use std::collections::HashSet;
 
 use anyhow::{Result, bail};
 
+use crate::json::sayln;
 use crate::model::{
     DepotFileRecord, DepotState, DigestType, FileAction, FileType, TargetMap, WorkspaceFile,
     WorkspaceState,
 };
 
-use super::changes::Changes;
+use super::changes::{Changes, NewFile};
 
 /// 一次差异分析的全部产出。
 pub(crate) struct Analysis<'a> {
@@ -147,7 +148,7 @@ pub(crate) fn analyze<'a>(
                                             .push((file, file_type.digest_type()?));
 
                                         if verbose {
-                                            println!(
+                                            sayln!(
                                                 "         File \"{}\" needs digest check for revert delete or reopen edit",
                                                 file.path
                                             );
@@ -156,7 +157,7 @@ pub(crate) fn analyze<'a>(
                                         changes.reopen_edit.push(record.client_file.clone());
 
                                         if verbose {
-                                            println!(
+                                            sayln!(
                                                 "         File \"{}\" has different length for reopen edit",
                                                 file.path
                                             );
@@ -257,7 +258,7 @@ pub(crate) fn analyze<'a>(
                         Some(Add | MoveAdd | Branch) => (),
                         // 还没标待添加。
                         None => {
-                            changes.add.push(file.path.clone());
+                            changes.add.push(NewFile::unmapped(file.path.clone()));
                         }
                         _ => bail!(
                             "{}",
@@ -296,7 +297,7 @@ pub(crate) fn analyze<'a>(
                                     check_revert_edit.push((file, file_type.digest_type()?));
 
                                     if verbose {
-                                        println!(
+                                        sayln!(
                                             "         File \"{}\" needs digest check for revert edit",
                                             file.path
                                         );
@@ -322,7 +323,7 @@ pub(crate) fn analyze<'a>(
                                     changes.edit.push(file.path.clone());
 
                                     if verbose {
-                                        println!(
+                                        sayln!(
                                             "         File \"{}\" has different length for edit",
                                             file.path
                                         );
@@ -331,7 +332,7 @@ pub(crate) fn analyze<'a>(
                                     check_edit.push((file, file_type.digest_type()?));
 
                                     if verbose {
-                                        println!(
+                                        sayln!(
                                             "         File \"{}\" needs digest check for edit",
                                             file.path
                                         );
@@ -355,7 +356,7 @@ pub(crate) fn analyze<'a>(
             }
         } else {
             // depot 里压根没有、也没被忽略：标为待添加。
-            changes.add.push(file.path.clone());
+            changes.add.push(NewFile::unmapped(file.path.clone()));
         }
     }
 
@@ -701,17 +702,19 @@ mod tests {
     /// 哪些类别非空——用来一眼看出一个文件有没有落进唯一的一类。
     fn non_empty_groups(changes: &Changes) -> Vec<&'static str> {
         let mut labels = Vec::new();
-        for (label, files) in [
-            ("add", &changes.add),
-            ("edit", &changes.edit),
-            ("reopen_edit", &changes.reopen_edit),
-            ("delete", &changes.delete),
-            ("reopen_delete", &changes.reopen_delete),
-            ("revert_add", &changes.revert_add),
-            ("revert_edit", &changes.revert_edit),
-            ("revert_delete", &changes.revert_delete),
+        // add 那一类装的是 NewFile（它还要带 depot 路径），其余七类是纯路径，
+        // 所以这里按长度取「空不空」，不碰元素。
+        for (label, count) in [
+            ("add", changes.add.len()),
+            ("edit", changes.edit.len()),
+            ("reopen_edit", changes.reopen_edit.len()),
+            ("delete", changes.delete.len()),
+            ("reopen_delete", changes.reopen_delete.len()),
+            ("revert_add", changes.revert_add.len()),
+            ("revert_edit", changes.revert_edit.len()),
+            ("revert_delete", changes.revert_delete.len()),
         ] {
-            if !files.is_empty() {
+            if count > 0 {
                 labels.push(label);
             }
         }
@@ -916,7 +919,10 @@ mod tests {
         let analysis = analyze(&depot, &workspace, false).unwrap();
 
         assert_eq!(non_empty_groups(&analysis.changes), ["add"]);
-        assert_eq!(analysis.changes.add, vec![PATH.to_owned()]);
+        assert_eq!(
+            analysis.changes.add,
+            vec![NewFile::unmapped(PATH.to_owned())]
+        );
     }
 
     /// depot 里有、但这个客户端从没同步过：本地那个只是重名，不能当改动用。
@@ -983,7 +989,10 @@ mod tests {
         let analysis = analyze(&depot, &workspace, false).unwrap();
 
         assert_eq!(non_empty_groups(&analysis.changes), ["add"]);
-        assert_eq!(analysis.changes.add, vec![PATH.to_owned()]);
+        assert_eq!(
+            analysis.changes.add,
+            vec![NewFile::unmapped(PATH.to_owned())]
+        );
     }
 
     // ---- 未建模的组合必须响亮失败 ----

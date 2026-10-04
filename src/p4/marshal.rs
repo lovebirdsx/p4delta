@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use encoding_rs::Encoding;
 
 use crate::charset::{decode_p4_bytes, strip_bom};
+use crate::json::sayln;
 use crate::model::HaveRecord;
 use crate::path::local_path_key;
 
@@ -240,9 +241,10 @@ impl MarshalStreamParser {
             );
         }
 
-        println!(
+        sayln!(
             "      Parsed {} have records ({} missing syncTime).",
-            self.total_parsed, self.missing_sync_time
+            self.total_parsed,
+            self.missing_sync_time
         );
 
         self.records

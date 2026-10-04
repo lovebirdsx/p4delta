@@ -13,6 +13,7 @@ use walkdir::WalkDir;
 
 use crate::charset::query_p4_variable;
 use crate::cli::Options;
+use crate::json::sayln;
 use crate::p4::process::{
     FailureMode, compute_batches, run_p4_command_batched, run_p4_command_slice,
     split_command_line_paths,
@@ -182,7 +183,7 @@ pub(crate) async fn query_ignored_dirs(
     // 只在 `-v` 下说一声。本函数每轮剪枝规划会被调两次（顶层与其余各一次），
     // 两批的分母不同，所以这里不去重：各自说各自的，反而看得清是哪一批。
     if options.verbose && !unreadable.is_empty() {
-        println!(
+        sayln!(
             "         {} of {} directory name(s) cannot go on the p4 command line; \
              those directories are scanned in full instead of being pruned.",
             unreadable.len(),
@@ -342,8 +343,8 @@ pub(crate) async fn plan_directory_pruning(
     };
 
     match &plan.fallback {
-        Some(reason) => println!("    Not pruning ignored directories: {}.", reason),
-        None => println!(
+        Some(reason) => sayln!("    Not pruning ignored directories: {}.", reason),
+        None => sayln!(
             "      Pruned {} of {} candidate directories in {} batches ({} seconds).",
             plan.dirs.len(),
             plan.candidates,

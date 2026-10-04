@@ -1,7 +1,7 @@
 //! 范围的 reconcile 编排。
 
 mod analyze;
-mod changes;
+pub(crate) mod changes;
 mod clean;
 mod sync;
 
@@ -23,6 +23,10 @@ use sync::{apply_sync, build_sync_changes};
 use crate::cache::{CacheWriter, save_cache};
 use crate::cli::Options;
 use crate::digest::{CachePolicy, is_unchanged_since_sync, parallel_compute_digests};
+use crate::json::{
+    HandoffFile, Mode, emit_handoff_files, emit_native_reconcile_records, emit_progress,
+    emit_unmatched, sayln, set_reason, set_scope_matched,
+};
 use crate::model::{
     DepotState, DigestType, HaveRecord, TargetMap, WorkspaceCache, WorkspaceFile, WorkspaceState,
 };
@@ -31,7 +35,7 @@ use crate::p4::process::{FailureMode, run_p4_command_batched, run_p4_have};
 use crate::path::path_is_under_key;
 use crate::prune::PrunePlan;
 use crate::scope::{EntryKind, ExcludeSet, Scope};
-use crate::workspace::{filter_unmapped_paths, gather_workspace, rescan_tracked_pruned_dirs};
+use crate::workspace::{gather_workspace, map_new_paths, rescan_tracked_pruned_dirs};
 
 /// 一轮 reconcile 的编排：拉齐 fstat / 工作区 / have 三路数据，分析、算摘要，
 /// 最后把变更下发给 p4。多个范围入口合并成这一轮——一次操作、一个视图。
@@ -44,7 +48,7 @@ pub(crate) async fn reconcile_scope(
     // cwd 取第一个入口的所在目录：`.p4config` / P4IGNORE 的发现跟着它走。
     let work_dir = scope.first_dir.as_str();
 
-    println!(
+    sayln!(
         "Processing {} scope entr{}.",
         scope.includes.len(),
         if scope.includes.len() == 1 {
@@ -55,7 +59,7 @@ pub(crate) async fn reconcile_scope(
     );
     if options.verbose {
         for entry in &scope.includes {
-            println!("         Entry \"{}\"", entry.path);
+            sayln!("         Entry \"{}\"", entry.path);
         }
     }
 
@@ -78,7 +82,7 @@ pub(crate) async fn reconcile_scope(
     warn_unmatched_entries(scope, &depot)?;
     let excluded_depot_keys = exclude_from_depot(&mut depot, &scope.excludes);
     if !excluded_depot_keys.is_empty() {
-        println!(
+        sayln!(
             "   Left {} depot-tracked file(s) outside the scope untouched.",
             excluded_depot_keys.len()
         );
@@ -100,7 +104,7 @@ pub(crate) async fn reconcile_scope(
     .await?;
 
     if depot.file_records.is_empty() && workspace.num_files == 0 {
-        println!("The folder contains no files that need checking.");
+        sayln!("The folder contains no files that need checking.");
         return Ok(());
     }
 
@@ -151,7 +155,7 @@ pub(crate) async fn reconcile_scope(
         //   集合比实际要小，而预演必须预告真实动作；
         // - `--to <CL>` 下把版本说明符钉在参数上，否则转交的这一批会跑到 head 去。
         if !plan.unsupported.is_empty() {
-            println!(
+            sayln!(
                 "Found {num_files} file(s) that are not supported by p4delta, running a manual sync",
                 num_files = plan.unsupported.len()
             );
@@ -173,18 +177,27 @@ pub(crate) async fn reconcile_scope(
                 FailureMode::Warn
             };
             run_p4_command_batched(options, work_dir, args, &specs, false, mode).await?;
+
+            // 转交出去的文件必须出现在记录流里：消费方读到的是「这批我处理不了，
+            // 交给原生 p4 了」，而不是「这批不存在」。
+            emit_handoff_files(
+                Mode::Sync,
+                "sync",
+                plan.unsupported.iter().cloned(),
+                options.apply,
+            );
         }
 
         if plan.changes.total() == 0 {
             // 转交出去的那批不算在 `changes` 里，但 `-a` 下它刚刚真的被执行过——这时说
             // 「一切与目标版本一致」就是自相矛盾，只能说「除此之外没有别的」。
             if plan.unsupported.is_empty() {
-                println!("No files to sync, everything up to date.");
+                sayln!("No files to sync, everything up to date.");
             } else {
-                println!("No other files to sync.");
+                sayln!("No other files to sync.");
                 // 这句话只在有东西可落地时才说：刚跑的那次转交是预演（带 `-n`）。
                 if !options.apply {
-                    println!("Re-run with -a to sync the workspace.");
+                    sayln!("Re-run with -a to sync the workspace.");
                 }
             }
             return Ok(());
@@ -193,7 +206,7 @@ pub(crate) async fn reconcile_scope(
         return apply_sync(options, work_dir, &plan.changes).await;
     }
 
-    println!("   Analyzing files for inconsistencies.");
+    sayln!("   Analyzing files for inconsistencies.");
     let start_time = Instant::now();
 
     let Analysis {
@@ -206,15 +219,18 @@ pub(crate) async fn reconcile_scope(
         archived_files,
     } = analyze(&depot, &workspace, options.verbose)?;
 
-    println!(
+    sayln!(
         "      Analysis complete in {} seconds.",
         start_time.elapsed().as_secs_f32()
     );
+    emit_progress("analyze", None);
 
     // client view 的排除行会让 p4 完全看不见某些路径（例如 `-//aki/....tmp`），
     // 扫盘时它们却长得像新增文件。不剔掉的话，open 模式会去 add 一个 p4 拒绝的文件，
     // clean 模式会删掉一个 p4 根本不管的文件。
-    changes.add = filter_unmapped_paths(options, work_dir, &changes.add).await?;
+    // 顺手补上它们的 depot 路径：新增文件是唯一没有 depot 记录可查的一类，而契约里
+    // `depotFile` 是必填项（`p4 where` 一次批量查询同时给出映射与排除名单）。
+    changes.add = map_new_paths(options, work_dir, &changes.add).await?;
 
     // clean 模式不消费「已打开」的两组候选：`p4 clean` 不碰已打开的文件，
     // [`CleanChanges::project`] 把这两组的结论整个丢弃——为它们读文件算摘要、写缓存
@@ -237,12 +253,23 @@ pub(crate) async fn reconcile_scope(
     );
 
     if let Some(summary) = timestamps.summary() {
-        println!("{summary}");
+        sayln!("{summary}");
+    }
+
+    // 进度提示只发这一处：三组摘要各自有独立的一行「Checking digests for N files」，
+    // 但它们是同一段工作，消费方要看的是「还要读多少盘」这个总量。
+    let digest_total =
+        edit.needs_digest.len() + revert_edit.needs_digest.len() + revert_delete.needs_digest.len();
+    if digest_total > 0 {
+        emit_progress(
+            "digest",
+            Some(&format!("Checking digests for {digest_total} files.")),
+        );
     }
 
     // 算摘要，看是否需要 open for edit。
     if !edit.needs_digest.is_empty() {
-        println!("   Checking digests for {} files.", edit.needs_digest.len());
+        sayln!("   Checking digests for {} files.", edit.needs_digest.len());
 
         let mut hashed = HashStats::new();
         let results = parallel_compute_digests(edit.needs_digest, cache, CachePolicy::Use)?;
@@ -256,7 +283,7 @@ pub(crate) async fn reconcile_scope(
                 changes.edit.push(outcome.file.path.clone());
 
                 if options.verbose {
-                    println!("         File \"{}\" digest is wrong.", outcome.file.path);
+                    sayln!("         File \"{}\" digest is wrong.", outcome.file.path);
                 }
             }
         }
@@ -267,7 +294,7 @@ pub(crate) async fn reconcile_scope(
     for (file, _) in revert_edit.unchanged {
         changes.revert_edit.push(file.path.clone());
         if options.verbose {
-            println!(
+            sayln!(
                 "         File \"{}\" unchanged since sync (revert).",
                 file.path
             );
@@ -275,7 +302,7 @@ pub(crate) async fn reconcile_scope(
     }
 
     if !revert_edit.needs_digest.is_empty() {
-        println!(
+        sayln!(
             "   Checking digests for {} files.",
             revert_edit.needs_digest.len()
         );
@@ -291,7 +318,7 @@ pub(crate) async fn reconcile_scope(
                 changes.revert_edit.push(outcome.file.path.clone());
 
                 if options.verbose {
-                    println!("         File \"{}\" digest is correct.", outcome.file.path);
+                    sayln!("         File \"{}\" digest is correct.", outcome.file.path);
                 }
             }
         }
@@ -302,7 +329,7 @@ pub(crate) async fn reconcile_scope(
     for (file, _) in revert_delete.unchanged {
         changes.revert_delete.push(file.path.clone());
         if options.verbose {
-            println!(
+            sayln!(
                 "         File \"{}\" unchanged since sync (revert delete).",
                 file.path
             );
@@ -310,7 +337,7 @@ pub(crate) async fn reconcile_scope(
     }
 
     if !revert_delete.needs_digest.is_empty() {
-        println!(
+        sayln!(
             "   Checking digests for {} files.",
             revert_delete.needs_digest.len()
         );
@@ -328,13 +355,13 @@ pub(crate) async fn reconcile_scope(
                 changes.revert_delete.push(outcome.file.path.clone());
 
                 if options.verbose {
-                    println!("         File \"{}\" digest is correct.", outcome.file.path);
+                    sayln!("         File \"{}\" digest is correct.", outcome.file.path);
                 }
             } else {
                 changes.reopen_edit.push(outcome.file.path.clone());
 
                 if options.verbose {
-                    println!("         File \"{}\" digest is wrong.", outcome.file.path);
+                    sayln!("         File \"{}\" digest is wrong.", outcome.file.path);
                 }
             }
         }
@@ -353,37 +380,44 @@ pub(crate) async fn reconcile_scope(
     };
 
     if !unsynced_files.is_empty() {
-        println!(
+        sayln!(
             "Found {} file(s) in the depot this client has never synced; sync or resolve them, then re-run.",
             unsynced_files.len()
         );
     }
 
     if !archived_files.is_empty() {
-        println!(
+        sayln!(
             "Skipped {} archived file(s): their contents live in an archive depot, so there is nothing to compare.",
             archived_files.len()
         );
     }
 
     if !unsupported_files.is_empty() {
-        println!(
+        sayln!(
             "Found {num_files} file(s) that are not supported by p4delta, running a manual {command}",
             command = if options.clean { "clean" } else { "reconcile" },
             num_files = unsupported_files.len()
         );
         let unsupported_paths: Vec<_> = unsupported_files
-            .into_iter()
+            .iter()
             .map(|rec| rec.depot_file.to_owned())
             .collect();
 
         // 预演的方向必须和实际动作一致：`p4 clean -n` 与 `p4 reconcile -n` 对同一批文件
         // 给出的预告正好相反，用错方向的预演比没有预演更糟。
+        //
+        // open 模式的预演额外要 `-Mj -Ztag`：那批文件的逐条动作只有 p4 自己知道，而预演
+        // 的全部意义就是预告真实动作，不能只报一句「这批转交了」就把它们从清单里抹掉。
+        // `-Ztag` 不能省——只给 `-Mj` 时 p4 回的是 `{"data":"//depot/… - opened for edit",
+        // "level":0}` 这种给人读的行，没有 `depotFile` / `clientFile` 字段，翻译层会把每一
+        // 行都丢掉（那正是这段代码曾经整个死掉的原因）。
+        // 两个都是全局选项，得走在命令名前面（与 `p4 where` / `p4 info` 的调用同款）。
         let args: &[&str] = match (options.clean, options.apply) {
             (true, true) => &["clean"],
             (true, false) => &["clean", "-n"],
             (false, true) => &["reconcile"],
-            (false, false) => &["reconcile", "-n"],
+            (false, false) => &["-Mj", "-Ztag", "reconcile", "-n"],
         };
 
         // clean 的两支不能带 changelist：`p4 clean` 不接受 `-c`。
@@ -397,7 +431,7 @@ pub(crate) async fn reconcile_scope(
         } else {
             FailureMode::Warn
         };
-        run_p4_command_batched(
+        let lines = run_p4_command_batched(
             options,
             work_dir,
             args,
@@ -406,10 +440,29 @@ pub(crate) async fn reconcile_scope(
             mode,
         )
         .await?;
+
+        // 转交出去的文件必须出现在记录流里，绝不静默丢。open 模式的预演带回了逐条记录，
+        // 翻译成正常文件记录；其余三支只能说清「这批交给谁了」。
+        match (options.clean, options.apply) {
+            (false, false) => {
+                emit_native_reconcile_records(Mode::Open, &lines, options.apply);
+            }
+            (clean, _) => emit_handoff_files(
+                if clean { Mode::Clean } else { Mode::Open },
+                if clean { "clean" } else { "reconcile" },
+                unsupported_files.iter().map(|rec| HandoffFile {
+                    depot_file: rec.depot_file.clone(),
+                    client_file: rec.client_file.clone(),
+                }),
+                options.apply,
+            ),
+        }
     }
 
+    emit_progress("report", None);
+
     if sum_changes == 0 {
-        println!(
+        sayln!(
             "{}",
             if options.clean {
                 "No files to clean, everything up to date."
@@ -422,7 +475,7 @@ pub(crate) async fn reconcile_scope(
 
     match &clean_changes {
         Some(clean) => apply_clean(options, work_dir, clean).await?,
-        None => apply_changes(options, work_dir, &changes).await?,
+        None => apply_changes(options, work_dir, &changes, &depot).await?,
     }
 
     Ok(())
@@ -451,12 +504,21 @@ fn warn_unmatched_entries(scope: &Scope, depot: &DepotState) -> Result<()> {
         .collect();
 
     if unmatched.is_empty() {
+        set_scope_matched(scope.includes.len());
         return Ok(());
+    }
+
+    set_scope_matched(scope.includes.len() - unmatched.len());
+    for path in &unmatched {
+        emit_unmatched(path);
     }
 
     // 一条都没匹配上就是「什么都没做」，不能报成功：用户会把 exit 0 当成「处理完了」，
     // 而真相多半是路径拼错了。部分匹配则是另一回事，其余入口照常处理。
     if unmatched.len() == scope.includes.len() {
+        // 消费方要能把这档与「跑挂了」分开：入口全落空是一个**完整的答案**（这里确实
+        // 什么都没有），编辑器把成对的 `[<path>, <path>/...]` 发过来时就靠它下结论。
+        set_reason("no-entry-matched");
         bail!(
             "Nothing to work on: {} scope entr{} matched nothing in the depot or on disk \
              (misspelled?):\n  {}",
@@ -551,7 +613,7 @@ impl TimestampStats {
         self.skipped += unchanged.len();
 
         if !unchanged.is_empty() && self.verbose {
-            println!(
+            sayln!(
                 "   Skipped {} file(s) unchanged since sync ({phase}).",
                 unchanged.len()
             );
@@ -614,7 +676,7 @@ impl HashStats {
     /// 一个字都没读时不作声——缓存全命中时那行本来就该缺席。
     fn report(&self) {
         if self.total_size > 0 {
-            println!(
+            sayln!(
                 "      Hashed {} in {} seconds.",
                 format_size(self.total_size, BINARY),
                 self.start.elapsed().as_secs_f32()
@@ -691,12 +753,12 @@ fn delete_workspace_files(files: &[String]) -> Result<()> {
 ///
 /// 不钉的话这一批会跑到 head 去——`--to` 下那正是要避免的（拉到比目标更新的版本），
 /// 而且从输出上看不出来：文件确实被「转交」了，只是转交错了地方。
-fn handoff_specs(depot_files: &[String], to: Option<u32>) -> Vec<String> {
-    depot_files
+fn handoff_specs(files: &[HandoffFile], to: Option<u32>) -> Vec<String> {
+    files
         .iter()
-        .map(|depot_file| match to {
-            Some(changelist) => format!("{depot_file}@{changelist}"),
-            None => depot_file.clone(),
+        .map(|file| match to {
+            Some(changelist) => format!("{}@{changelist}", file.depot_file),
+            None => file.depot_file.clone(),
         })
         .collect()
 }
@@ -831,14 +893,25 @@ mod tests {
     /// 避免的事，而且用户从输出上看不出来：文件确实被转交了，只是转交错了地方。
     #[test]
     fn handoff_specs_pin_the_target_changelist() {
-        let files = ["//depot/a.txt".to_owned(), "//depot/b/c.txt".to_owned()];
+        let file = |depot_file: &str, client_file: &str| HandoffFile {
+            depot_file: depot_file.to_owned(),
+            client_file: client_file.to_owned(),
+        };
+
+        let files = [
+            file("//depot/a.txt", r"C:\ws\a.txt"),
+            file("//depot/b/c.txt", r"C:\ws\b\c.txt"),
+        ];
 
         assert_eq!(
             handoff_specs(&files, Some(1234)),
             ["//depot/a.txt@1234", "//depot/b/c.txt@1234"]
         );
         // head 目标下不加后缀：加了反而变成「拉到 1234 那一版」，与目标不符。
-        assert_eq!(handoff_specs(&files, None), files);
+        assert_eq!(
+            handoff_specs(&files, None),
+            ["//depot/a.txt", "//depot/b/c.txt"]
+        );
     }
 
     #[test]

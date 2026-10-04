@@ -439,6 +439,30 @@ P4V 那边的 prompt 留空仍然落在 `No path given` 上。范围语法见「
 > 退出码 `1` 的错误格式与 0.1.2 及更早版本不同：旧版是 anyhow 的多行
 > `Error: ...` / `Caused by: ...`，现在压成一行。写脚本解析 stderr 时需要留意。
 
+## 程序化输出（`--json`）
+
+`--json` 把 stdout 让给机器：一条记录一行 JSON，人类可读的报告整体改道 stderr（外加
+`kind:"progress"` 的进度记录）。退出码与文本模式一致。契约的单一真相是
+[`docs/json-contract.md`](docs/json-contract.md)，那里有全部字段与硬条款；这里只讲怎么用。
+
+```console
+$ p4delta --json -l .            # 预演，stdout 只有 JSONL
+{"kind":"file","mode":"open","class":"edit","action":"edit","depotFile":"//depot/main/a.txt","clientFile":"//ws/a.txt","rev":"3","applied":false}
+{"kind":"summary","mode":"open","ok":true,"applied":false,"total":1,"counts":{"edit":1},"scopeMatched":1,"unmatched":0,"elapsedMs":12,"reason":null}
+```
+
+给编辑器 / 脚本用的三个附加开关：
+
+| 开关 | 作用 |
+| --- | --- |
+| `--client-root <PATH>` | client 根目录。`clientFile` 要拼成 `//<client>/<相对路径>`，给了就省掉一次 `p4 info` |
+| `--no-scope-file` | 忽略工作区里的 `.p4delta-scope`：范围完全由调用方给定，不在别人的配置上再叠一层 |
+| `--no-revert-groups` | 输出逐行等于 `p4 reconcile -a -e -d`（见「会修正的不一致」里那三组 revert 的说明） |
+
+两条消费方最该记住的规矩：**`kind:"summary"` 是「这一轮有结论」的唯一凭据**（进程崩溃或被
+`kill` 就没有它），以及 **`ok:false` 的记录流永远是残缺的**——只有 `ok:true` 时才能把记录
+当成全集。
+
 ## 已知问题
 
 它只在我们的仓库上验证过，如果你的配置与我们不同，未必能正常工作。

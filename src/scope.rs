@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::cli::Options;
+use crate::json::sayln;
 use crate::p4::process::{FailureMode, run_p4_command_slice};
 use crate::path::{
     absolute_local_path, local_path_key, normalize_local_path, path_is_under_key,
@@ -497,14 +498,21 @@ fn build_exclude_set(entries: Vec<ScopeEntry>) -> ExcludeSet {
 pub(crate) async fn evaluate_scope(options: &Options) -> Result<Scope> {
     let cli = parse_cli_entries(&options.paths);
 
-    let mut scope_file = find_scope_file(&config_start_dir(&cli));
+    // `--no-scope-file` 让配置整个缺席：范围只认命令行。给编辑器用——它的范围是「聚焦目录
+    // 减排除项」，自己算好了，工作区里那份 `.p4delta-scope` 是给手工跑 CLI 的人写的，
+    // 两者叠在一起会让编辑器看到的范围与用户以为的不一样。
+    let mut scope_file = if options.no_scope_file {
+        None
+    } else {
+        find_scope_file(&config_start_dir(&cli))
+    };
     let mut config = Vec::new();
     let mut config_dir = None;
 
     if let Some(file) = &scope_file {
         let content = fs::read_to_string(file)
             .with_context(|| format!("Failed to read {}", file.display()))?;
-        println!("Using scope file {}.", file.display());
+        sayln!("Using scope file {}.", file.display());
         config = parse_scope_content(&content)?;
 
         // 只有注释与空行的配置等同于没有配置。"以配置目录为根"是留给"只写排除项"
@@ -628,7 +636,7 @@ pub(crate) async fn evaluate_scope(options: &Options) -> Result<Scope> {
         .to_string();
 
     if excludes.declared_len() > 0 {
-        println!(
+        sayln!(
             "Scope has {} include entr{} and {} exclusion(s).",
             includes.len(),
             if includes.len() == 1 { "y" } else { "ies" },

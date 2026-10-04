@@ -1,6 +1,6 @@
 //! 工作区文件的收集与过滤。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::Instant;
 
@@ -9,12 +9,14 @@ use humansize::{BINARY, format_size};
 use walkdir::WalkDir;
 
 use crate::cli::Options;
+use crate::json::sayln;
 use crate::model::{DepotState, WorkspaceFile, WorkspaceState};
 use crate::p4::process::{FailureMode, run_p4_command_batched, split_command_line_paths};
 use crate::path::{local_path_key, normalize_local_path_owned, path_is_under_key};
 use crate::prune::{
     IGNORES_ARGS, PrunePlan, has_pruned_ancestor, parse_ignores_output, plan_directory_pruning,
 };
+use crate::reconcile::changes::NewFile;
 use crate::scope::{EntryKind, ExcludeSet, Scope, ScopeEntry};
 
 /// 扫描范围入口：目录入口递归收集；文件入口直接取单个文件（本地不存在就跳过，
@@ -177,7 +179,7 @@ pub(crate) async fn apply_file_ignores(
     // 交不出去的那些不是被放弃，下面有补充判据接手。只在 `-v` 下说一声：它们现在有解，
     // 不该在正常输出里冒充告警——那会让人以为出了事。
     if options.verbose && !unreadable_paths.is_empty() {
-        println!(
+        sayln!(
             "         {} of {} path(s) cannot go on the p4 command line; \
              their ignored state comes from a \"p4 add -n\" query instead.",
             unreadable_paths.len(),
@@ -219,7 +221,7 @@ async fn query_ignores(
 
     if options.verbose {
         for ignored_file in &ignored_files {
-            println!("         Ignored file \"{}\" by ignores", ignored_file);
+            sayln!("         Ignored file \"{}\" by ignores", ignored_file);
         }
     }
 
@@ -295,7 +297,7 @@ async fn query_ignored_refusals(
     for file in files.iter_mut() {
         if !file.filtered && refused.contains(&local_path_key(&file.path)) {
             if options.verbose {
-                println!("         Ignored file \"{}\" by add -n", file.path);
+                sayln!("         Ignored file \"{}\" by add -n", file.path);
             }
             ignored_count += 1;
             file.filtered = true;
@@ -345,69 +347,129 @@ fn parse_ignored_refusals(
 /// `p4 where` 的查询参数。它只读 client spec 的 view，不需要连服务器。
 const WHERE_ARGS: [&str; 3] = ["-Mj", "-Ztag", "where"];
 
-/// 从 `p4 where -Mj -Ztag` 的输出里挑出被 client view 排除的路径键。
-///
-/// view 里的排除行（例如 `-//aki/....tmp`）让 p4 完全看不见那些路径，`p4 where` 为它们
-/// 返回的映射记录里会多一个 `unmap` 字段——这是区分「已映射」与「被排除」的信号。
-fn unmapped_path_keys(lines: &[String]) -> HashSet<String> {
-    let mut keys = HashSet::new();
+/// `p4 where -Mj -Ztag` 的一条记录：一个本地路径在 view 里的映射。
+#[derive(Debug, PartialEq)]
+struct WhereRecord {
+    /// 归一化后的本地路径键，与扫描结果、fstat 的 clientFile 同一口径。
+    key: String,
+
+    /// depot 路径。新增文件的 `depotFile` 就来自这里——它 depot 里还没有记录可查。
+    depot_file: String,
+
+    /// 被 view 的排除行（例如 `-//aki/....tmp`）挡下：p4 完全看不见这个路径。
+    /// 这是区分「已映射」与「被排除」的唯一信号。
+    unmapped: bool,
+}
+
+/// 解析 `p4 where` 的输出行。p4 偶尔会混进非 JSON 的提示行，跳过即可，不值得中止整轮。
+fn parse_where_lines(lines: &[String]) -> Vec<WhereRecord> {
+    let mut records = Vec::new();
 
     for line in lines {
-        // p4 偶尔会混进非 JSON 的提示行，不值得让它中止整轮。
         let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
 
-        if record.get("unmap").is_none() {
+        // `path` 与 `depotFile` 缺一不可：没有它们这条记录对我们的两个用途都没意义。
+        let (Some(path), Some(depot_file)) =
+            (record["path"].as_str(), record["depotFile"].as_str())
+        else {
             continue;
-        }
+        };
 
-        if let Some(path) = record["path"].as_str() {
-            keys.insert(local_path_key(path));
+        records.push(WhereRecord {
+            key: local_path_key(path),
+            depot_file: depot_file.to_owned(),
+            unmapped: record.get("unmap").is_some(),
+        });
+    }
+
+    records
+}
+
+/// p4 的 filespec 元字符在路径里的转义。
+///
+/// 名字里带 `@` / `#` / `*` / `%` 的文件，p4 会把它们当版本说明符或通配符解析，逐文件
+/// 查询当场报错（`Invalid changelist/client/label/date '@2024.txt'`），于是一个这样的名字
+/// 就能让整批新增文件查不到映射。p4 认 `%xx` 转义，编码后它能正常回答映射，回给我们的
+/// `depotFile` 也正是 p4 自己对这类文件的拼法。
+///
+/// 只用在 `p4 where` 这种**问路**的查询上。动作类调用仍传原样路径：那类文件名 p4 本来
+/// 就不收（`p4 add` 要 `-f` 才肯），工具的立场是把失败如实报出来，而不是悄悄替用户加 `-f`。
+fn escape_filespec_metacharacters(path: &str) -> String {
+    // `%` 必须最先换，否则会把后面刚生成的 `%40` 又编码一遍。
+    path.replace('%', "%25")
+        .replace('#', "%23")
+        .replace('@', "%40")
+        .replace('*', "%2A")
+}
+
+/// 用 `p4 where` 的结果给新增文件补齐：剔掉被排除的路径，其余配上 depot 路径。
+///
+/// 比较按本地路径键（大小写与分隔符已归一），与扫描结果一致——p4 回的路径形式与本地
+/// 扫描的未必逐字相同。
+fn apply_where(files: &[NewFile], records: &[WhereRecord]) -> Vec<NewFile> {
+    let mut unmapped = HashSet::new();
+    let mut mapped = HashMap::new();
+
+    for record in records {
+        if record.unmapped {
+            unmapped.insert(record.key.clone());
+        } else {
+            mapped.insert(record.key.clone(), record.depot_file.clone());
         }
     }
 
-    keys
-}
-
-/// 剔除键落在 `unmapped` 里的文件。大小写与分隔符都按本地路径键归一，与扫描结果一致。
-fn drop_unmapped(files: &[String], unmapped: &HashSet<String>) -> Vec<String> {
     files
         .iter()
-        .filter(|file| !unmapped.contains(&local_path_key(file)))
-        .cloned()
+        .filter(|file| !unmapped.contains(&local_path_key(&file.client_file)))
+        .map(|file| NewFile {
+            depot_file: mapped.get(&local_path_key(&file.client_file)).cloned(),
+            client_file: file.client_file.clone(),
+        })
         .collect()
 }
 
-/// 剔除被 client view 排除的路径。
+/// 给新增文件补上 depot 路径，并剔掉被 client view 排除的路径。
 ///
-/// 这些路径 p4 完全看不见：`p4 reconcile`、`p4 clean`、`p4 add` 对它们一律报
-/// "not in client view"。工具是自己扫盘的，不查 view 就会把它们当成新增文件——
-/// open 模式下会去 `p4 add` 一个 p4 会拒绝的文件，clean 模式下更糟：会**删掉**
-/// p4 根本不管的文件。
+/// 两件事共用同一次 `p4 where`：排除名单与 depot 映射是同一份输出的两个投影。
+///
+/// 排除项必须剔掉——被 view 排除的路径 p4 完全看不见：`p4 reconcile`、`p4 clean`、
+/// `p4 add` 对它们一律报 "not in client view"。工具是自己扫盘的，不查 view 就会把它们
+/// 当成新增文件——open 模式下会去 `p4 add` 一个 p4 会拒绝的文件，clean 模式下更糟：
+/// 会**删掉** p4 根本不管的文件。
+///
+/// depot 路径则必须补上：契约里记录的 `depotFile` 是必填项，而新增文件是全流程里唯一
+/// 没有 depot 记录可查的一类。补不上（p4 没回这条路径）时留 `None`，由报告层响亮失败——
+/// 编一个路径出来只会把错的东西写进记录里。
 ///
 /// 只喂已经判定为新增的文件：这类路径通常很少，一次批量查询就够；对全部工作区文件
 /// 做这件事，在几十万文件的目录上会变成灾难。
-pub(crate) async fn filter_unmapped_paths(
+pub(crate) async fn map_new_paths(
     options: &Options,
     work_dir: &str,
-    files: &[String],
-) -> Result<Vec<String>> {
+    files: &[NewFile],
+) -> Result<Vec<NewFile>> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
+
+    let paths: Vec<String> = files
+        .iter()
+        .map(|file| escape_filespec_metacharacters(&file.client_file))
+        .collect();
 
     let lines = run_p4_command_batched(
         options,
         work_dir,
         &WHERE_ARGS,
-        files,
+        &paths,
         false,
         FailureMode::Warn,
     )
     .await?;
 
-    Ok(drop_unmapped(files, &unmapped_path_keys(&lines)))
+    Ok(apply_where(files, &parse_where_lines(&lines)))
 }
 
 /// 扫描工作区，返回收集到的文件状态与本次实际应用的剪枝计划。
@@ -415,7 +477,7 @@ pub(crate) async fn gather_workspace(
     options: &Options,
     scope: &Scope,
 ) -> Result<(WorkspaceState, PrunePlan)> {
-    println!("   Scanning workspace for files.");
+    sayln!("   Scanning workspace for files.");
     let start_time = Instant::now();
 
     let roots = scope.directory_roots();
@@ -426,11 +488,11 @@ pub(crate) async fn gather_workspace(
 
     if options.verbose {
         for file in &files {
-            println!("         File \"{}\", size {}", file.path, file.size);
+            sayln!("         File \"{}\", size {}", file.path, file.size);
         }
     }
 
-    println!(
+    sayln!(
         "      Collected {} files in {} directories ({}) in {} seconds.",
         files.len(),
         num_dirs,
@@ -438,7 +500,7 @@ pub(crate) async fn gather_workspace(
         start_time.elapsed().as_secs_f32()
     );
 
-    println!("   Filtering workspace files.");
+    sayln!("   Filtering workspace files.");
     let start_time = Instant::now();
 
     let ignored_count = apply_file_ignores(options, &scope.first_dir, &mut files).await?;
@@ -450,7 +512,7 @@ pub(crate) async fn gather_workspace(
     };
     workspace_state.build_mapping();
 
-    println!(
+    sayln!(
         "      Filtered out {} files, {} remain, in {} seconds.",
         ignored_count,
         workspace_state.num_files,
@@ -495,7 +557,7 @@ pub(crate) async fn rescan_tracked_pruned_dirs(
         return Ok(());
     }
 
-    println!(
+    sayln!(
         "   Re-scanning {} pruned directories that contain depot-tracked files.",
         needed.len()
     );
@@ -519,7 +581,7 @@ pub(crate) async fn rescan_tracked_pruned_dirs(
         .sort_by(|a, b| a.path_lower.cmp(&b.path_lower));
     workspace.build_mapping();
 
-    println!(
+    sayln!(
         "      Re-collected {} files ({} ignored, {} remain).",
         recollected,
         ignored_total,
@@ -540,38 +602,113 @@ mod tests {
     use crate::model::{DepotFileRecord, FileAction};
     use crate::path::local_path_key;
 
-    /// 被 view 排除的路径在 `p4 where` 的输出里多一个 `unmap` 字段，这是唯一的信号。
+    /// 被 view 排除的路径在 `p4 where` 的输出里多一个 `unmap` 字段，这是唯一的信号；
+    /// 其余记录则要交出 depot 路径。两个投影来自同一份输出，这条用例把两边都钉住。
     #[test]
-    fn where_output_marks_unmapped_paths() {
+    fn where_output_carries_the_mapping_and_the_unmap_marker() {
         let lines = vec![
             // 正常映射：没有 unmap 字段。
             r#"{"clientFile":"//ws/a.txt","depotFile":"//depot/a.txt","path":"C:\\ws\\a.txt"}"#
                 .to_owned(),
-            // 被 view 的排除行挡下：多一个 unmap 字段。
+            // 被 view 的排除行挡下：多一个 unmap 字段（它同样带着 depotFile，别把它当映射）。
             r#"{"clientFile":"//ws/b.tmp","depotFile":"//depot/b.tmp","path":"C:\\ws\\b.tmp","unmap":""}"#
                 .to_owned(),
             // p4 偶尔混进来的提示行，不该中止解析。
             "Some warning from p4".to_owned(),
         ];
 
-        let keys = unmapped_path_keys(&lines);
+        let records = parse_where_lines(&lines);
 
-        assert_eq!(keys.len(), 1);
-        assert!(keys.contains(&local_path_key(r"C:\ws\b.tmp")));
+        assert_eq!(
+            records,
+            vec![
+                WhereRecord {
+                    key: local_path_key(r"C:\ws\a.txt"),
+                    depot_file: "//depot/a.txt".to_owned(),
+                    unmapped: false,
+                },
+                WhereRecord {
+                    key: local_path_key(r"C:\ws\b.tmp"),
+                    depot_file: "//depot/b.tmp".to_owned(),
+                    unmapped: true,
+                },
+            ]
+        );
+
+        // 只喂一条记录里的路径：被排除的那条必须整个消失（映射有意义也不作数），
+        // 没被 p4 提到的那条留着但没有 depot 路径（报告层会为它响亮失败）。
+        let files = vec![
+            NewFile::unmapped(r"C:\ws\a.txt".to_owned()),
+            NewFile::unmapped(r"C:\ws\b.tmp".to_owned()),
+            NewFile::unmapped(r"C:\ws\never-mentioned.txt".to_owned()),
+        ];
+        let mapped = apply_where(&files, &records);
+
+        assert_eq!(
+            mapped,
+            vec![
+                NewFile {
+                    client_file: r"C:\ws\a.txt".to_owned(),
+                    depot_file: Some("//depot/a.txt".to_owned()),
+                },
+                NewFile::unmapped(r"C:\ws\never-mentioned.txt".to_owned()),
+            ]
+        );
+    }
+
+    /// 名字里带 p4 filespec 元字符的文件：不转义的话一个这样的名字就能让整批 `p4 where`
+    /// 当场失败，所有新增文件都拿不到映射。
+    #[test]
+    fn filespec_metacharacters_are_escaped_for_the_mapping_query() {
+        assert_eq!(
+            escape_filespec_metacharacters(r"C:\ws\report@2024.txt"),
+            r"C:\ws\report%402024.txt"
+        );
+        // `%` 先换：否则后面生成的 `%40` 会被再编码一遍。
+        assert_eq!(
+            escape_filespec_metacharacters("50%off#1*star.txt"),
+            "50%25off%231%2Astar.txt"
+        );
+        // 没有元字符的路径一个字节都不该动。
+        assert_eq!(
+            escape_filespec_metacharacters(r"C:\ws\readme.txt"),
+            r"C:\ws\readme.txt"
+        );
     }
 
     #[test]
     fn unmapped_files_are_dropped_even_with_a_different_case() {
         // 扫描结果的路径大小写与 p4 返回的未必一致，过滤要按归一化后的键来。
         let files = vec![
-            r"C:\ws\a.txt".to_owned(),
-            r"C:\ws\B.TMP".to_owned(),
-            r"C:\ws\c.txt".to_owned(),
+            NewFile::unmapped(r"C:\ws\a.txt".to_owned()),
+            NewFile::unmapped(r"C:\ws\B.TMP".to_owned()),
+            NewFile::unmapped(r"C:\ws\c.txt".to_owned()),
         ];
-        let unmapped: HashSet<String> = [local_path_key(r"C:\ws\b.tmp")].into_iter().collect();
+        let records = vec![
+            WhereRecord {
+                key: local_path_key(r"C:\ws\a.txt"),
+                depot_file: "//depot/a.txt".to_owned(),
+                unmapped: false,
+            },
+            WhereRecord {
+                key: local_path_key(r"C:\ws\b.tmp"),
+                depot_file: "//depot/b.tmp".to_owned(),
+                unmapped: true,
+            },
+            WhereRecord {
+                key: local_path_key(r"C:\ws\c.txt"),
+                depot_file: "//depot/c.txt".to_owned(),
+                unmapped: false,
+            },
+        ];
+
+        let mapped: Vec<String> = apply_where(&files, &records)
+            .into_iter()
+            .map(|file| file.client_file)
+            .collect();
 
         assert_eq!(
-            drop_unmapped(&files, &unmapped),
+            mapped,
             vec![r"C:\ws\a.txt".to_owned(), r"C:\ws\c.txt".to_owned()]
         );
     }
