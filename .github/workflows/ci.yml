@@ -21,18 +21,21 @@ env:
 
 jobs:
   fmt:
-    runs-on: ubuntu-latest
+    # 钉 24.04 而不是 ubuntu-latest：后者 2026-10-19 起迁往 Ubuntu 26，那次迁移会连
+    # glibc 与预装工具链一起换掉，让 CI 在与代码无关的日子里整体漂移。下面几个
+    # ubuntu job 同此。
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -45,10 +48,10 @@ jobs:
       # Windows 挂而别的平台过时，两边的结果都要能看到。
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # e2e 要在真实的 Perforce 服务器上跑，而 runner 上什么都没有。
@@ -79,7 +82,7 @@ jobs:
   installer:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # 用户机器上的默认解释器是 Windows PowerShell 5.1，开发机上多半是 7。
       # 两边都跑：install.ps1 要同时兼容（比如 5.1 没有 ?? 和 utf8NoBOM），
       # 而它对中文输出的依赖（脚本必须带 UTF-8 BOM）只有 5.1 这一遍能验出来。
@@ -96,7 +99,7 @@ jobs:
   # release.sh 的黑盒测试：在一次性 git 仓库里真跑一遍改版本号、提交、打附注 tag、推送，
   # 只有 cargo 换成垫片——所以不需要构建产物，也不联网。
   release-script:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: bash scripts/test-release.sh

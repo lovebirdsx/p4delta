@@ -655,6 +655,13 @@ mod tests {
         }
     }
 
+    /// 平台形状的测试路径。`local_path_key` 与 `path_is_under_key` 都按 `MAIN_SEPARATOR`
+    /// 切组件，硬编码的 `C:\ws\...` 在 Unix 上只是一串普通字符，父子关系判不出来。
+    fn ws_path(parts: &[&str]) -> String {
+        let sep = std::path::MAIN_SEPARATOR;
+        format!("C:{sep}ws{sep}{}", parts.join(&sep.to_string()))
+    }
+
     // ---- 条目解析 ----
 
     #[test]
@@ -765,9 +772,9 @@ mod tests {
 
     #[test]
     fn directory_intersections_take_the_deeper_side() {
-        let outer = entry(r"C:\ws\a", EntryKind::Directory);
-        let inner = entry(r"C:\ws\a\b", EntryKind::Directory);
-        let unrelated = entry(r"C:\ws\c", EntryKind::Directory);
+        let outer = entry(&ws_path(&["a"]), EntryKind::Directory);
+        let inner = entry(&ws_path(&["a", "b"]), EntryKind::Directory);
+        let unrelated = entry(&ws_path(&["c"]), EntryKind::Directory);
 
         assert_eq!(
             intersect_entry(&outer, &inner).unwrap().path_lower,
@@ -782,9 +789,9 @@ mod tests {
 
     #[test]
     fn a_file_intersects_only_the_directory_that_contains_it() {
-        let dir = entry(r"C:\ws\a", EntryKind::Directory);
-        let file = entry(r"C:\ws\a\b\d.txt", EntryKind::File);
-        let other_file = entry(r"C:\ws\z\d.txt", EntryKind::File);
+        let dir = entry(&ws_path(&["a"]), EntryKind::Directory);
+        let file = entry(&ws_path(&["a", "b", "d.txt"]), EntryKind::File);
+        let other_file = entry(&ws_path(&["z", "d.txt"]), EntryKind::File);
 
         assert_eq!(
             intersect_entry(&dir, &file).unwrap().path_lower,
@@ -795,9 +802,9 @@ mod tests {
 
     #[test]
     fn files_intersect_only_on_the_exact_path() {
-        let a = entry(r"C:\ws\d.txt", EntryKind::File);
-        let same = entry(r"C:\WS\D.TXT", EntryKind::File);
-        let other = entry(r"C:\ws\e.txt", EntryKind::File);
+        let a = entry(&ws_path(&["d.txt"]), EntryKind::File);
+        let same = entry(&ws_path(&["d.txt"]).to_ascii_uppercase(), EntryKind::File);
+        let other = entry(&ws_path(&["e.txt"]), EntryKind::File);
 
         assert!(intersect_entry(&a, &same).is_some());
         assert!(intersect_entry(&a, &other).is_none());
@@ -806,8 +813,8 @@ mod tests {
     #[test]
     fn a_file_path_equal_to_a_directory_path_still_intersects() {
         // 本地不存在时类型判定可能与实际不符，同一路径的两种判定要能相交。
-        let dir = entry(r"C:\ws\thing", EntryKind::Directory);
-        let file = entry(r"C:\ws\thing", EntryKind::File);
+        let dir = entry(&ws_path(&["thing"]), EntryKind::Directory);
+        let file = entry(&ws_path(&["thing"]), EntryKind::File);
 
         assert!(intersect_entry(&dir, &file).is_some());
         assert!(intersect_entry(&file, &dir).is_some());
@@ -818,22 +825,22 @@ mod tests {
     #[test]
     fn a_directory_entry_swallows_entries_beneath_it() {
         let includes = vec![
-            entry(r"C:\ws\a\b\c.txt", EntryKind::File),
-            entry(r"C:\ws\a", EntryKind::Directory),
-            entry(r"C:\ws\a\b", EntryKind::Directory),
+            entry(&ws_path(&["a", "b", "c.txt"]), EntryKind::File),
+            entry(&ws_path(&["a"]), EntryKind::Directory),
+            entry(&ws_path(&["a", "b"]), EntryKind::Directory),
         ];
 
         let deduped = dedupe_entries(includes, &ExcludeSet::default());
 
         assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0].path_lower, local_path_key(r"C:\ws\a"));
+        assert_eq!(deduped[0].path_lower, local_path_key(&ws_path(&["a"])));
     }
 
     #[test]
     fn duplicate_file_entries_are_kept_once() {
         let includes = vec![
-            entry(r"C:\ws\d.txt", EntryKind::File),
-            entry(r"C:\WS\D.TXT", EntryKind::File),
+            entry(&ws_path(&["d.txt"]), EntryKind::File),
+            entry(&ws_path(&["d.txt"]).to_ascii_uppercase(), EntryKind::File),
         ];
 
         assert_eq!(dedupe_entries(includes, &ExcludeSet::default()).len(), 1);
@@ -841,19 +848,19 @@ mod tests {
 
     #[test]
     fn exclusion_beats_inclusion_unconditionally() {
-        let includes = vec![entry(r"C:\ws\d.txt", EntryKind::File)];
-        let excludes = build_exclude_set(vec![entry(r"C:\ws\d.txt", EntryKind::File)]);
+        let includes = vec![entry(&ws_path(&["d.txt"]), EntryKind::File)];
+        let excludes = build_exclude_set(vec![entry(&ws_path(&["d.txt"]), EntryKind::File)]);
 
         assert!(dedupe_entries(includes, &excludes).is_empty());
     }
 
     #[test]
     fn an_exclusion_directory_covers_files_and_subdirectories() {
-        let excludes = build_exclude_set(vec![entry(r"C:\ws\gen", EntryKind::Directory)]);
+        let excludes = build_exclude_set(vec![entry(&ws_path(&["gen"]), EntryKind::Directory)]);
 
-        assert!(excludes.excludes_key(&local_path_key(r"C:\ws\gen")));
-        assert!(excludes.excludes_key(&local_path_key(r"C:\ws\gen\out\a.txt")));
-        assert!(!excludes.excludes_key(&local_path_key(r"C:\ws\gen2\a.txt")));
+        assert!(excludes.excludes_key(&local_path_key(&ws_path(&["gen"]))));
+        assert!(excludes.excludes_key(&local_path_key(&ws_path(&["gen", "out", "a.txt"]))));
+        assert!(!excludes.excludes_key(&local_path_key(&ws_path(&["gen2", "a.txt"]))));
     }
 
     // ---- file spec ----
