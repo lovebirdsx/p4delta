@@ -228,8 +228,12 @@ else
   step '本地门禁'
   cargo fmt --all -- --check
   cargo clippy --all-targets --all-features --locked -- -D warnings
+  # 默认档排掉了那条要跑十来秒的 Windows 失败注入用例（理由见 .config/nextest.toml）。
+  # 这里不补跑：它在 Linux/macOS 上匹配 0 条用例，nextest 的 --no-tests 默认 fail 会让门禁
+  # 无谓地红。发布流水线不缺它——release workflow 复用 ci.yml 的 test job，那边补跑。
   cargo nextest run --all-targets --all-features --locked
-  printf '    （机器上没有 p4/p4d 时 e2e 会自己跳过；CI 上不跳，那边设了 P4_E2E_REQUIRED）\n'
+  printf '    （机器上没有 p4/p4d 时 e2e 会自己跳过；CI 上不跳，那边设了 P4_E2E_REQUIRED。\n'
+  printf '     那条十来秒的失败注入用例也由 CI 的 Windows job 单独补跑，本地门禁不含它）\n'
 fi
 
 step "提交并打 tag $TAG"

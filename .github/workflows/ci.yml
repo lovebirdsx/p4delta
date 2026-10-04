@@ -76,6 +76,19 @@ jobs:
           # 一场绿色的空跑。后缀跟着平台走，只有 Windows 的二进制带 .exe。
           P4_EXE: ${{ github.workspace }}/vendor/p4${{ runner.os == 'Windows' && '.exe' || '' }}
         run: cargo nextest run --all-targets --all-features --locked
+      # 默认档用 default-filter 排掉了那条 Windows 专用的失败注入用例——它要跑十来秒，
+      # 且并行度救不了它（理由写在 .config/nextest.toml 里）。这里补跑回来，门禁才不缺这一环。
+      # 不写 if 的话 Linux/macOS 上匹配到 0 条用例，而 --no-tests 默认 fail（退出码 4）会让
+      # job 红；反过来在 Windows 上保留这个 fail 行为，用例被改名后会立刻暴露，不会悄悄退化成不跑。
+      - name: Run the default-filter-excluded test
+        if: runner.os == 'Windows'
+        env:
+          P4_E2E_REQUIRED: "1"
+          P4_EXE: ${{ github.workspace }}/vendor/p4.exe
+        run: >
+          cargo nextest run --all-targets --all-features --locked
+          --ignore-default-filter
+          -E 'test(=both_delete_legs_report_their_own_failure)'
 
   # 安装脚本的黑盒测试：把 install.ps1 与一个人造 exe 拷进临时目录再跑，
   # 断言生成的 customtools.xml 与幂等/卸载行为。不需要构建产物，所以独立于 test。

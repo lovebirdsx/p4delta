@@ -126,7 +126,16 @@ sync 模式的四组动作在 `tests/e2e_sync.rs` 里同样对着真实服务器
 
 `--to` 的两个边界也纳入了沙箱自动化：**目标 CL 早于限定子目录首次提交时拒绝执行**，并断言内容、have 和 opened 不变；**超过 head 的 CL 回落到 head**，通过读回 `haveRev` 与内容确认没有误触发空目标护栏。目标号都从沙箱已提交记录取得，不依赖固定种子 CL。另有 have < 目标 < head 的前向同步用例，确认不会越过指定目标。时间戳捷径的用例在修改内容后恢复实际同步时的 mtime，不再依赖测试执行时的当前时钟。
 
-删除组还有一条实测值得记：`p4 sync -f //depot/f#none` 面对**被别的进程占着的文件**会重试约十秒才放弃，而且它会先把 `deleted as` 打到 stdout、把 `unlink: ...` 写到 stderr，**have 记录原样保留**——「看起来成功、其实什么都没做」的典型。这正是那一组的判据必须是 `ExitCodeOrStderr` 而不能是 `ExitCode` 的原因（后者会让它整个隐形），也是 `both_delete_legs_report_their_own_failure` 那条用例要跑十来秒的原因。
+删除组还有一条实测值得记：`p4 sync -f //depot/f#none` 面对**被别的进程占着的文件**会重试约十秒才放弃，而且它会先把 `deleted as` 打到 stdout、把 `unlink: ...` 写到 stderr，**have 记录原样保留**——「看起来成功、其实什么都没做」的典型。这正是那一组的判据必须是 `ExitCodeOrStderr` 而不能是 `ExitCode` 的原因（后者会让它整个隐形）。
+
+这十秒也落在那条用例身上，而并行度对它无能为力：一条用例只跑在一个 worker 上，它跑到最后就成了整轮墙钟的地板（实测 18.9s；用 `-E 'not test(=both_delete_legs_report_their_own_failure)'` 排除它之后是 8.0s）。所以默认档用 `.config/nextest.toml` 的 `default-filter` 把它排掉，CI 的 Windows job 用 `--ignore-default-filter` 补跑回来——门禁不缺这一环，本地 `cargo nextest run` 快一半。
+
+**换一条更快的失败注入试过一轮，四条候选全部不成立**，记在这里免得后人重走：
+
+- **只读位 + 不给 `FILE_SHARE_WRITE`**：p4 自己会清掉只读位，而 `FILE_SHARE_DELETE` 一旦授予，删除就成功（实测 0.06s）——腿一不再失败，用例前提直接没了。
+- **`icacls` 给文件 DENY DELETE**：管理员令牌下被绕过，p4 照样删掉（0.06s）；而且用例中途 panic 会把 DENY ACE 留在实例目录里，`InstancePaths::remove()` 那套退避删不掉它，`target/e2e/instances/` 会永久堆积。
+- **收紧 `sys.rename.*`**：默认 `max=10` × `wait=1000ms` 正好是观测到的十秒，看着像答案，但服务端 `p4 configure set` 与环境变量 `P4SYS_RENAME_WAIT` 都不生效（实测仍是 10.19s / 10.18s）——这个退避读的是客户端里写死的值。
+- **目录 / 符号链接**：前者进不了删除组（`push_deleted` 要求本地是被扫到的文件），后者有 `remove_dir` 兜底——两条都会让腿二反而成功。
 
 真实大工作区上的 A/B 也跑过一轮（客户端的 `Source\Client\Config` 589 文件、`Source\Script\QAScript` 44,554 文件 5.09 GiB）：前者原生 10 个 `updating`、我们 10 个 `Update`，文件集合逐条相同。`--to <CL>` 换成一个能真正区分 head 与目标的目标 CL 后（8984916，那里 `DefaultEngine.ini` 是 `#34`、head 已是 `#35`），两边仍是同样的那 10 个文件。后者整轮 dry run 2.54 s（摘要缓存全命中）。**那里出现过一次分歧**：原生打了 22 行 `deleted as` 而我们说「无事可做」——逐条核实后那 22 个既不在磁盘上也没有 have 记录，原生那几行只是描述目标状态、p4 自己也无事可做，结论钉在 `a_deleted_target_with_nothing_local_is_a_no_op` 里。
 

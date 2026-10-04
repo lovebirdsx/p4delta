@@ -368,7 +368,13 @@ impl Sandbox {
         // 剪枝只在生效的 P4IGNORE 恰好是 .p4ignore 时才敢用目录级判断。
         set("P4IGNORE", ".p4ignore".to_owned());
         // 设了就不必跑 `p4 set` 去探测，也躲开这台机器的注册表。
+        //
+        // 这两条必须成对：`src/charset.rs` 的跳过条件要求**两者**都有环境变量，少一个
+        // 每次运行都会白起一个 `p4 set`（整套 e2e 跑上百次 CLI，那是实打实的一笔）。
+        // 成对设上还有个附带好处：这台机器的注册表里真有什么 P4COMMANDCHARSET，
+        // 也穿不过沙箱去影响参数编码了。
         set("P4CHARSET", "utf8".to_owned());
+        set("P4COMMANDCHARSET", "utf8".to_owned());
         set("P4TICKETS", self.paths.tickets.display().to_string());
         set("P4ENVIRO", self.paths.enviro.display().to_string());
         set("P4TRUST", self.paths.trust.display().to_string());

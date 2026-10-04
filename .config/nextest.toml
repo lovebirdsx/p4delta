@@ -23,3 +23,14 @@ retries = 0
 # 被杀意味着进程跑不到 Drop，实例目录会留在 target/e2e/instances/ 下（名字带 pid，
 # 不会和别的实例撞上）。真遇到超时，顺手确认一下有没有残留的 p4d 再收掉。
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# 默认档排掉 `both_delete_legs_report_their_own_failure`。它是 Windows 专用的失败注入用例：
+# 摁住文件且不给 FILE_SHARE_DELETE，p4 便在 unlink 上退避重试满十秒才放弃。并行度救不了它——
+# 一条用例只跑在一个 worker 上，它跑到最后就成了整轮的地板（实测 18.9s，排除它 8.0s）。
+#
+# 这是「换一条更快的失败注入」的实验全部失败后的退路，注入与断言一字未改。试过的候选都会被
+# p4 绕过或照样退避，逐条记录在 CONTRIBUTING.md 的 e2e 一节。CI 的 Windows job 用
+# `--ignore-default-filter` 把它补跑回来（见 ci.yml），门禁因此不缺这一环。
+#
+# `=` 是精确匹配，避免将来出现名字包含它的用例被连带排除。
+default-filter = 'not test(=both_delete_legs_report_their_own_failure)'

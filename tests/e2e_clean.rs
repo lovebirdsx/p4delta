@@ -7,16 +7,42 @@ mod support;
 
 use predicates::prelude::*;
 
+/// 三类动作连同预演，在一个沙箱里跑完。
+///
+/// 四处差异刻意落在四个互不相干的路径上，所以预演之后直接落地**不需要任何清理**：
+/// 预演本来就不改状态，落地只是把同一批差异做掉。合成一条省下一次 p4d 冷启动与
+/// 一次模板复制——每条 e2e 用例的固定开销都在那里，而不在断言上。
 #[test]
-fn an_untracked_file_is_deleted_from_disk() {
+fn the_three_clean_actions_are_counted_then_applied() {
     let Some(sandbox) = support::sandbox_or_skip() else {
         return;
     };
 
+    // 未跟踪两份（删除）、已改一份（还原）、缺失一份（写回）。
     sandbox.write("extra.txt", "not in the depot\n");
     sandbox.write("build/scratch.txt", "also not in the depot\n");
-    assert!(sandbox.exists("extra.txt"));
+    sandbox.write("readme.txt", "locally changed\n");
+    sandbox.remove("src/lib.txt");
 
+    // 预演：三类都数得出来，但磁盘上什么都不许动。
+    sandbox
+        .cli()
+        .args(["--clean", "-l"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Counted 4 files to clean"))
+        .stdout(predicate::str::contains(
+            "Re-run with -a to clean the workspace.",
+        ));
+
+    assert!(sandbox.exists("extra.txt"));
+    assert!(sandbox.exists("build/scratch.txt"));
+    assert_eq!(sandbox.read("readme.txt"), "locally changed\n");
+    assert!(!sandbox.exists("src/lib.txt"));
+    assert!(sandbox.opened().is_empty());
+
+    // 落地：三类动作各走一遍，计数各自钉住自己那一类。
     sandbox
         .cli()
         .args(["--clean", "-a", "-l"])
@@ -24,80 +50,15 @@ fn an_untracked_file_is_deleted_from_disk() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Deleting 2 files"))
+        .stdout(predicate::str::contains("Reverting 1 files"))
+        .stdout(predicate::str::contains("Restoring 1 files"))
         .stdout(predicate::str::contains("Workspace matches the depot."));
 
     assert!(!sandbox.exists("extra.txt"));
     assert!(!sandbox.exists("build/scratch.txt"));
-    assert!(sandbox.opened().is_empty(), "clean never opens files");
-}
-
-#[test]
-fn a_modified_tracked_file_is_restored_to_have() {
-    let Some(sandbox) = support::sandbox_or_skip() else {
-        return;
-    };
-
-    sandbox.write("readme.txt", "locally changed\n");
-
-    sandbox
-        .cli()
-        .args(["--clean", "-a", "-l"])
-        .arg(".")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Reverting 1 files"))
-        .stdout(predicate::str::contains("Workspace matches the depot."));
-
     assert_eq!(sandbox.read("readme.txt"), "hello from the depot\n");
-}
-
-#[test]
-fn a_missing_tracked_file_is_restored_from_the_depot() {
-    let Some(sandbox) = support::sandbox_or_skip() else {
-        return;
-    };
-
-    sandbox.remove("src/lib.txt");
-    assert!(!sandbox.exists("src/lib.txt"));
-
-    sandbox
-        .cli()
-        .args(["--clean", "-a", "-l"])
-        .arg(".")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Restoring 1 files"))
-        .stdout(predicate::str::contains("Workspace matches the depot."));
-
     assert_eq!(sandbox.read("src/lib.txt"), "library\n");
-}
-
-/// dry run：三类差异都数得出来，但磁盘上什么都不许动。
-#[test]
-fn clean_dry_run_changes_nothing() {
-    let Some(sandbox) = support::sandbox_or_skip() else {
-        return;
-    };
-
-    sandbox.write("extra.txt", "not in the depot\n");
-    sandbox.write("readme.txt", "locally changed\n");
-    sandbox.remove("src/lib.txt");
-
-    sandbox
-        .cli()
-        .args(["--clean", "-l"])
-        .arg(".")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Counted 3 files to clean"))
-        .stdout(predicate::str::contains(
-            "Re-run with -a to clean the workspace.",
-        ));
-
-    assert!(sandbox.exists("extra.txt"));
-    assert_eq!(sandbox.read("readme.txt"), "locally changed\n");
-    assert!(!sandbox.exists("src/lib.txt"));
-    assert!(sandbox.opened().is_empty());
+    assert!(sandbox.opened().is_empty(), "clean never opens files");
 }
 
 /// 已打开的文件不归 clean 管，`p4 clean` 的官方口径也是如此

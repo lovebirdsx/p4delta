@@ -1,5 +1,9 @@
 //! 操作范围：多入口合并成一轮、文件入口、排除，以及 `.p4delta-scope` 与位置参数
 //! 的组合（硬上限 + 交集）。
+//!
+//! 只验**解析与报错**的那几条不在这里——它们在 `evaluate_scope` 里就 bail 了，
+//! 一个 p4 进程都不需要，所以搬去了 `tests/cli.rs`（不必为它们各起一个 p4d 沙箱）。
+//! 留在这里的都要真实文件树或 depot 数据才能得出结论。
 
 mod support;
 
@@ -146,49 +150,6 @@ fn the_scope_file_caps_the_given_paths() {
     assert!(opened[0].contains("lib.txt"), "{opened:?}");
 }
 
-/// 传入的路径与配置范围完全不相交时什么都没得做，报错退出而不是静默成功。
-#[test]
-fn an_empty_intersection_is_a_failure() {
-    let Some(sandbox) = support::sandbox_or_skip() else {
-        return;
-    };
-
-    sandbox.write(".p4delta-scope", "src\n");
-
-    sandbox
-        .cli()
-        .args(["-a", "-l"])
-        .arg("readme.txt")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("do not overlap"));
-}
-
-/// 交集空掉的另一种成因是排除项把入口自己排掉了：报错里要把排除项列出来。
-///
-/// 不列的话这条消息看着自相矛盾——`scope: src` 配 `given: src/generated` 明明相交。
-#[test]
-fn an_entry_that_exclusions_swallow_reports_the_exclusions() {
-    let Some(sandbox) = support::sandbox_or_skip() else {
-        return;
-    };
-
-    sandbox.write(".p4delta-scope", "src\n-src/deep\n");
-    sandbox.write("src/deep/a/b/c.txt", "changed deep\n");
-
-    sandbox
-        .cli()
-        .args(["-a", "-l"])
-        .arg("src/deep")
-        .assert()
-        .failure()
-        // 分隔符两个平台都认：报错里是本地路径的原样，Windows 上全是反斜杠。
-        .stderr(predicate::str::is_match(r"excluded: -.*src[\\/]deep").unwrap());
-
-    let opened = sandbox.opened();
-    assert!(opened.is_empty(), "什么都不该打开: {opened:?}");
-}
-
 /// 重叠的入口先归并再查询：不去重的话 fstat 会返回重复记录，同一个文件被打开两次。
 #[test]
 fn overlapping_entries_do_not_duplicate_commands() {
@@ -290,29 +251,6 @@ fn a_nested_scope_file_uses_its_own_directory_as_the_base() {
     let opened = sandbox.opened();
     assert_eq!(opened.len(), 1, "{opened:?}");
     assert!(opened[0].contains("c.txt"), "{opened:?}");
-}
-
-/// 只有注释的配置等同于没有配置：不能因为「配置存在」就把配置文件所在目录整个当成范围。
-#[test]
-fn an_empty_scope_file_is_ignored() {
-    let Some(sandbox) = support::sandbox_or_skip() else {
-        return;
-    };
-
-    sandbox.write(".p4delta-scope", "# 还没想好\n\n");
-    sandbox.write("src/lib.txt", "changed\n");
-
-    // 不给路径、配置又是空的：等于什么都没给，报错而不是默默扫遍整个目录。
-    sandbox
-        .cli()
-        .args(["-a", "-l"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("no entries"))
-        .stderr(predicate::str::contains("No path given"));
-
-    let opened = sandbox.opened();
-    assert!(opened.is_empty(), "什么都没打开才对: {opened:?}");
 }
 
 /// 入口在 depot 与本地都找不到东西时提示一句（多半是拼错了），但不影响其他入口。
