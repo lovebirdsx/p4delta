@@ -86,7 +86,7 @@ bash scripts/test-release.sh
 
 ### e2e：真实 p4d 沙箱
 
-`tests/e2e_*.rs` 为每个用例起一个独立的 p4d 实例，在真服务器上跑完整流程——八类变更、`--clean` 的三类动作、`--sync` 的四组动作、忽略目录剪枝、client view 排除、字符集、缓存复用。数据库模板只生成一次（`<target>/e2e/template-<指纹>/`），之后每个实例从模板复制，所以单个用例的开销在百毫秒级。
+`tests/e2e_*.rs` 为每个用例起一个独立的 p4d 实例，在真服务器上跑完整流程——八类变更、`--clean` 的三类动作、`--sync` 的四组动作、忽略目录剪枝、client view 排除、字符集、缓存复用、操作范围。数据库模板只生成一次（`<target>/e2e/template-<指纹>/`），之后每个实例从模板复制，所以单个用例的开销在百毫秒级。
 
 ```bash
 # 机器上已经有 p4d（比如随 P4V 装的）就能直接跑
@@ -141,6 +141,7 @@ src/
   locate.rs            p4 可执行文件的定位（P4_EXE → PATH → P4V 安装目录）
   model.rs             领域数据模型：depot 记录、工作区文件、摘要缓存
   path.rs              本地路径规范化与路径键
+  scope.rs             操作范围：入口解析、`.p4delta-scope` 配置、交集与排除
   cache.rs             摘要缓存的阶段间保存（全量序列化 + 临时文件改名）
   digest.rs            p4 摘要计算与「自 sync 起未改动」判定
   prune.rs             .p4ignore 分析、预扫描、目录剪枝决策
@@ -150,7 +151,7 @@ src/
     process.rs         p4 子进程调用与批次的切分、并发
     fstat.rs           p4 fstat 查询与流式解析
   reconcile/
-    mod.rs             单个目录的 reconcile 编排
+    mod.rs             一个范围的 reconcile 编排
     analyze.rs         两阶段差异分析：每个文件落在哪一类变更（纯逻辑）
     changes.rs         变更分类，以及表驱动的报告与应用
     clean.rs           clean 模式：三类动作的投影、报告与执行
@@ -158,13 +159,14 @@ src/
   test_util.rs         跨模块共享的测试基建（仅测试构建）
 tests/
   support/             e2e 沙箱框架：p4d 生命周期、数据库模板、环境隔离
-  cli.rs               黑盒 CLI 测试（不起服务器，只覆盖参数解析与路径参数的校验）
+  cli.rs               黑盒 CLI 测试（不起服务器，只覆盖参数解析与启动期的环境错误）
   e2e_open.rs          八类变更
   e2e_clean.rs         --clean 的三类动作与已打开文件的保护
   e2e_sync.rs          --sync 的四组动作、--to <CL> 与 --verify-all
   e2e_prune.rs         忽略目录剪枝
   e2e_paths.rs         路径形式 / changelist / 缓存复用 / unmap
   e2e_charset.rs       非 ASCII 文件名与输出契约
+  e2e_scope.rs         操作范围：多入口合并、文件入口、排除、配置与参数的组合
 install.ps1            安装脚本：铺 exe + 注册 P4V 自定义工具
 scripts/
   benchmark.ps1        仅预览的多轮计时、动作多重集比对与日志留存（PowerShell 7）
@@ -176,7 +178,7 @@ scripts/
   test-release.sh      release.sh 的黑盒测试
 ```
 
-阅读时可从 `model` / `path` 等基础模块入手，再看 `p4/*` 的查询和进程管理、`workspace` / `cache` / `digest` 的扫描与摘要，最后看 `reconcile/*` 的分类和动作。`lib.rs` 不仅声明模块，还负责编排参数、缓存生命周期与逐目录执行；`main.rs` 才是薄入口。
+阅读时可从 `model` / `path` 等基础模块入手，再看 `p4/*` 的查询和进程管理、`workspace` / `cache` / `digest` 的扫描与摘要，最后看 `reconcile/*` 的分类和动作。`lib.rs` 不仅声明模块，还负责编排参数、缓存生命周期与单轮执行（范围求值在 `scope`，编排在 `reconcile`）；`main.rs` 才是薄入口。
 
 ## 注释
 

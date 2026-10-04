@@ -13,6 +13,8 @@ use crate::path::local_path_key;
 pub(crate) const TYPE_NULL: u8 = b'0';
 pub(crate) const TYPE_DICT: u8 = b'{';
 pub(crate) const TYPE_STRING: u8 = b's';
+/// int：`'i'` + 4 字节小端。p4 的错误记录带这样的字段（实测 `severity` / `generic`）。
+pub(crate) const TYPE_INT: u8 = b'i';
 
 /// 从 Python marshal 格式里读一个字符串。
 /// 格式：`'s'`（类型字节）+ 4 字节小端 i32（长度）+ N 字节（数据）。
@@ -50,8 +52,33 @@ pub(crate) fn read_marshal_string(cursor: &mut &[u8]) -> Result<Option<Vec<u8>>>
     Ok(Some(data))
 }
 
+/// 从 Python marshal 格式里读一个字典值。
+///
+/// 值可以是字符串，也可以是 int——p4 的错误记录就是后者（实测 `p4 -G have` 对本地与
+/// depot 都没有的路径返回 `{'code': 'error', 'data': '... - file(s) not on client.\n',
+/// 'severity': 2, 'generic': 17}`，两个字段都是 int）。int 转成十进制文本，让字典
+/// 保持完整；其余类型没在 p4 的输出里见过，宁可报错也不要静默错位。
+fn read_marshal_value(cursor: &mut &[u8]) -> Result<Option<Vec<u8>>> {
+    let probe = *cursor;
+
+    if probe.is_empty() {
+        return Ok(None);
+    }
+
+    if probe[0] != TYPE_INT {
+        return read_marshal_string(cursor);
+    }
+
+    if probe.len() < 5 {
+        return Ok(None);
+    }
+    let number = i32::from_le_bytes([probe[1], probe[2], probe[3], probe[4]]);
+    *cursor = &probe[5..];
+    Ok(Some(number.to_string().into_bytes()))
+}
+
 /// 从 Python marshal 格式里读一个字典。
-/// 格式：`'{'`（类型字节）+（键字符串 + 值字符串）* + `'0'`（终止符）。
+/// 格式：`'{'`（类型字节）+（键字符串 + 值）* + `'0'`（终止符）。
 ///
 /// `dict` 是清空后原地填充的：流式调用方复用一个 map，不必为几百万条记录里的每一条
 /// 重新分配（那还会连带每条记录每个字段两个 `Vec`）。
@@ -85,7 +112,7 @@ pub(crate) fn read_marshal_dict_into(
         let Some(key) = read_marshal_string(&mut probe)? else {
             return Ok(None);
         };
-        let Some(value) = read_marshal_string(&mut probe)? else {
+        let Some(value) = read_marshal_value(&mut probe)? else {
             return Ok(None);
         };
         dict.insert(key, value);
@@ -260,6 +287,37 @@ mod tests {
             .get("e:\\中文\\私服使用说明.docx")
             .expect("key should be the ascii-lowercased utf8 path");
         assert_eq!(record.sync_time, Some(1700000000));
+    }
+
+    /// p4 的错误记录带 int 字段：`p4 -G have` 对本地与 depot 都没有的路径返回
+    /// `{'code': 'error', 'data': '... - file(s) not on client.\n', 'severity': 2,
+    /// 'generic': 17}`。整条流不能因为这几个整数中止，而且后面的记录要照常解析。
+    #[test]
+    fn dict_values_may_be_marshal_ints() {
+        // `marshal_dict` 只造字符串字段，int 字段手工追加在终止符之前。
+        let mut data = marshal_dict(&[
+            ("code", "error"),
+            ("data", "E:\\ws\\gone.txt - file(s) not on client.\n"),
+        ]);
+        data.pop();
+        for (key, number) in [("severity", 2i32), ("generic", 17)] {
+            data.extend_from_slice(&marshal_string(key));
+            data.push(TYPE_INT);
+            data.extend_from_slice(&number.to_le_bytes());
+        }
+        data.push(TYPE_NULL);
+
+        // 紧跟一条正常记录：int 字段若被读错长度，这一条会解析不出来。
+        data.extend_from_slice(&marshal_dict(&[
+            ("code", "stat"),
+            ("path", "E:\\ws\\kept.txt"),
+            ("syncTime", "1700000000"),
+        ]));
+
+        let records = parse_p4_have_output(&data, UTF_8).unwrap();
+
+        assert_eq!(records.len(), 1, "错误记录不该产出 have 记录");
+        assert!(records.contains_key("e:\\ws\\kept.txt"), "{records:?}");
     }
 
     #[test]

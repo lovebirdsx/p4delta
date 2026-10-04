@@ -344,6 +344,29 @@ pub(crate) fn validate_refreshed_records(
     Ok(())
 }
 
+/// 去掉重复的 fstat 记录。
+///
+/// 重叠的 file spec（例如 `dir/...` 与该目录里的一个文件同时作为范围入口）会让 p4
+/// 对同一文件返回多条记录——实测确认过。不去重的话，删除候选会被 push 两次、
+/// 命令重复下发。
+///
+/// 键取**大小写敏感**的 depot 路径：`Snow_Normal.uasset` 与 `Snow_normal.uasset` 是
+/// depot 里两个不同的文件，折成小写去重会悄悄吃掉一条，连 `build_mapping` 里那条
+/// 「在库的胜过已删除的」决胜规则都跟着失效——而那个场景正是它要处理的。
+/// 重叠入口产生的重复记录才是逐字节相同的，用原样路径做键正好只去掉它们。
+fn dedupe_records(records: Vec<DepotFileRecord>) -> Vec<DepotFileRecord> {
+    let mut seen: HashSet<String> = HashSet::with_capacity(records.len());
+    let mut deduped = Vec::with_capacity(records.len());
+
+    for record in records {
+        if seen.insert(record.depot_file.clone()) {
+            deduped.push(record);
+        }
+    }
+
+    deduped
+}
+
 /// 取走初次查询里的 `(head_rev, head_action)`，作为目标版本的事实。
 ///
 /// 必须在补查**之前**调用：补查会把 `head_type` / `head_action` / `file_size` / `digest`
@@ -382,11 +405,16 @@ pub(crate) async fn run_p4_fstat_at_revision(
     options: &Options,
     work_dir: &str,
     changelist: u32,
+    specs: &[String],
 ) -> Result<TargetMap> {
     println!("   Requesting depot state for changelist {changelist}.");
     let start_time = Instant::now();
 
-    let query = [format!("./...@{changelist}")];
+    // 版本说明符拼在每个入口的 file spec 后面，与路径一样经 stdin 发放。
+    let query: Vec<String> = specs
+        .iter()
+        .map(|spec| format!("{spec}@{changelist}"))
+        .collect();
     let records = run_p4_fstat_batched(options, work_dir, &FSTAT_ARGS, &query, true).await?;
     let target = snapshot_target(&records);
 
@@ -401,17 +429,25 @@ pub(crate) async fn run_p4_fstat_at_revision(
 }
 
 /// 查询 depot 状态。第二项是目标版本快照，只有 sync 模式才建（见 [`snapshot_target`]）。
+///
+/// `specs` 是本轮范围的 file spec 列表（目录已补 `...`）：一个入口一条，一次批量查询。
 pub(crate) async fn run_p4_fstat_all(
     options: &Options,
     work_dir: &str,
+    specs: &[String],
 ) -> Result<(DepotState, Option<TargetMap>)> {
     println!("   Requesting depot state for all files.");
     let start_time = Instant::now();
 
-    let initial_args = [String::from("./...")];
     let mut depot_state: DepotState = Default::default();
-    depot_state.file_records =
-        run_p4_fstat_batched(options, work_dir, &FSTAT_ARGS, &initial_args, false).await?;
+    // 单入口时每条 file spec 至多回一条记录，不存在重复；而在几十万条记录上建哈希表、
+    // 逐条复制路径，是这条路上最贵的恒等变换。
+    let records = run_p4_fstat_batched(options, work_dir, &FSTAT_ARGS, specs, false).await?;
+    depot_state.file_records = if specs.len() <= 1 {
+        records
+    } else {
+        dedupe_records(records)
+    };
 
     depot_state.build_mapping();
 
@@ -543,6 +579,41 @@ mod tests {
         // 非 ASCII 路径解码后原样保留，查询键照旧折成小写。
         assert_eq!(records[1].client_file, "E:\\ws\\中文.txt");
         assert_eq!(records[1].client_file_lower, "e:\\ws\\中文.txt");
+    }
+
+    /// 去重只该去掉「同一条记录被查了两遍」，不能顺手吃掉大小写不同的另一个文件。
+    ///
+    /// 折成小写去重会连 `build_mapping` 里「在库的胜过已删除的」那条决胜规则一起废掉：
+    /// 它要处理的正是这一个小写键下的两个文件。
+    #[test]
+    fn dedupe_records_keeps_case_variants_and_drops_true_repeats() {
+        let lines: Vec<&[u8]> = vec![
+            b"... depotFile //depot/Snow_Normal.uasset",
+            b"... clientFile E:\\ws\\Snow_Normal.uasset",
+            b"... headRev 1",
+            b"",
+            b"... depotFile //depot/Snow_normal.uasset",
+            b"... clientFile E:\\ws\\Snow_normal.uasset",
+            b"... headRev 1",
+            b"",
+            // 重叠入口（`dir/...` 与该目录里的文件）造成的原样重复。
+            b"... depotFile //depot/Snow_Normal.uasset",
+            b"... clientFile E:\\ws\\Snow_Normal.uasset",
+            b"... headRev 1",
+            b"",
+        ];
+
+        let records = parse_p4_fstat_lines(lines, UTF_8).unwrap();
+        let deduped = dedupe_records(records);
+
+        let kept: Vec<&str> = deduped
+            .iter()
+            .map(|record| record.depot_file.as_str())
+            .collect();
+        assert_eq!(
+            kept,
+            vec!["//depot/Snow_Normal.uasset", "//depot/Snow_normal.uasset"]
+        );
     }
 
     /// 目标快照的取值口径：认 `headRev` 与 `headAction`，缺一个就不进表。

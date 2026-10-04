@@ -233,6 +233,15 @@ impl DepotState {
         }
     }
 
+    /// 按谓词保留记录并重建索引。过滤会打乱既有索引（下标全部失效），所以必须整体重建，
+    /// 不能沿用 [`Self::build_mapping`] 的累加式插入。
+    pub(crate) fn retain_records(&mut self, mut keep: impl FnMut(&DepotFileRecord) -> bool) {
+        self.file_records.retain(|record| keep(record));
+        self.depot_map.clear();
+        self.client_map.clear();
+        self.build_mapping();
+    }
+
     pub(crate) fn get_depot_record_mut(&mut self, file: &str) -> Option<&mut DepotFileRecord> {
         self.depot_map.get(file).map(|&i| &mut self.file_records[i])
     }

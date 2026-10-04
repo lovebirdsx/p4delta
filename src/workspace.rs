@@ -1,6 +1,7 @@
 //! 工作区文件的收集与过滤。
 
 use std::collections::HashSet;
+use std::fs;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -14,25 +15,87 @@ use crate::path::{local_path_key, normalize_local_path_owned, path_is_under_key}
 use crate::prune::{
     IGNORES_ARGS, PrunePlan, has_pruned_ancestor, parse_ignores_output, plan_directory_pruning,
 };
+use crate::scope::{EntryKind, ExcludeSet, Scope, ScopeEntry};
 
-/// 扫描工作区文件。`skip_dirs` 里的目录及其子树会被跳过（目录级 ignore 剪枝的结果）。
+/// 扫描范围入口：目录入口递归收集；文件入口直接取单个文件（本地不存在就跳过，
+/// 让 depot 记录去判定——「本地删除、depot 还有」正是 open for delete 要看的状态）。
+///
+/// `skip_dirs` 是 ignore 剪枝结果（语义：p4 看不见这些目录，但其中已跟踪文件要回扫）；
+/// `excludes` 是范围硬排除（命中即整棵子树跳过，且不像剪枝那样回扫）。
+pub(crate) fn collect_scope_files(
+    includes: &[ScopeEntry],
+    skip_dirs: &[String],
+    excludes: &ExcludeSet,
+) -> Result<(Vec<WorkspaceFile>, usize, u64)> {
+    let skip_keys: HashSet<String> = skip_dirs.iter().map(|dir| local_path_key(dir)).collect();
+    let mut files = Vec::new();
+    let mut num_dirs = 0;
+    let mut total_size = 0;
+
+    for entry in includes {
+        match entry.kind {
+            EntryKind::Directory => {
+                let (mut collected, dirs, size) =
+                    collect_directory(&entry.path, &skip_keys, excludes)?;
+                files.append(&mut collected);
+                num_dirs += dirs;
+                total_size += size;
+            }
+            EntryKind::File => {
+                if let Some(file) = collect_single_file(&entry.path, excludes)? {
+                    total_size += file.size;
+                    files.push(file);
+                }
+            }
+        }
+    }
+
+    files.sort_by(|a, b| a.path_lower.cmp(&b.path_lower));
+
+    Ok((files, num_dirs, total_size))
+}
+
+/// 扫描单个目录。`skip_dirs` 里的目录及其子树会被跳过（目录级 ignore 剪枝的结果）；
+/// `excludes` 是范围排除项，命中的子树同样不进入。
 pub(crate) fn collect_workspace_files(
     work_dir: &str,
     skip_dirs: &[String],
+    excludes: &ExcludeSet,
+) -> Result<(Vec<WorkspaceFile>, usize, u64)> {
+    let skip_keys: HashSet<String> = skip_dirs.iter().map(|dir| local_path_key(dir)).collect();
+    let (mut files, num_dirs, total_size) = collect_directory(work_dir, &skip_keys, excludes)?;
+
+    files.sort_by(|a, b| a.path_lower.cmp(&b.path_lower));
+
+    Ok((files, num_dirs, total_size))
+}
+
+/// 递归收集一个目录里的文件。
+fn collect_directory(
+    dir: &str,
+    skip_keys: &HashSet<String>,
+    excludes: &ExcludeSet,
 ) -> Result<(Vec<WorkspaceFile>, usize, u64)> {
     let mut files = Vec::new();
     let mut num_dirs = 0;
     let mut total_size = 0;
-    let skip_keys: HashSet<String> = skip_dirs.iter().map(|dir| local_path_key(dir)).collect();
 
-    let mut walker = WalkDir::new(work_dir).into_iter();
+    let mut walker = WalkDir::new(dir).into_iter();
     while let Some(entry) = walker.next() {
         let entry = entry?;
         let file_type = entry.file_type();
 
         if file_type.is_dir() {
             let dir_key = local_path_key(&entry.path().display().to_string());
-            if skip_keys.contains(&dir_key) || has_pruned_ancestor(&dir_key, &skip_keys) {
+
+            // 范围排除是硬排除：整棵子树不碰，也不像 ignore 剪枝那样回扫
+            // （回扫是给「p4 看不见但已跟踪」的目录用的，排除目录不在其列）。
+            if excludes.excludes_key(&dir_key) {
+                walker.skip_current_dir();
+                continue;
+            }
+
+            if skip_keys.contains(&dir_key) || has_pruned_ancestor(&dir_key, skip_keys) {
                 walker.skip_current_dir();
                 continue;
             }
@@ -44,6 +107,11 @@ pub(crate) fn collect_workspace_files(
         // 大小与时间描述的是链接本身。
         } else if file_type.is_file() || file_type.is_symlink() {
             let path_string = normalize_local_path_owned(entry.path().display().to_string());
+
+            if excludes.excludes_key(&local_path_key(&path_string)) {
+                continue;
+            }
+
             let meta = entry.metadata()?;
             total_size += meta.len();
 
@@ -57,9 +125,33 @@ pub(crate) fn collect_workspace_files(
         }
     }
 
-    files.sort_by(|a, b| a.path_lower.cmp(&b.path_lower));
-
     Ok((files, num_dirs, total_size))
+}
+
+/// 收集单个文件入口。本地不存在时返回 None——文件可能已被删除，depot 记录会把它判成
+/// 待删除；这里静默跳过正是让那条链路成立的前提。
+fn collect_single_file(path: &str, excludes: &ExcludeSet) -> Result<Option<WorkspaceFile>> {
+    if excludes.excludes_key(&local_path_key(path)) {
+        return Ok(None);
+    }
+
+    // lstat 语义，与目录扫描一致：符号链接算文件，大小与时间描述链接本身。
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+
+    // 入口位置被本地目录顶替（文件被删、原地建了同名目录）时不按文件收。
+    if meta.is_dir() {
+        return Ok(None);
+    }
+
+    Ok(Some(WorkspaceFile {
+        path_lower: local_path_key(path),
+        path: normalize_local_path_owned(path.to_owned()),
+        size: meta.len(),
+        date: meta.modified()?,
+        filtered: false,
+    }))
 }
 
 /// 用 `p4 ignores -i` 标记被忽略的文件，返回被忽略的数量。
@@ -321,14 +413,16 @@ pub(crate) async fn filter_unmapped_paths(
 /// 扫描工作区，返回收集到的文件状态与本次实际应用的剪枝计划。
 pub(crate) async fn gather_workspace(
     options: &Options,
-    work_dir: &str,
+    scope: &Scope,
 ) -> Result<(WorkspaceState, PrunePlan)> {
     println!("   Scanning workspace for files.");
     let start_time = Instant::now();
 
-    let plan = plan_directory_pruning(options, work_dir).await?;
+    let roots = scope.directory_roots();
+    let plan = plan_directory_pruning(options, &scope.first_dir, &roots, &scope.excludes).await?;
 
-    let (mut files, num_dirs, total_size) = collect_workspace_files(work_dir, &plan.dirs)?;
+    let (mut files, num_dirs, total_size) =
+        collect_scope_files(&scope.includes, &plan.dirs, &scope.excludes)?;
 
     if options.verbose {
         for file in &files {
@@ -347,7 +441,7 @@ pub(crate) async fn gather_workspace(
     println!("   Filtering workspace files.");
     let start_time = Instant::now();
 
-    let ignored_count = apply_file_ignores(options, work_dir, &mut files).await?;
+    let ignored_count = apply_file_ignores(options, &scope.first_dir, &mut files).await?;
 
     let mut workspace_state = WorkspaceState {
         num_files: files.len() - ignored_count,
@@ -368,11 +462,15 @@ pub(crate) async fn gather_workspace(
 
 /// 已剪目录里可能有 depot 已跟踪的文件，例如新加的忽略规则盖住了已同步文件。
 /// 这些目录必须用原来的扫描逻辑重新收集并按原生规则过滤，否则会被误判为删除。
+///
+/// `excludes` 要一路带下去：排除子树在 depot 侧已经被过滤掉，本地若还把它们收回来，
+/// 那些文件在分析眼里就成了「本地有、depot 没有」的新增。
 pub(crate) async fn rescan_tracked_pruned_dirs(
     options: &Options,
     work_dir: &str,
     depot: &DepotState,
     plan: &PrunePlan,
+    excludes: &ExcludeSet,
     workspace: &mut WorkspaceState,
 ) -> Result<()> {
     if plan.dirs.is_empty() {
@@ -407,7 +505,7 @@ pub(crate) async fn rescan_tracked_pruned_dirs(
 
     for dir in needed {
         // 重新收集时不再剪枝，保证链接、文件类型与 I/O 错误语义和完整扫描一致。
-        let (mut files, _num_dirs, _total_size) = collect_workspace_files(dir, &[])?;
+        let (mut files, _num_dirs, _total_size) = collect_workspace_files(dir, &[], excludes)?;
         let ignored = apply_file_ignores(options, work_dir, &mut files).await?;
 
         recollected += files.len();
@@ -535,6 +633,7 @@ mod tests {
         tree.file("node_modules/mod.js", "tracked");
         tree.file("node_modules/open.js", "tracked, open for edit");
         tree.file("node_modules/extra.tmp", "not tracked");
+        tree.file("node_modules/generated/gen.js", "excluded by the scope");
         tree.file("build/out.bin", "no tracked file in this pruned directory");
         tree.file("node_modules2/keep.js", "not ignored");
         tree.file("src/app.txt", "not ignored");
@@ -554,7 +653,7 @@ mod tests {
 
         // 主扫描按剪枝结果跳过了这些目录，本地文件都在，但工作区里看不到
         let (files, _num_dirs, _total_size) =
-            collect_workspace_files(&work_dir, &plan.dirs).unwrap();
+            collect_workspace_files(&work_dir, &plan.dirs, &ExcludeSet::default()).unwrap();
         let mut workspace = WorkspaceState {
             num_files: files.len(),
             files,
@@ -572,6 +671,16 @@ mod tests {
         let (_build_path, build_key) = path_of("build/out.bin");
         let (_keep_path, keep_key) = path_of("node_modules2/keep.js");
         let (_gone_path, gone_key) = path_of("node_modules/gone.js");
+        let (_gen_path, gen_key) = path_of("node_modules/generated/gen.js");
+
+        // 范围排除的子树：depot 侧已经过滤掉它，本地侧同样不能再收回来。
+        let excludes = ExcludeSet::from_dir_keys(&[&local_path_key(
+            &tree
+                .root
+                .join("node_modules/generated")
+                .display()
+                .to_string(),
+        )]);
 
         assert!(
             !workspace.has_file(&mod_key),
@@ -616,6 +725,7 @@ mod tests {
             &work_dir,
             &depot,
             &plan,
+            &excludes,
             &mut workspace,
         ))
         .unwrap();
@@ -634,6 +744,11 @@ mod tests {
         assert!(workspace.has_file(&keep_key));
         // 重扫目录里的普通文件按原逻辑收集
         assert!(workspace.has_file(&extra_key));
+        // 排除子树不收：它的记录在 depot 侧已被过滤，收回来就成了凭空的「新增」
+        assert!(
+            !workspace.has_file(&gen_key),
+            "an excluded subtree must not be recollected"
+        );
 
         if native_filter_available {
             // 被原生规则忽略时标记 filtered，但必须仍留在工作区里（存在即不删）
@@ -663,7 +778,8 @@ mod tests {
         }
 
         let (files, _num_dirs, _total_size) =
-            collect_workspace_files(&tree.root.to_string_lossy(), &[]).unwrap();
+            collect_workspace_files(&tree.root.to_string_lossy(), &[], &ExcludeSet::default())
+                .unwrap();
 
         let link_key = local_path_key(&link.display().to_string());
         assert!(

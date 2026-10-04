@@ -150,19 +150,6 @@ fn missing_workspace_is_a_run_error() {
         ));
 }
 
-/// 路径不存在不再是「跳过」，而是错误：一个可用的路径都没有就什么都没做，
-/// 而「什么都没做」报告成功会让 P4V 那边（prompt 留空、路径拼错）以为事情办完了。
-#[test]
-fn a_path_that_does_not_exist_is_an_error() {
-    cli()
-        .args(["-w", "some-workspace", "--charset", "utf8"])
-        .arg("this-path-does-not-exist-9f3c1e")
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("does not exist"))
-        .stderr(predicate::str::contains("this-path-does-not-exist-9f3c1e"));
-}
-
 /// 一个路径都不给也是错误。P4V 的 prompt 留空时命令行上就是这种形状。
 #[test]
 fn a_run_without_a_path_is_an_error() {
@@ -171,20 +158,6 @@ fn a_run_without_a_path_is_an_error() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("No path given"));
-}
-
-/// 传文件而不是目录同样是错误，**不是**退而求其次用它的父目录：父目录会把工作范围悄悄
-/// 扩大到用户没点过的东西上，而 `--sync` 会覆盖本地改动、`--clean` 会删文件。
-/// （P4V 的文件历史里右键就会走到这里，见 README 的 P4V 集成一节。）
-#[test]
-fn a_path_that_is_a_file_is_an_error() {
-    let file = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
-    cli()
-        .args(["-w", "some-workspace", "--charset", "utf8"])
-        .arg(file)
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("is not a directory"));
 }
 
 /// `P4_EXE` 指到不存在的文件是**配置错误**，不是「这台机器没有 p4」：后者由各调用点

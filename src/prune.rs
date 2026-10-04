@@ -18,6 +18,7 @@ use crate::p4::process::{
     split_command_line_paths,
 };
 use crate::path::{local_path_key, normalize_local_path_owned, path_is_under_key};
+use crate::scope::ExcludeSet;
 
 /// P4IGNORE 必须恰好解析成这个名字，才允许用目录级判断剪枝。
 pub(crate) const P4IGNORE_FILE_NAME: &str = ".p4ignore";
@@ -289,25 +290,37 @@ pub(crate) fn is_ignore_file_name(name: &OsStr) -> bool {
 }
 
 /// 只收集目录并查找嵌套忽略文件，不获取文件 metadata、不保留文件路径。
-pub(crate) fn prescan_directories(work_dir: &str) -> Result<Prescan> {
+/// 多入口时对每个根分别遍历，深度相对各自的根计算。
+pub(crate) fn prescan_directories(roots: &[String], excludes: &ExcludeSet) -> Result<Prescan> {
     let mut prescan = Prescan::default();
 
-    for entry in WalkDir::new(work_dir) {
-        let entry = entry?;
-        let file_type = entry.file_type();
+    for root in roots {
+        let mut walker = WalkDir::new(root).into_iter();
 
-        if file_type.is_dir() {
-            if entry.depth() > 0 {
+        while let Some(entry) = walker.next() {
+            let entry = entry?;
+            let file_type = entry.file_type();
+
+            if file_type.is_dir() {
                 let path = normalize_local_path_owned(entry.path().display().to_string());
-                prescan.dirs.push((entry.depth(), path));
-            }
-            continue;
-        }
 
-        // 同名条目只要不是目录就按嵌套忽略文件处理：符号链接等情况也保守算上。
-        // 根目录自己的 .p4ignore 是标准配置（深度 1），只有子目录里的才算嵌套。
-        if entry.depth() >= 2 && is_ignore_file_name(entry.file_name()) {
-            prescan.nested_ignore = true;
+                // 范围排除的目录连候选都不是：它根本不会被扫描，剪不剪都无意义。
+                if excludes.excludes_key(&local_path_key(&path)) {
+                    walker.skip_current_dir();
+                    continue;
+                }
+
+                if entry.depth() > 0 {
+                    prescan.dirs.push((entry.depth(), path));
+                }
+                continue;
+            }
+
+            // 同名条目只要不是目录就按嵌套忽略文件处理：符号链接等情况也保守算上。
+            // 根目录自己的 .p4ignore 是标准配置（深度 1），只有子目录里的才算嵌套。
+            if entry.depth() >= 2 && is_ignore_file_name(entry.file_name()) {
+                prescan.nested_ignore = true;
+            }
         }
     }
 
@@ -315,10 +328,15 @@ pub(crate) fn prescan_directories(work_dir: &str) -> Result<Prescan> {
 }
 
 /// 目录剪枝的对外入口：算好计划后统一打印一行结果，便于对比基准。
-pub(crate) async fn plan_directory_pruning(options: &Options, work_dir: &str) -> Result<PrunePlan> {
+pub(crate) async fn plan_directory_pruning(
+    options: &Options,
+    work_dir: &str,
+    roots: &[String],
+    excludes: &ExcludeSet,
+) -> Result<PrunePlan> {
     let start_time = Instant::now();
     // p4 查询出错只说明用不了目录级剪枝，回退到完整扫描继续，不要中止整个协调。
-    let plan = match decide_directory_pruning(options, work_dir).await {
+    let plan = match decide_directory_pruning(options, work_dir, roots, excludes).await {
         Ok(plan) => plan,
         Err(error) => PrunePlan::fallback(format!("p4 query failed: {error:#}")),
     };
@@ -341,9 +359,16 @@ pub(crate) async fn plan_directory_pruning(options: &Options, work_dir: &str) ->
 pub(crate) async fn decide_directory_pruning(
     options: &Options,
     work_dir: &str,
+    roots: &[String],
+    excludes: &ExcludeSet,
 ) -> Result<PrunePlan> {
     if options.no_prune_ignored_dirs {
         return Ok(PrunePlan::fallback("--no-prune-ignored-dirs"));
+    }
+
+    // 纯文件入口没有目录可剪，连 p4 都不必问。
+    if roots.is_empty() {
+        return Ok(PrunePlan::default());
     }
 
     // 只有恰好配置成标准 .p4ignore 时才敢用目录级判断，其他配置（多文件、绝对路径）回退。
@@ -365,7 +390,7 @@ pub(crate) async fn decide_directory_pruning(
     }
 
     // 嵌套的 .p4ignore 只靠 `p4 ignores -v` 是看不出来的，必须自己预扫描。
-    let prescan = prescan_directories(work_dir)?;
+    let prescan = prescan_directories(roots, excludes)?;
     if prescan.nested_ignore {
         return Ok(PrunePlan::fallback("nested .p4ignore found"));
     }
@@ -449,6 +474,12 @@ mod tests {
 
     use crate::charset::parse_p4_set_value;
     use crate::p4::process::command_line_safe;
+
+    /// 单根、无排除的预扫描：多数用例只关心一个根目录这一种情形。
+    fn prescan_root(root: &str) -> Result<Prescan> {
+        prescan_directories(&[root.to_owned()], &ExcludeSet::default())
+    }
+
     #[test]
     fn pruned_ancestors_are_found_by_component() {
         let sep = std::path::MAIN_SEPARATOR;
@@ -574,7 +605,7 @@ mod tests {
         tree.file("ignored/a.txt", "a");
         tree.file("src/deep/b.txt", "b");
 
-        let prescan = prescan_directories(&tree.root.to_string_lossy()).unwrap();
+        let prescan = prescan_root(&tree.root.to_string_lossy()).unwrap();
 
         assert!(!prescan.nested_ignore);
         // 根的直接子目录深度为 1，更深的目录交给第二轮目录查询
@@ -587,7 +618,7 @@ mod tests {
         // 根目录以下的 .p4ignore 会让 p4 按子目录应用规则，必须放弃剪枝
         tree.file("src/deep/.p4ignore", "x\n");
         assert!(
-            prescan_directories(&tree.root.to_string_lossy())
+            prescan_root(&tree.root.to_string_lossy())
                 .unwrap()
                 .nested_ignore
         );
@@ -631,8 +662,13 @@ mod tests {
             // 命中忽略目录时只剪掉最上层目录，其余目录不再查询
             "gate-plan" => {
                 let options = Options::parse_from(["p4delta", "-w", "p4delta-test"]);
-                let plan = task::block_on(decide_directory_pruning(&options, &work_dir))
-                    .expect("p4 queries must succeed when p4 is available");
+                let plan = task::block_on(decide_directory_pruning(
+                    &options,
+                    &work_dir,
+                    std::slice::from_ref(&work_dir),
+                    &ExcludeSet::default(),
+                ))
+                .expect("p4 queries must succeed when p4 is available");
                 assert!(
                     plan.fallback.is_none(),
                     "directory pruning must not fall back: {:?}",
@@ -646,10 +682,15 @@ mod tests {
             }
             // 嵌套忽略文件必须让门控回退
             "gate-nested" => {
-                assert!(prescan_directories(&work_dir).unwrap().nested_ignore);
+                assert!(prescan_root(&work_dir).unwrap().nested_ignore);
                 let options = Options::parse_from(["p4delta", "-w", "p4delta-test"]);
-                let plan = task::block_on(decide_directory_pruning(&options, &work_dir))
-                    .expect("p4 queries must succeed when p4 is available");
+                let plan = task::block_on(decide_directory_pruning(
+                    &options,
+                    &work_dir,
+                    std::slice::from_ref(&work_dir),
+                    &ExcludeSet::default(),
+                ))
+                .expect("p4 queries must succeed when p4 is available");
                 assert!(
                     plan.dirs.is_empty(),
                     "a nested ignore file must disable pruning"
@@ -684,8 +725,13 @@ mod tests {
                     "client name \"*\" must make p4 exit non-zero on this platform"
                 );
 
-                let plan = task::block_on(plan_directory_pruning(&options, &work_dir))
-                    .expect("a failing p4 query must not abort the reconcile");
+                let plan = task::block_on(plan_directory_pruning(
+                    &options,
+                    &work_dir,
+                    std::slice::from_ref(&work_dir),
+                    &ExcludeSet::default(),
+                ))
+                .expect("a failing p4 query must not abort the reconcile");
                 assert!(
                     plan.dirs.is_empty(),
                     "no directory may be pruned from a failed query"
@@ -838,7 +884,7 @@ mod tests {
 
         // 嵌套 .p4ignore 在 -v 里看不到，只能靠预扫描
         tree.file("build/keep/.p4ignore", "x\n");
-        let prescan = prescan_directories(&tree.root.to_string_lossy()).unwrap();
+        let prescan = prescan_root(&tree.root.to_string_lossy()).unwrap();
         assert!(prescan.nested_ignore);
     }
 
@@ -918,12 +964,12 @@ mod tests {
         let work_dir = tree.root.to_string_lossy().to_string();
 
         // 根目录自己的忽略文件是标准配置，只有子目录里的才算嵌套
-        assert!(!prescan_directories(&work_dir).unwrap().nested_ignore);
+        assert!(!prescan_root(&work_dir).unwrap().nested_ignore);
 
         // Windows 的文件名不区分大小写，.P4IGNORE 就是同一个文件
         tree.file("src/.P4IGNORE", "!keep/\n");
         assert_eq!(
-            prescan_directories(&work_dir).unwrap().nested_ignore,
+            prescan_root(&work_dir).unwrap().nested_ignore,
             cfg!(windows),
             ".P4IGNORE is a nested ignore file only on case-insensitive filesystems"
         );
@@ -933,14 +979,14 @@ mod tests {
         let symlink_tree = TempTree::new("prescan-symlink");
         symlink_tree.file(".p4ignore", "ignored/\n");
         let symlink_dir = symlink_tree.root.to_string_lossy().to_string();
-        assert!(!prescan_directories(&symlink_dir).unwrap().nested_ignore);
+        assert!(!prescan_root(&symlink_dir).unwrap().nested_ignore);
 
         let target = symlink_tree.file("shared-rules.txt", "x\n");
         let link = symlink_tree.root.join("linked").join(P4IGNORE_FILE_NAME);
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         match symlink_file(&target, &link) {
             Ok(()) => assert!(
-                prescan_directories(&symlink_dir).unwrap().nested_ignore,
+                prescan_root(&symlink_dir).unwrap().nested_ignore,
                 "a symlinked nested ignore file must disable pruning"
             ),
             // 没有创建符号链接的权限时只能明确跳过，其他错误一律失败

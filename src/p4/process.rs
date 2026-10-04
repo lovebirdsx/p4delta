@@ -110,39 +110,45 @@ pub(crate) async fn write_p4_arguments(arguments: Option<(ChildStdin, Vec<u8>)>)
     let _ = stdin.close().await;
 }
 
-/// 跑 `p4 -G have`，解析它的 marshal 二进制输出，取回同步时间戳。
+/// `p4 have` 的参数。`-G` 让它输出 marshal 格式（见 [`crate::p4::marshal`]）。
+const HAVE_ARGS: &[&str] = &["-G", "have"];
+
+/// 跑 `p4 -G have`，解析它的 marshal 二进制输出，取回同步时间戳（syncTime），
+/// 供时间戳快筛使用。
+///
+/// `specs` 是本轮范围的 file spec 列表，一个入口一条。它们走 `-x -` 送进 stdin：
+/// 入口可以是含非 ASCII 字符的路径，挂在命令行上会被 Windows 的 ANSI 代码页转换吃掉，
+/// 一个这样的路径就足以让整批查询失败（见 [`command_line_safe`]）。
 pub(crate) async fn run_p4_have(
     options: &Options,
     work_dir: &str,
+    specs: &[String],
 ) -> Result<HashMap<String, HaveRecord>> {
     println!("   Querying file sync timestamps.");
     let start_time = Instant::now();
 
-    let mut cmd = Command::new(crate::locate::p4_exe()?);
-    cmd.current_dir(work_dir);
-    // p4 在 Windows 上按继承来的 PWD 找 .p4config，显式指定 cwd 时必须同时清掉 PWD。
-    cmd.env_remove("PWD");
-
-    if let Some(workspace) = &options.workspace {
-        cmd.arg("-c");
-        cmd.arg(workspace);
-    }
-
-    cmd.arg("-G");
-    cmd.arg("have");
-    cmd.arg("...");
+    let (mut cmd, payload) = build_p4_command(
+        crate::locate::p4_exe()?,
+        work_dir,
+        HAVE_ARGS,
+        specs,
+        options.workspace.as_deref(),
+        None,
+    );
 
     if options.verbose {
-        println!("    Running: p4 -G have ...");
+        println!("    Running: p4 -G have {}", specs.join(" "));
     }
 
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
-
     let mut child = cmd.spawn()?;
-    // 参数是 `...`，用不上 stdin。
-    let P4Pipes { stdout, stderr, .. } = take_p4_pipes(&mut child, None)?;
+    let P4Pipes {
+        arguments,
+        stdout,
+        stderr,
+    } = take_p4_pipes(&mut child, payload)?;
+
+    // 参数在 stdin 上：写完关掉管道，p4 才读得到 EOF。
+    write_p4_arguments(arguments).await;
 
     // 边读边解析：大工作区的原始响应有好几 GB，整份缓冲下来正是当初把内存撑爆的原因。
     let read_stdout = async move {

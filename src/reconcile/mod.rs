@@ -1,11 +1,11 @@
-//! 单个目录的 reconcile 编排。
+//! 范围的 reconcile 编排。
 
 mod analyze;
 mod changes;
 mod clean;
 mod sync;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::time::Instant;
@@ -28,33 +28,76 @@ use crate::model::{
 };
 use crate::p4::fstat::{run_p4_fstat_all, run_p4_fstat_at_revision};
 use crate::p4::process::{FailureMode, run_p4_command_batched, run_p4_have};
+use crate::path::path_is_under_key;
 use crate::prune::PrunePlan;
+use crate::scope::{EntryKind, ExcludeSet, Scope};
 use crate::workspace::{filter_unmapped_paths, gather_workspace, rescan_tracked_pruned_dirs};
 
-/// 单个目录的 reconcile 编排：拉齐 fstat / 工作区 / have 三路数据，分析、算摘要，
-/// 最后把变更下发给 p4。
-pub(crate) async fn reconcile_dir(
+/// 一轮 reconcile 的编排：拉齐 fstat / 工作区 / have 三路数据，分析、算摘要，
+/// 最后把变更下发给 p4。多个范围入口合并成这一轮——一次操作、一个视图。
+pub(crate) async fn reconcile_scope(
     options: &Options,
-    work_dir: &str,
+    scope: &Scope,
     cache: &mut WorkspaceCache,
     cache_writer: &mut Option<CacheWriter>,
 ) -> Result<()> {
-    println!("Processing path \"{}\".", work_dir);
+    // cwd 取第一个入口的所在目录：`.p4config` / P4IGNORE 的发现跟着它走。
+    let work_dir = scope.first_dir.as_str();
+
+    println!(
+        "Processing {} scope entr{}.",
+        scope.includes.len(),
+        if scope.includes.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        }
+    );
+    if options.verbose {
+        for entry in &scope.includes {
+            println!("         Entry \"{}\"", entry.path);
+        }
+    }
+
+    let specs = scope.file_specs();
 
     let (maybe_depot, maybe_workspace, maybe_have) = futures::join!(
-        run_p4_fstat_all(options, work_dir),
-        gather_workspace(options, work_dir),
-        run_p4_have(options, work_dir)
+        run_p4_fstat_all(options, work_dir, &specs),
+        gather_workspace(options, scope),
+        run_p4_have(options, work_dir, &specs)
     );
 
     // 第二项是 head 目标快照，只有 sync 模式才建（`head_action` 会被 fstat 的补查覆盖，
     // 只能在补查之前取）。
-    let (depot, head_target): (DepotState, Option<TargetMap>) = maybe_depot?;
+    let (mut depot, head_target): (DepotState, Option<TargetMap>) = maybe_depot?;
     let (mut workspace, prune_plan): (WorkspaceState, PrunePlan) = maybe_workspace?;
     let have_records: HashMap<String, HaveRecord> = maybe_have?;
 
+    // 范围排除：depot 记录与目标快照用同一份名单、同时过滤，且都在分析之前。
+    // 只过滤扫盘一侧的话，排除目录里已跟踪的文件会因为「本地扫不到」被误判成待删除。
+    warn_unmatched_entries(scope, &depot)?;
+    let excluded_depot_keys = exclude_from_depot(&mut depot, &scope.excludes);
+    if !excluded_depot_keys.is_empty() {
+        println!(
+            "   Left {} depot-tracked file(s) outside the scope untouched.",
+            excluded_depot_keys.len()
+        );
+    }
+    let head_target = head_target.map(|mut target| {
+        target.retain(|key, _| !excluded_depot_keys.contains(key));
+        target
+    });
+
     // 差异分析之前补回已剪目录里 depot 已跟踪的文件，否则它们会被当成被删除。
-    rescan_tracked_pruned_dirs(options, work_dir, &depot, &prune_plan, &mut workspace).await?;
+    rescan_tracked_pruned_dirs(
+        options,
+        work_dir,
+        &depot,
+        &prune_plan,
+        &scope.excludes,
+        &mut workspace,
+    )
+    .await?;
 
     if depot.file_records.is_empty() && workspace.num_files == 0 {
         println!("The folder contains no files that need checking.");
@@ -66,7 +109,11 @@ pub(crate) async fn reconcile_dir(
     if options.sync {
         let target = match options.to {
             Some(changelist) => {
-                let target = run_p4_fstat_at_revision(options, work_dir, changelist).await?;
+                let mut target =
+                    run_p4_fstat_at_revision(options, work_dir, changelist, &specs).await?;
+                // 目标快照与 depot 记录用同一份排除名单，否则范围外文件会被当成
+                // 「目标时刻不在库」而遭删除。
+                target.retain(|key, _| !excluded_depot_keys.contains(key));
                 // 空结果在分析层的意思是「目标时刻什么都不存在」，落到动作上就是删光本地
                 // 每一个被跟踪的文件。depot 里明明有记录却查出空目标，那是查询坏了而不是
                 // 用户的意图——真的一无所有的工作区，depot 记录本来就是空的。立场同
@@ -379,6 +426,78 @@ pub(crate) async fn reconcile_dir(
     }
 
     Ok(())
+}
+
+/// 入口在 depot 与本地都找不到任何东西时提示一句：多半是路径拼错了。
+///
+/// 判据要求「本地不存在」且「depot 无记录」，所以空目录这类合法情况（还没同步过，
+/// 或纯本地的全新目录）同时满足两者，也会被提示——因此只要还有别的入口能干活，
+/// 就只是警告，不影响它们。本地存在的入口一定有东西可查，直接跳过，省掉大工作区里的
+/// 整表扫描。
+fn warn_unmatched_entries(scope: &Scope, depot: &DepotState) -> Result<()> {
+    let unmatched: Vec<&str> = scope
+        .includes
+        .iter()
+        .filter(|entry| !Path::new(&entry.path).exists())
+        .filter(|entry| match entry.kind {
+            // 文件入口是一次建好索引的查表；目录入口要问「这棵子树里有没有」，只能扫。
+            EntryKind::File => depot.get_client_record(&entry.path_lower).is_none(),
+            EntryKind::Directory => !depot.file_records.iter().any(|record| {
+                record.client_file_lower == entry.path_lower
+                    || path_is_under_key(&record.client_file_lower, &entry.path_lower)
+            }),
+        })
+        .map(|entry| entry.path.as_str())
+        .collect();
+
+    if unmatched.is_empty() {
+        return Ok(());
+    }
+
+    // 一条都没匹配上就是「什么都没做」，不能报成功：用户会把 exit 0 当成「处理完了」，
+    // 而真相多半是路径拼错了。部分匹配则是另一回事，其余入口照常处理。
+    if unmatched.len() == scope.includes.len() {
+        bail!(
+            "Nothing to work on: {} scope entr{} matched nothing in the depot or on disk \
+             (misspelled?):\n  {}",
+            unmatched.len(),
+            if unmatched.len() == 1 { "y" } else { "ies" },
+            unmatched.join("\n  ")
+        );
+    }
+
+    eprintln!(
+        "Warning: {} scope entr{} matched nothing in the depot or on disk (misspelled?):",
+        unmatched.len(),
+        if unmatched.len() == 1 { "y" } else { "ies" }
+    );
+    for path in unmatched {
+        eprintln!("  {path}");
+    }
+
+    Ok(())
+}
+
+/// 按范围排除过滤 depot 记录，返回被剔除的 depot 键（目标快照要用同一份名单过滤）。
+///
+/// 这一步与扫盘侧对 exclude 的处理是一对，缺一不可：少了它，排除目录里已跟踪的
+/// 文件会因为「本地扫不到」被误判成待删除。
+fn exclude_from_depot(depot: &mut DepotState, excludes: &ExcludeSet) -> HashSet<String> {
+    if excludes.is_empty() {
+        return HashSet::new();
+    }
+
+    let mut excluded = HashSet::new();
+    depot.retain_records(|record| {
+        if excludes.excludes_key(&record.client_file_lower) {
+            excluded.insert(record.depot_file_lower.clone());
+            false
+        } else {
+            true
+        }
+    });
+
+    excluded
 }
 
 // ---- 摘要阶段的小工具 ----

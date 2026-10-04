@@ -9,7 +9,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use async_global_executor as task;
 use directories::ProjectDirs;
 
@@ -25,6 +25,7 @@ mod p4;
 mod path;
 mod prune;
 mod reconcile;
+mod scope;
 mod workspace;
 
 #[cfg(test)]
@@ -34,9 +35,8 @@ use crate::cache::{CacheWriter, save_cache};
 use crate::charset::init_p4_encoding;
 use crate::locate::check_p4_exe_env;
 use crate::model::WorkspaceCache;
-use crate::p4::process::{FailureMode, run_p4_command_slice};
-use crate::path::{absolute_local_path, normalize_local_path_owned, strip_depot_wildcard_suffix};
-use crate::reconcile::reconcile_dir;
+use crate::reconcile::reconcile_scope;
+use crate::scope::evaluate_scope;
 
 /// 读写文件的缓冲区大小：缓存读写、摘要计算、p4 输出流三处共用。
 ///
@@ -76,12 +76,10 @@ pub fn run(mut options: Options) -> Result<()> {
         }
     };
 
-    // 没有路径就无事可做，而「什么事都没做」不该报告成功——P4V 那边的 prompt 留空正好落到
-    // 这里（`-l $D` 展开成空）。空串也算没给（`p4delta -l ""`）：`is_empty()` 时 `all()` 为真，
-    // 一个判断同时覆盖「没给」与「给了空串」。
-    if options.paths.iter().all(|path| path.trim().is_empty()) {
-        bail!("No path given; pass the folder to work on.");
-    }
+    // 求值本轮范围：位置参数与 `.p4delta-scope` 取交集、去重。没有路径也没有配置、
+    // 或两者交集为空，都在这里报错退出——「什么事都没做」不该报告成功。P4V 那边的
+    // prompt 留空正好落到「没给路径」这一支（`-l $D` 展开成空）。
+    let scope = task::block_on(evaluate_scope(&options))?;
 
     if options.clean {
         println!("Clean mode: updating the workspace to match the depot.");
@@ -153,95 +151,13 @@ pub fn run(mut options: Options) -> Result<()> {
     // 摘要阶段成功后按阈值保存，保留此前阶段的成果；不是阶段计算中的周期 checkpoint。
     let mut cache_writer = cache_path.map(CacheWriter::new);
 
-    // 逐个处理输入里的路径，串行执行，输出才好读。不可用的路径先记下原因：一个都用不上时
-    // 整轮失败（见循环之后），只是其中一部分时最后汇总成一行告警。
-    let mut usable = 0usize;
-    let mut unusable: Vec<String> = Vec::new();
-
-    for original_path in &options.paths {
-        let mut path: String = original_path.to_owned();
-
-        // depot 路径转工作区路径。
-        if original_path.starts_with("//") {
-            let args = ["-Mj", "-Ztag", "where"];
-            let paths = [original_path.to_owned()];
-            let current_dir = env::current_dir()
-                .map_err(|e| anyhow!("Failed to get current directory: {}", e))?;
-            let result = task::block_on(run_p4_command_slice(
-                &options,
-                &current_dir.to_string_lossy(),
-                &args,
-                &paths,
-                false,
-                FailureMode::Warn,
-            ))?;
-            for record_result in result
-                .into_iter()
-                .map(|line| serde_json::from_str::<serde_json::Value>(&line))
-            {
-                let record = record_result?;
-                if record["depotFile"].as_str() == Some(original_path) {
-                    path = record["path"]
-                        .as_str()
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "Missing 'path' field in p4 where response for {}",
-                                original_path
-                            )
-                        })?
-                        .to_owned();
-                    break;
-                }
-            }
-        }
-        // 统一本地路径：P4V 等工具会传来正斜杠，本地键必须与 p4 返回的 clientFile 一致。
-        path = normalize_local_path_owned(path);
-
-        path = strip_depot_wildcard_suffix(&path).to_owned();
-
-        // 相对路径转绝对：扫描结果的路径前缀必须与 p4 返回的 clientFile 相同。
-        path = absolute_local_path(&path);
-
-        if let Some(first_letter) = path.get_mut(0..1) {
-            first_letter.make_ascii_uppercase();
-        }
-        let check_path = PathBuf::from(&path);
-        if check_path.exists() {
-            if check_path.is_dir() {
-                task::block_on(reconcile_dir(
-                    &options,
-                    &path,
-                    &mut cache,
-                    &mut cache_writer,
-                ))?;
-                usable += 1;
-            } else {
-                unusable.push(format!("\"{original_path}\" is not a directory"));
-            }
-        } else {
-            unusable.push(format!("\"{original_path}\" does not exist"));
-        }
-    }
-
-    // 一个用得上的路径都没有，等于什么都没做，而「什么都没做」不该报成功。原因一律用
-    // `original_path`：`path` 在上面被归一化、剥通配后缀、绝对化、首字母大写，depot 路径
-    // 翻译失败时还会变成 `\\depot\...` 的样子，拿它报错用户对不上自己输入的东西。
-    if usable == 0 {
-        bail!(
-            "Nothing to work on; p4delta works on folders:\n  {}",
-            unusable.join("\n  ")
-        );
-    }
-    if !unusable.is_empty() {
-        // 告警走 stderr：`-l` 的清单在 stdout 上，别混在一起。
-        eprintln!(
-            "Warning: skipped {} path(s) that cannot be worked on:",
-            unusable.len()
-        );
-        for reason in &unusable {
-            eprintln!("  {reason}");
-        }
-    }
+    // 一次操作、一个视图：所有入口合并为一轮（exclude 的两侧过滤在 reconcile_scope 内完成）。
+    task::block_on(reconcile_scope(
+        &options,
+        &scope,
+        &mut cache,
+        &mut cache_writer,
+    ))?;
 
     save_cache(&mut cache_writer, &mut cache, true)?;
 
