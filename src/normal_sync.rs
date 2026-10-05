@@ -679,30 +679,49 @@ mod tests {
         records.pop().expect("exactly one record")
     }
 
+    /// 平台形状的测试路径。用例统一按 Windows 形式书写，这里换成本地分隔符：
+    /// `local_path_key` 与 `path_is_under_key` 都按 `MAIN_SEPARATOR` 切组件，
+    /// 硬编码的 `C:\ws\...` 在 Unix 上只是一串普通字符，父子关系判不出来。
+    fn platform_path(path: &str) -> String {
+        if cfg!(windows) {
+            path.to_owned()
+        } else {
+            path.replace('\\', "/")
+        }
+    }
+
+    /// 入口与排除项都按平台形状构造，理由见 [`platform_path`]。
     fn scope_of(includes: &[(&str, EntryKind)], excludes: &[&str]) -> Scope {
         let entries: Vec<ScopeEntry> = includes
             .iter()
-            .map(|(path, kind)| ScopeEntry {
-                path: (*path).to_owned(),
-                path_lower: local_path_key(path),
-                kind: *kind,
+            .map(|(path, kind)| {
+                let path = platform_path(path);
+                ScopeEntry {
+                    path_lower: local_path_key(&path),
+                    path,
+                    kind: *kind,
+                }
             })
             .collect();
 
+        let excludes: Vec<String> = excludes.iter().map(|key| platform_path(key)).collect();
+        let excludes: Vec<&str> = excludes.iter().map(String::as_str).collect();
+
         Scope {
             includes: entries,
-            excludes: ExcludeSet::from_dir_keys(excludes),
+            excludes: ExcludeSet::from_dir_keys(&excludes),
             first_dir: String::new(),
         }
     }
 
     fn candidate(client_file: &str, action: NativeAction, rev: u32) -> Candidate {
+        let client_file = platform_path(client_file);
         Candidate {
             depot_file: format!(
                 "//depot/{}",
                 client_file.rsplit(['\\', '/']).next().unwrap()
             ),
-            client_file: client_file.to_owned(),
+            client_file,
             rev: Some(rev),
             action,
         }
@@ -888,7 +907,7 @@ mod tests {
 
         assert_eq!(excluded, 1);
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].client_file, r"C:\ws\kept.txt");
+        assert_eq!(kept[0].client_file, platform_path(r"C:\ws\kept.txt"));
     }
 
     /// 文件入口按精确路径匹配，目录入口按子树匹配。
@@ -896,9 +915,9 @@ mod tests {
     fn a_file_entry_matches_only_its_own_path() {
         let scope = scope_of(&[(r"C:\ws\a.txt", EntryKind::File)], &[]);
 
-        assert!(scope.includes_key(&local_path_key(r"C:\ws\a.txt")));
-        assert!(!scope.includes_key(&local_path_key(r"C:\ws\a.txt.bak")));
-        assert!(!scope.includes_key(&local_path_key(r"C:\ws\sub\a.txt")));
+        assert!(scope.includes_key(&local_path_key(&platform_path(r"C:\ws\a.txt"))));
+        assert!(!scope.includes_key(&local_path_key(&platform_path(r"C:\ws\a.txt.bak"))));
+        assert!(!scope.includes_key(&local_path_key(&platform_path(r"C:\ws\sub\a.txt"))));
     }
 
     // ---- 报告与命令 ----
