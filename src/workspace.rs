@@ -356,7 +356,7 @@ struct WhereRecord {
     /// depot 路径。新增文件的 `depotFile` 就来自这里——它 depot 里还没有记录可查。
     depot_file: String,
 
-    /// 被 view 的排除行（例如 `-//aki/....tmp`）挡下：p4 完全看不见这个路径。
+    /// 被 view 的排除行（例如 `-//depot/....tmp`）挡下：p4 完全看不见这个路径。
     /// 这是区分「已映射」与「被排除」的唯一信号。
     unmapped: bool,
 }

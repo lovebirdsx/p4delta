@@ -225,7 +225,7 @@ pub(crate) async fn reconcile_scope(
     );
     emit_progress("analyze", None);
 
-    // client view 的排除行会让 p4 完全看不见某些路径（例如 `-//aki/....tmp`），
+    // client view 的排除行会让 p4 完全看不见某些路径（例如 `-//depot/....tmp`），
     // 扫盘时它们却长得像新增文件。不剔掉的话，open 模式会去 add 一个 p4 拒绝的文件，
     // clean 模式会删掉一个 p4 根本不管的文件。
     // 顺手补上它们的 depot 路径：新增文件是唯一没有 depot 记录可查的一类，而契约里

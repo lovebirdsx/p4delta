@@ -106,8 +106,8 @@ Arguments 填 `--sync -w $c -l %D`，先读「sync 模式」一节。
 
 在 History 视图里右键一个已提交的 changelist，选 `p4delta Sync to changelist`：那个号直接进了
 `--sync --to <CL>`，工作区被拉回那一刻的状态。弹框问的是**目录**——扫描与还原的范围就是它，
-不是整个工作区。从 History 的路径栏复制即可，本地路径（`E:\aki\...`）与 depot 路径
-（`//aki/...`）都收。
+不是整个工作区。从 History 的路径栏复制即可，本地路径（`E:\project\...`）与 depot 路径
+（`//depot/...`）都收。
 
 反过来，在 Workspace 或 Depot 树里右键一个目录，选 `p4delta Sync this folder to changelist`：
 目录就是右键的那一个，弹框问 changelist 号。
@@ -210,7 +210,7 @@ Arguments 里的 `$c` 是 P4V 展开的当前 workspace，`%D` 是右键选中�
 里没有 p4。找不到时的报错会列出找过哪些地方。
 
 > `P4_EXE` 在 e2e 测试里还有另一层含义（指到不存在的路径等于强制跳过），与生产代码不同，
-> 见 [CONTRIBUTING.md](CONTRIBUTING.md) 的「开发与验证」。
+> 见 [docs/dev/e2e.md](docs/dev/e2e.md)。
 
 ### 非 ASCII 文件名
 
@@ -241,7 +241,7 @@ p4delta -w "your-workspace" -l --no-prune-ignored-dirs "E:\project\src"
 
 旧版本文件的元数据补查使用 `p4 fstat -L`；补查失败或记录不完整时会停止，不会用最新版本的摘要替代本地 have revision 的摘要。
 
-client view 里的排除行（例如 `-//aki/....tmp`）会让 p4 完全看不见那些路径：`p4 reconcile`、`p4 clean`、`p4 add` 对它们一律报 `not in client view`。工具是自己扫盘的，所以对判定为新增的文件会再查一次 `p4 where`，把被排除的路径剔除——否则 open 模式会去 add 一个 p4 拒绝的文件，clean 模式更糟：会删掉一个 p4 根本不管的文件。
+client view 里的排除行（例如 `-//depot/....tmp`）会让 p4 完全看不见那些路径：`p4 reconcile`、`p4 clean`、`p4 add` 对它们一律报 `not in client view`。工具是自己扫盘的，所以对判定为新增的文件会再查一次 `p4 where`，把被排除的路径剔除——否则 open 模式会去 add 一个 p4 拒绝的文件，clean 模式更糟：会删掉一个 p4 根本不管的文件。
 
 不加 `--apply`（`-a`）时不会应用 P4 变更，但仍可能更新工具自身的本地 digest 缓存。首次路径规范化后，部分旧缓存可能无法命中；请以预览结果一致性及多轮计时评估性能，目录结构不同，收益也会不同。
 
@@ -279,7 +279,7 @@ p4delta -w "your-workspace" -l "Source\Client;-Source\Client\Generated"
 Source/Client
 Source/Script
 -Package/Server/Res
-//aki/branch_3.8/Source/Script/QAScript/...
+//depot/main/src/...
 ```
 
 - **位置**：从第一个位置参数所在目录（没有参数时从当前目录）向上查找，与 p4 找 `.p4config`

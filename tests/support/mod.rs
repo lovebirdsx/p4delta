@@ -525,7 +525,7 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if std::env::var_os("P4_KEEP_SANDBOX").is_some() {
             // 保留现场的意思是一个还能连上去的现场，所以服务器不能杀：
-            // 杀了的话下面打印的端口就是个死端口，按 CONTRIBUTING.md 的命令连过去
+            // 杀了的话下面打印的端口就是个死端口，按 docs/dev/e2e.md 的命令连过去
             // 只会得到 "Connect to server failed"。也顺带保住了 journal——
             // p4d 先写 journal 再改库，强杀会把最后几条事务留在 journal 里。
             self.server.keep_running();

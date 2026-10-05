@@ -644,7 +644,7 @@ mod tests {
     }
 
     /// p4 存的符号链接内容是"目标路径（正斜杠）+ 换行"。
-    /// 公式取自真实 depot：//aki/.../libjsig.so 的 headType=symlink、fileSize=14，
+    /// 公式取自真实 depot：//depot/.../libjsig.so 的 headType=symlink、fileSize=14，
     /// 摘要是 md5("../libjsig.so\n")，而 Windows 客户端上目标显示为 `..\libjsig.so`。
     #[test]
     fn symlink_digest_matches_the_depot_representation() {

@@ -141,6 +141,6 @@ p4delta 的 clean 与 reconcile 共用同一条分析管线和同一份摘要缓
 - **时间戳捷径原生也有**（`p4 reconcile -m`），见第三节的说明。
 - **历史数字不等于本轮优化的实测收益。** README 的数据来自手工测量，不是此次改动的 A/B 结果。
   现在有轻量的 `scripts/benchmark.ps1`，记录预览的多轮耗时、主进程峰值工作集与原始日志，并核对
-  动作多重集；用法与局限见 [开发指南](../CONTRIBUTING.md#预览性能测量powershell-7)。没有 criterion
+  动作多重集；用法与局限见 [性能测量](dev/benchmark.md#预览性能测量powershell-7)。没有 criterion
   或 CI 耗时硬门禁，也没有分阶段/进程树性能统计。`--no-prune-ignored-dirs` 可用于剪枝对照；
   脚本不清摘要缓存，不控制操作系统缓存，不能把自然预热重复测量叫作冷缓存基准。

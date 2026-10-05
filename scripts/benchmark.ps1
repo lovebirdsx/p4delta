@@ -60,11 +60,11 @@
     默认 <脚本所在仓库>\target\benchmark。
 
 .EXAMPLE
-    .\scripts\benchmark.ps1 -Binary .\target\release\p4delta.exe -Workspace aki -Path E:\project\src
+    .\scripts\benchmark.ps1 -Binary .\target\release\p4delta.exe -Workspace your-workspace -Path E:\project\src
     open 模式，1 轮预热 + 5 轮计时，结果落在 target\benchmark\<时间戳>-<pid>\。
 
 .EXAMPLE
-    .\scripts\benchmark.ps1 -Binary .\target\release\p4delta.exe -Workspace aki -Path E:\project\src `
+    .\scripts\benchmark.ps1 -Binary .\target\release\p4delta.exe -Workspace your-workspace -Path E:\project\src `
         -Mode sync -To 12345 -Rounds 3
     sync 到 changelist 12345（预演），3 轮计时。
 #>

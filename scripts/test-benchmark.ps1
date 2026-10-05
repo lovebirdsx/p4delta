@@ -46,7 +46,7 @@ $FakeDir = Join-Path $Root '假 CLI 目录'
 $WorkDir = Join-Path $Root '工 作 区'
 $PathDir = Join-Path $WorkDir '子 目录 空格'
 $PathResolved = ''
-$Workspace = 'aki 测 试'
+$Workspace = 'p4 工作区'
 
 function Assert-True($Condition, [string] $Message) {
     if (-not $Condition) {

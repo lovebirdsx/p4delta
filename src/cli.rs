@@ -3,7 +3,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-// 版本号取自 Cargo.toml，不再手写副本，见 CONTRIBUTING.md 的发布检查清单。
+// 版本号取自 Cargo.toml，不再手写副本，见 docs/dev/release.md 的发布检查清单。
 // 简介同理：不带值的 about 让 clap 去取 CARGO_PKG_DESCRIPTION，代码里不写第二份字面量。
 #[command(version, about)]
 pub struct Options {

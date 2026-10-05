@@ -278,4 +278,4 @@ if [ -n "$slug" ]; then
   printf '    release.yml 开始跑了：https://github.com/%s/actions/workflows/release.yml\n' "$slug"
   printf '    盯进度：gh run watch\n'
 fi
-printf '    release 建好后，在装了 P4V 的机器上按 CONTRIBUTING.md「发布检查清单」的最后一步核对一遍\n'
+printf '    release 建好后，在装了 P4V 的机器上按 docs/dev/release.md「发布检查清单」的最后一步核对一遍\n'
