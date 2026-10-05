@@ -262,6 +262,144 @@ pub(crate) fn parse_p4_have_output(
     Ok(parser.finish())
 }
 
+// ---- 通用记录流 ----
+//
+// `-G have` 有它自己的投影（[`MarshalStreamParser`] 直接产出 have 记录）。普通同步要的是
+// 原始记录本身：它的字段（`code` / `depotFile` / `action` / `severity` …）语义由调用方定，
+// 而且**解析失败必须是失败**——把半条记录悄悄丢掉，等于让 p4 的答案少几行而工具照报成功。
+
+/// 一条完整的 marshal 记录：字段名 → 原始字节。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MarshalRecord {
+    fields: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl MarshalRecord {
+    fn from_dict(dict: &HashMap<Vec<u8>, Vec<u8>>) -> Self {
+        MarshalRecord {
+            fields: dict.clone(),
+        }
+    }
+
+    /// 字段的原始字节。字段缺席返回 `None`（p4 只写它有的字段，缺席不是错误）。
+    pub(crate) fn raw(&self, key: &str) -> Option<&[u8]> {
+        self.fields.get(key.as_bytes()).map(Vec::as_slice)
+    }
+
+    /// 字段文本，按 p4 配置的字符集解码。
+    ///
+    /// 解码出替换字符时返回 `Err` 而不是「差不多的文本」：路径一旦对不上本地文件系统，
+    /// 后续的范围判断与下发规格会跟着错，而错得看不出来。[`decode_p4_bytes`] 的
+    /// windows-1252 兜底对它是最后一道防线——真落到兜底上说明字符集配置本身有问题。
+    pub(crate) fn text(&self, key: &str, encoding: &'static Encoding) -> Result<Option<String>> {
+        let Some(raw) = self.raw(key) else {
+            return Ok(None);
+        };
+
+        let (text, had_replacements) = decode_p4_bytes(raw, encoding);
+        if had_replacements {
+            bail!(
+                "p4 returned a {key} value that is not valid {}",
+                encoding.name()
+            );
+        }
+
+        Ok(Some(text.into_owned()))
+    }
+}
+
+/// 通用 marshal 记录流的增量读取器。
+///
+/// 与 [`MarshalStreamParser`] 的两点不同：
+///
+/// - 记录不投影，逐条交给调用方（大响应不必先攒成一份专门的 map）；
+/// - **截断是错误**。[`MarshalStreamParser::finish`] 对尾部残记录只警告一句（have 查询
+///   少几条只影响时间戳快筛），而普通同步拿这个流当「p4 要对哪些文件做什么」的完整答案，
+///   半条记录丢掉就是漏一个文件的动作。
+pub(crate) struct MarshalRecordReader {
+    encoding: &'static Encoding,
+    buffer: Vec<u8>,
+    /// `buffer` 里第一个未消费字节的偏移。
+    consumed: usize,
+    scratch: HashMap<Vec<u8>, Vec<u8>>,
+    /// 是否已经见过数据块：BOM 只在最开头剥一次。
+    started: bool,
+    parsed: usize,
+}
+
+impl MarshalRecordReader {
+    pub(crate) fn new(encoding: &'static Encoding) -> Self {
+        MarshalRecordReader {
+            encoding,
+            buffer: Vec::new(),
+            consumed: 0,
+            scratch: HashMap::new(),
+            started: false,
+            parsed: 0,
+        }
+    }
+
+    /// 喂一块数据，把其中已经完整的记录逐条交给 `on_record`。
+    pub(crate) fn push_chunk(
+        &mut self,
+        chunk: &[u8],
+        on_record: &mut impl FnMut(&MarshalRecord) -> Result<()>,
+    ) -> Result<()> {
+        // BOM 只会出现在流的最开头。
+        let chunk = if self.started {
+            chunk
+        } else {
+            self.started = true;
+            strip_bom(chunk, self.encoding)
+        };
+
+        self.buffer.extend_from_slice(chunk);
+
+        loop {
+            let parsed_length = {
+                let mut cursor = &self.buffer[self.consumed..];
+                match read_marshal_dict_into(&mut cursor, &mut self.scratch)? {
+                    Some(()) => Some(self.buffer.len() - self.consumed - cursor.len()),
+                    // 记录被截断：等下一块数据。
+                    None => None,
+                }
+            };
+
+            let Some(parsed_length) = parsed_length else {
+                break;
+            };
+            self.consumed += parsed_length;
+            self.parsed += 1;
+
+            let record = MarshalRecord::from_dict(&self.scratch);
+            on_record(&record)?;
+        }
+
+        // 缓冲区大部分消费掉之后就压缩一次，避免它随流一直增长。
+        if self.consumed >= (1 << 20) && self.consumed * 2 >= self.buffer.len() {
+            self.buffer.drain(..self.consumed);
+            self.consumed = 0;
+        }
+
+        Ok(())
+    }
+
+    /// 收尾：还有没消费完的字节就是流被截断了。
+    ///
+    /// 返回解析出的记录条数，调用方可以拿它区分「p4 什么都没说」与「p4 说了但没解析出来」。
+    pub(crate) fn finish(self) -> Result<usize> {
+        if self.consumed < self.buffer.len() {
+            bail!(
+                "p4 output ended in the middle of a record ({} trailing byte(s)); \
+                 the result is incomplete.",
+                self.buffer.len() - self.consumed
+            );
+        }
+
+        Ok(self.parsed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

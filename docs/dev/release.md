@@ -55,7 +55,10 @@ pwsh -File scripts/install-local.ps1 -Restore     # 把本地安装之前的那�
    这一段 **2026-10-03 已在本机完整对过**：我们手写的节点在 P4V 重写 `customtools.xml` 时原样
    保留（与 P4V 自己 `Export tools...` 的输出比对差异为零），两条 sync 入口都出现在预期位置、
    prompt 留空以退出码 1 报 `No path given`、输出进 P4V 自己的输出窗。之后凡是动过
-   `install.ps1` 里元素形状或 Arguments 的改动，这一段就再走一遍。同样要留意 README 里那条：
+   `install.ps1` 里元素形状或 Arguments 的改动，这一段就再走一遍。**2026-10-05 动过 Arguments**
+   （四条 sync 入口都加上 `--force`，把「回到某个 changelist」与新的普通同步分开：不带 `--force`
+   的 `--sync` 不再覆盖未打开文件上的本地改动），元素形状与 prompt 没动——按上面的规矩这段要再
+   走一遍，本轮**只在沙箱里验证，没有装进 P4V**，所以还没复验。同样要留意 README 里那条：
    团队那个 `RunTaskAndSyncFiles.bat` 会拿 depot 的 `tools.xml` 覆盖 `customtools.xml`，跑过
    一次它之后 p4delta 的七条就全没了，别把"菜单里没有"误判成工具定义写错了。
 

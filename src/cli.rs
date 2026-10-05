@@ -32,23 +32,34 @@ pub struct Options {
     #[arg(long)]
     pub(crate) clean: bool,
 
-    /// 同步模式：把工作区拉到目标版本（默认 head），等价于「只传真正需要传的文件」的
-    /// `p4 sync -f`。不删 depot 里没有的文件；已打开的文件一律不碰。
+    /// 同步模式：把工作区拉到目标版本（默认 head，可用 `--to` 指定 changelist），
+    /// 由原生 p4 判定覆盖保护、opened/resolve 与 have 更新——已打开的文件交给 p4 处理，
+    /// 可写保护也照 p4 的规则走。不删 depot 里没有的文件。
+    ///
+    /// 要「无论本地改没改，都把工作区修成目标版本」，加上 `--force`。
     #[arg(long, conflicts_with = "clean")]
     pub(crate) sync: bool,
 
-    /// 同步的目标 changelist（仅 `--sync`）。默认是 head。
+    /// 强制修复（仅 `--sync`）：等价于「只传真正需要传的文件」的 `p4 sync -f`。
+    /// 会恢复缺失文件、丢弃未打开文件的本地改动，且不可撤销；已打开的文件一律不碰。
+    /// 这是 `--sync` 在加上本开关之前的旧行为。
+    #[arg(long, requires = "sync")]
+    pub(crate) force: bool,
+
+    /// 同步的目标 changelist（`--sync`，普通与 `--force` 都支持）。默认是 head。
     ///
     /// 不接受 0：`-c 0` 在本工具里是「默认 changelist」，照搬成 `--to 0` 太容易，而
-    /// `@0` 在 p4 语法里是「第一个修订版之前」——目标时刻什么都不存在，`--sync` 会据此
+    /// `@0` 在 p4 语法里是「第一个修订版之前」——目标时刻什么都不存在，同步会据此
     /// 删光本地文件。解析层直接当用法错误挡掉。
     #[arg(long, value_name = "CL", requires = "sync", value_parser = clap::value_parser!(u32).range(1..))]
     pub(crate) to: Option<u32>,
 
-    /// 不信任任何推断（仅 `--sync`）：对目标版本没变的文件全部重算摘要，摘要缓存也不看。
-    /// 默认档靠 mtime 与缓存跳过它们，快，但「没变化」是上一轮或时间戳说的；这一档把推断
-    /// 换成验证，代价是每次运行都要全量读盘。
-    #[arg(long, requires = "sync")]
+    /// 不信任任何推断（仅 `--sync --force`）：对目标版本没变的文件全部重算摘要，
+    /// 摘要缓存也不看。默认档靠 mtime 与缓存跳过它们，快，但「没变化」是上一轮或
+    /// 时间戳说的；这一档把推断换成验证，代价是每次运行都要全量读盘。
+    ///
+    /// 普通同步（不带 `--force`）不读摘要，这个开关没有可放大的东西。
+    #[arg(long, requires = "force")]
     pub(crate) verify_all: bool,
 
     /// 范围入口：目录（整棵子树）或文件（单文件；本地不存在也可以，用于 open for
@@ -121,6 +132,7 @@ mod tests {
         let parsed = Options::parse_from([
             "p4delta",
             "--sync",
+            "--force",
             "-w",
             "ws",
             "--to",
@@ -128,8 +140,51 @@ mod tests {
             "--verify-all",
         ]);
         assert!(parsed.sync);
+        assert!(parsed.force);
         assert_eq!(parsed.to, Some(12345));
         assert!(parsed.verify_all);
+
+        // 普通同步：不带 --force，其余开关照旧可用。
+        let plain = Options::parse_from(["p4delta", "--sync", "-w", "ws", "--to", "7"]);
+        assert!(plain.sync);
+        assert!(!plain.force);
+        assert!(!plain.verify_all);
+    }
+
+    /// `--force` 只对 sync 有意义：没有 `--sync` 时它是用法错误，而不是被静默忽略。
+    /// 加上它等于「丢弃未打开文件的本地改动」，放行一个拼错模式的调用代价太大。
+    #[test]
+    fn force_requires_sync() {
+        let error = Options::try_parse_from(["p4delta", "--force", "-w", "ws"])
+            .expect_err("没有 --sync 时 --force 必须是用法错误");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        // `--clean --force` 是 clap 放行的另一种形状：它补上的 `--sync` 与本已给出的
+        // `--clean` 互斥，于是 `sync` 最终并没有出现——clean 照常走，force 一点作用都不起。
+        // 立场同 `no_revert_groups_is_tolerated_in_the_other_modes`：模式里无意义的东西
+        // 放行。真正的护栏在里面：只有 `--sync --force` 才会分流到强制修复。
+        let tolerated = Options::try_parse_from(["p4delta", "--clean", "--force", "-w", "ws"])
+            .expect("--clean 下给 --force 不该是用法错误");
+        assert!(tolerated.clean);
+        assert!(!tolerated.sync, "conflicts_with 已经把 --sync 挡在外面");
+    }
+
+    /// `--verify-all` 放大的只有强制路径的摘要候选。普通同步根本不读摘要，放行它等于
+    /// 让用户以为「验证过全部文件」，而那一档没有这个含义。
+    #[test]
+    fn verify_all_requires_force() {
+        let error = Options::try_parse_from(["p4delta", "--sync", "--verify-all", "-w", "ws"])
+            .expect_err("--verify-all 必须要求 --force");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        // 普通同步仍然合法。
+        assert!(Options::try_parse_from(["p4delta", "--sync", "-w", "ws"]).is_ok());
     }
 
     /// `--to 0` 在 p4 语法里是「第一个修订版之前」：目标时刻什么都不存在，sync 会据此

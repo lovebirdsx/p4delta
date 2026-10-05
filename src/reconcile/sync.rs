@@ -381,6 +381,7 @@ pub(crate) async fn apply_sync(
                 title: &render_title(spec.title, files.len()),
                 list: options.list,
                 applied: options.apply,
+                stage: None,
             },
             &files.rows(),
         );

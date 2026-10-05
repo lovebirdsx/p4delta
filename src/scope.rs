@@ -75,10 +75,13 @@ pub(crate) struct ExcludeSet {
 
 impl ExcludeSet {
     /// 构造一个只含目录排除项的集合。仅供测试：产品路径上只有 [`build_exclude_set`] 会造它。
+    ///
+    /// 键照 [`build_exclude_set`] 的口径归一（折小写、统一分隔符）——直接拿用户写的原文
+    /// 当键，在大小写不一致的平台上会静默匹配不上，而测试恰恰要验的就是匹配本身。
     #[cfg(test)]
     pub(crate) fn from_dir_keys(keys: &[&str]) -> Self {
         ExcludeSet {
-            dir_keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+            dir_keys: keys.iter().map(|key| local_path_key(key)).collect(),
             file_keys: HashSet::new(),
             labels: keys.iter().map(|key| format!("-{key}")).collect(),
             implicit_file_key: None,
@@ -135,6 +138,46 @@ impl Scope {
         self.includes.iter().map(ScopeEntry::file_spec).collect()
     }
 
+    /// 普通同步查询用的 file spec：与 [`Scope::file_specs`] 同形，但把入口路径里那些在 p4
+    /// 语法里有特殊含义的字符转义掉（见 [`escape_file_spec`]）。
+    ///
+    /// 单独一份、而不是改 [`ScopeEntry::file_spec`]：open / clean / 强制 sync 的既有行为
+    /// 不在本轮范围内，转义只挂在普通同步这条新路径上。
+    pub(crate) fn query_specs(&self, changelist: Option<u32>) -> Vec<String> {
+        self.includes
+            .iter()
+            .map(|entry| {
+                let spec = match entry.kind {
+                    EntryKind::Directory => format!(
+                        "{}{}...",
+                        escape_file_spec(&entry.path),
+                        std::path::MAIN_SEPARATOR
+                    ),
+                    EntryKind::File => escape_file_spec(&entry.path),
+                };
+                match changelist {
+                    // 目标 CL 钉在每一条规格上：`@CL` 是 per-spec 的，漏掉哪条哪条就跑到
+                    // head 去，而输出上看不出来。
+                    Some(cl) => format!("{spec}@{cl}"),
+                    None => spec,
+                }
+            })
+            .collect()
+    }
+
+    /// 路径键是否落在某个入口之内（不含排除判断，那一侧走 [`ExcludeSet::excludes_key`]）。
+    ///
+    /// 普通同步拿它验证原生候选确实在范围内：目录入口按子树算，文件入口要精确相等。
+    /// 只看路径文本，**不要求磁盘上存在**——「本地已删除、depot 还有」的候选正是要处理的。
+    pub(crate) fn includes_key(&self, key: &str) -> bool {
+        self.includes.iter().any(|entry| match entry.kind {
+            EntryKind::Directory => {
+                key == entry.path_lower || path_is_under_key(key, &entry.path_lower)
+            }
+            EntryKind::File => key == entry.path_lower,
+        })
+    }
+
     /// 目录入口的路径列表：目录剪枝预扫描的起点。
     pub(crate) fn directory_roots(&self) -> Vec<String> {
         self.includes
@@ -143,6 +186,32 @@ impl Scope {
             .map(|entry| entry.path.clone())
             .collect()
     }
+}
+
+/// 本地路径 → p4 file spec 里可以安全出现的文本：把在 p4 语法里有特殊含义的字符转义成
+/// `%XX`（`p4 help wildcards`）。
+///
+/// 起因是**本地文件名**而不是 depot 名字：`#` 引入修订号、`@` 引入 changelist/label、
+/// `%` 是转义引导符、`*`/`?` 是通配符。一个叫 `notes#1.txt` 的本地文件原样交给 p4，
+/// 会被读成「`notes` 的第 1 版」，与本意完全不同——而且报出来的是「找不到文件」，
+/// 看上去像路径写错了。Windows 上 `#`、`@`、`%` 都是合法文件名字符，这不是病态输入。
+///
+/// 大小写十六进制都收，这里统一写大写，与 p4 自己的回显一致。
+fn escape_file_spec(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+
+    for character in path.chars() {
+        match character {
+            '%' => escaped.push_str("%25"),
+            '#' => escaped.push_str("%23"),
+            '@' => escaped.push_str("%40"),
+            '*' => escaped.push_str("%2A"),
+            '?' => escaped.push_str("%3F"),
+            other => escaped.push(other),
+        }
+    }
+
+    escaped
 }
 
 /// 解析出的原始条目：方向与路径文本已拆好，还没做路径归一与 depot 翻译。
@@ -344,6 +413,20 @@ fn classify_entry(path: &str, explicit_dir: bool) -> EntryKind {
     }
 }
 
+/// 范围求值遇到「这一条定位不了」时的立场。
+///
+/// [`ScopePolicy::Lenient`] 是 open / clean / 强制 sync 的既有行为：一条 depot 路径不在
+/// client view 里就警告一声跳过，其余入口照常处理。
+///
+/// [`ScopePolicy::Strict`] 是普通同步用的：那条路径会被写进「原生要对它做什么」的查询，静默丢掉它等于
+/// 让 p4 在一个**比用户以为的更小**的范围上作答，而工具随后会把这个答案当成完整结论报
+/// 出去。范围是硬上限，缩小它同样要报错。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopePolicy {
+    Lenient,
+    Strict,
+}
+
 /// 原始条目 → 已定位的入口：depot 翻译、绝对化、盘符大写、类型判定。
 ///
 /// `base_dir` 是相对路径的基准：配置文件里的条目以配置文件所在目录为基准（配置挪到
@@ -353,6 +436,7 @@ async fn resolve_entries(
     options: &Options,
     raw: &[RawEntry],
     base_dir: Option<&Path>,
+    policy: ScopePolicy,
 ) -> Result<Vec<ScopeEntry>> {
     let mut entries = Vec::with_capacity(raw.len());
 
@@ -362,6 +446,13 @@ async fn resolve_entries(
         if path.starts_with("//") {
             match translate_depot_path(options, &path, base_dir).await? {
                 Some(local) => path = local,
+                // 严格档逐条报错，而不是先把定位不了的都丢掉再看剩没剩：
+                // 这样「配置里写了 include 但一条都没能定位」根本走不到后面，
+                // 不用再单独设一道「配置 include 全空」的检查。
+                None if policy == ScopePolicy::Strict => bail!(
+                    "Nothing to work on: \"{path}\" is not in this client's view, so the scope \
+                     cannot be evaluated."
+                ),
                 None => {
                     eprintln!("Warning: skipping \"{path}\", it is not in this client's view.");
                     continue;
@@ -496,6 +587,19 @@ fn build_exclude_set(entries: Vec<ScopeEntry>) -> ExcludeSet {
 /// - 配置里只有 exclude 时，include 默认取**配置文件所在目录**（"根 + 排除"形状；
 ///   载体就在工作区根，于是这就是"默认整个工作区"）
 pub(crate) async fn evaluate_scope(options: &Options) -> Result<Scope> {
+    evaluate_scope_with(options, ScopePolicy::Lenient).await
+}
+
+/// 普通同步用的严格求值：任何一条显式条目定位不了都报错，而不是丢掉它继续。
+///
+/// 与 [`evaluate_scope`] 共用同一套解析、交集、去重与排除算法，差别只在
+/// [ScopePolicy]：范围是硬上限，普通同步拿它当「原生要对哪些文件作答」的边界，
+/// 少了一条入口就等于**换了个问题**去问 p4，而答案会被当成完整结论报出去。
+pub(crate) async fn evaluate_scope_strict(options: &Options) -> Result<Scope> {
+    evaluate_scope_with(options, ScopePolicy::Strict).await
+}
+
+async fn evaluate_scope_with(options: &Options, policy: ScopePolicy) -> Result<Scope> {
     let cli = parse_cli_entries(&options.paths);
 
     // `--no-scope-file` 让配置整个缺席：范围只认命令行。给编辑器用——它的范围是「聚焦目录
@@ -545,10 +649,12 @@ pub(crate) async fn evaluate_scope(options: &Options) -> Result<Scope> {
         config_includes
     };
 
-    let config_includes = resolve_entries(options, &config_includes, config_dir.as_deref()).await?;
-    let config_excludes = resolve_entries(options, &config_excludes, config_dir.as_deref()).await?;
-    let cli_includes = resolve_entries(options, &cli_includes, None).await?;
-    let cli_excludes = resolve_entries(options, &cli_excludes, None).await?;
+    let config_includes =
+        resolve_entries(options, &config_includes, config_dir.as_deref(), policy).await?;
+    let config_excludes =
+        resolve_entries(options, &config_excludes, config_dir.as_deref(), policy).await?;
+    let cli_includes = resolve_entries(options, &cli_includes, None, policy).await?;
+    let cli_excludes = resolve_entries(options, &cli_excludes, None, policy).await?;
 
     let cli_declared_includes = cli.iter().any(|entry| !entry.exclude);
     let includes = match (config_includes.is_empty(), cli_includes.is_empty()) {

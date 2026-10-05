@@ -22,7 +22,7 @@ fn an_untracked_file_survives_a_sync() {
 
     sandbox
         .cli()
-        .args(["--sync", "-a", "-l"])
+        .args(["--sync", "--force", "-a", "-l"])
         .arg(".")
         .assert()
         .success()
@@ -56,7 +56,7 @@ fn sync_dry_run_changes_nothing() {
 
     sandbox
         .cli()
-        .args(["--sync", "-l"])
+        .args(["--sync", "--force", "-l"])
         .arg(".")
         .assert()
         .success()
@@ -106,7 +106,7 @@ fn sync_never_touches_opened_files() {
 
     sandbox
         .cli()
-        .args(["--sync", "-a", "-l"])
+        .args(["--sync", "--force", "-a", "-l"])
         .arg(".")
         .assert()
         .success()
@@ -161,7 +161,7 @@ fn head_target_sorts_each_difference_into_its_own_group() {
 
     let output = sandbox
         .cli()
-        .args(["--sync", "-a", "-l"])
+        .args(["--sync", "--force", "-a", "-l"])
         .arg(".")
         .output()
         .expect("run the tool");
@@ -231,12 +231,12 @@ fn to_a_changelist_pulls_the_state_at_that_changelist() {
 
     sandbox
         .cli()
-        .args(["--sync", "--to", &target.to_string(), "-a", "-l"])
+        .args(["--sync", "--force", "--to", &target.to_string(), "-a", "-l"])
         .arg(".")
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "Sync mode: updating the workspace to changelist {target}."
+            "Sync (force) mode: repairing the workspace to changelist {target}."
         )))
         .stdout(predicate::str::contains("Updating 1 files"))
         .stdout(predicate::str::contains("Deleting 1 files"));
@@ -298,7 +298,7 @@ fn to_a_changelist_pulls_forward_to_that_revision_not_to_head() {
 
     sandbox
         .cli()
-        .args(["--sync", "--to", &target.to_string(), "-a", "-l"])
+        .args(["--sync", "--force", "--to", &target.to_string(), "-a", "-l"])
         .arg(".")
         .assert()
         .success()
@@ -350,7 +350,14 @@ fn a_target_changelist_that_predates_the_folder_is_refused() {
 
     let output = sandbox
         .cli()
-        .args(["--sync", "--to", &before_the_subdir.to_string(), "-a", "-l"])
+        .args([
+            "--sync",
+            "--force",
+            "--to",
+            &before_the_subdir.to_string(),
+            "-a",
+            "-l",
+        ])
         .arg("sub")
         .output()
         .expect("run the tool");
@@ -409,7 +416,14 @@ fn a_target_changelist_beyond_head_falls_back_to_head() {
 
     sandbox
         .cli()
-        .args(["--sync", "--to", &beyond_head.to_string(), "-a", "-l"])
+        .args([
+            "--sync",
+            "--force",
+            "--to",
+            &beyond_head.to_string(),
+            "-a",
+            "-l",
+        ])
         .arg(".")
         .assert()
         .success()
@@ -475,7 +489,7 @@ fn our_listing_covers_everything_native_sync_would_transfer() {
 
     let ours = sandbox
         .cli()
-        .args(["--sync", "-l"])
+        .args(["--sync", "--force", "-l"])
         .arg(".")
         .output()
         .expect("run the tool");
@@ -542,7 +556,7 @@ fn a_deleted_target_with_nothing_local_is_a_no_op() {
     // 我们无事可做，而这与「工作区已符合目标版本」并不矛盾：没有文件要删，也没有记录要清。
     sandbox
         .cli()
-        .args(["--sync", "-a", "-l"])
+        .args(["--sync", "--force", "-a", "-l"])
         .arg(".")
         .assert()
         .success()
@@ -575,7 +589,7 @@ fn verify_all_catches_what_the_timestamp_shortcut_misses() {
 
     sandbox
         .cli()
-        .args(["--sync", "-a", "-l"])
+        .args(["--sync", "--force", "-a", "-l"])
         .arg(".")
         .assert()
         .success()
@@ -598,7 +612,7 @@ fn verify_all_catches_what_the_timestamp_shortcut_misses() {
 
     sandbox
         .cli()
-        .args(["--sync", "--verify-all", "-a", "-l"])
+        .args(["--sync", "--force", "--verify-all", "-a", "-l"])
         .arg(".")
         .assert()
         .success()
@@ -631,7 +645,7 @@ fn verify_all_does_not_treat_files_behind_the_target_as_digest_candidates() {
 
     sandbox
         .cli()
-        .args(["--sync", "--verify-all", "-a", "-l"])
+        .args(["--sync", "--force", "--verify-all", "-a", "-l"])
         .arg(".")
         .assert()
         .success()
@@ -661,7 +675,7 @@ fn a_local_file_the_client_never_synced_is_overwritten_with_a_warning() {
 
     sandbox
         .cli()
-        .args(["--sync", "-a", "-l"])
+        .args(["--sync", "--force", "-a", "-l"])
         .arg(".")
         .assert()
         .success()
@@ -708,7 +722,7 @@ fn a_never_synced_local_file_is_deleted_without_asking_p4() {
 
     sandbox
         .cli()
-        .args(["--sync", "-a", "-l"])
+        .args(["--sync", "--force", "-a", "-l"])
         .arg(".")
         .assert()
         .success()
@@ -756,7 +770,7 @@ fn both_delete_legs_report_their_own_failure() {
 
     let output = sandbox
         .cli()
-        .args(["--sync", "-a", "-l"])
+        .args(["--sync", "--force", "-a", "-l"])
         .arg(".")
         .output()
         .expect("run the tool");

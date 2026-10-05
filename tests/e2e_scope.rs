@@ -445,7 +445,10 @@ fn a_depot_path_outside_the_client_view_is_an_error() {
     assert!(opened.is_empty(), "什么都不该打开: {opened:?}");
 }
 
-/// `--sync` 吃同一份排除名单：排除目录里的本地改动不传（也就不会被 depot 版本覆盖）。
+/// `--sync --force` 吃同一份排除名单：排除目录里的本地改动不传（也就不会被 depot 版本覆盖）。
+///
+/// 这里的正对照是「本地改动进同步清单」，那是强制修复的分类学；普通同步的清单由原生打算
+/// 传哪些文件决定，同样的排除边界另见 `e2e_sync_normal.rs::an_excluded_directory_is_never_written_to`。
 #[test]
 fn sync_leaves_excluded_directories_alone() {
     let Some(sandbox) = support::sandbox_or_skip() else {
@@ -459,7 +462,7 @@ fn sync_leaves_excluded_directories_alone() {
 
     sandbox
         .cli()
-        .args(["--sync", "-l"])
+        .args(["--sync", "--force", "-l"])
         .arg(".")
         .assert()
         .success()

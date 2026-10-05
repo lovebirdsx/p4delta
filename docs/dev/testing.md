@@ -37,7 +37,11 @@ CI 用 Windows PowerShell 5.1 与 PowerShell 7 各跑一遍。两个脚本都**�
 3. **同一个开关传两次 = 参数绑定错误**，不是「后一个覆盖前一个」。构建参数**数组**时最容易撞上——重复是运行时拼出来的，报错不指向调用点。项目里的落地：辅助函数默认补 `-WithoutPath`，需要真写 PATH 的用例走单独的 `-WithPath` 开关，不能把默认项塞进调用方的 `ExtraArguments`。
 4. **拿子进程输出做文本断言时，中文可能已经变形**：一是流（`Write-Warning` 在 `-File`/`-Command` 下走的是子进程的 **stdout**，不是 stderr），二是编码（非 UTF-8 控制台上中文过管道会被打散成 `?`，匹配中文的断言会退化成**永远通过的空断言**——本机 UTF-8 控制台复现不出来）。断言只匹配消息里刻意留的 **ASCII 记号**（`install.ps1` 的警告文案里留了 `WM_SETTINGCHANGE`）。
 
-最后一条用例（`Test-UserPathIsManagedByDefault`）是唯一碰真实用户配置的：它临时改写 `HKCU\Environment\Path` 来验默认安装会加进去、卸载会摘掉，先快照、`finally` 还原。**别同时跑两份测试**（两份快照会互相覆盖），也别在它跑的当口手工改 PATH；其余用例一律带 `-WithoutPath`，绝不碰这台机器的 PATH。
+最后一条用例（`Test-UserPathIsManagedByDefault`）是唯一碰真实用户配置的：它临时改写 `HKCU\Environment\Path` 来验默认安装会加进去、卸载会摘掉，先快照、`finally` 还原。**别同时跑两份测试**（两份快照会互相覆盖），也别在它跑的当口手工改 PATH；其余用例一律带 `-WithoutPath`，绝不碰这台机器的 PATH。只想摘掉这一条（不做任何真注册表写入）就加 `-SkipRealPath`——它把那条用例从列表里去掉、打一行 `skip`，其余全部照跑；默认不带，因为「默认安装会写 PATH」这条行为只有它能验：
+
+```powershell
+pwsh -File scripts/test-install.ps1 -SkipRealPath
+```
 
 发布脚本也有黑盒测试，它在一次性 git 仓库里真跑一遍改版本号、提交、打附注 tag、推送，只把 `cargo` 换成垫片：
 

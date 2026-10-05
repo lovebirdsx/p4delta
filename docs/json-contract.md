@@ -51,8 +51,12 @@
 ### `kind:"file"`
 
 ```json
-{"kind":"file","mode":"open","class":"edit","action":"edit","depotFile":"//depot/ws/a.txt","clientFile":"//bench/ws/a.txt","rev":"3","applied":false}
+{"kind":"file","mode":"open","class":"edit","action":"edit","depotFile":"//depot/ws/a.txt","clientFile":"//bench/ws/a.txt","rev":"3","applied":false,"force":false}
+{"kind":"file","mode":"sync","class":"update","action":"updating","depotFile":"//depot/ws/b.txt","clientFile":"//bench/ws/b.txt","rev":"4","applied":false,"force":false,"stage":"preview","nativeAction":"updated"}
 ```
+
+第二行是普通同步的记录：它比第一行多 `stage`（这条来自预演还是应用）与 `nativeAction`
+（原生报出的动作原文）两项，`class:"resolve"` 的记录只有前者、没有后者（见下）。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -63,6 +67,13 @@
 | `clientFile` | 字符串 | client 语法；拼不出来时退化成**本地路径**并在 stderr 记 warning（口径见下） |
 | `rev` | 字符串，可缺 | have / 目标版本号；**新增文件没有这一项**。原生 2024.1 的对应字段叫 `workRev`（add 也带它，但那是「将要成为的版本」而不是 have，翻译时按 class 摘掉） |
 | `applied` | 布尔 | 这一轮是否带 `-a` 真改状态。**不是**逐文件的成败：某条记录的 p4 命令失败时它照样是 `true`，那一批的失败走 summary 的 `ok:false` 与 stderr 上的人类可读错误（逐文件的 error 记录当前没有，见「`kind:"error"`」） |
+| `stage` | 字符串，可缺 | 普通同步（`--sync` 不带 `--force`）独有：`"preview"` 或 `"apply"`。这条路一次运行**只发一套记录**——预演那份不重复发，带了 `-a` 就是 apply 那一套 |
+| `nativeAction` | 字符串，可缺 | 原生报出的动作原文（`added` / `updated` / `deleted` / `refreshed`），普通同步独有。消费方要跟 `p4` 自己的输出对齐时看它，别去反推 `action` 的派生值 |
+| `force` | 布尔 | 这一轮是不是强制修复（`--sync --force`）。普通同步与强制修复共用 `mode:"sync"` 与一部分 `class`（`update` / `delete`），消费方要区分它们只能靠这个布尔 |
+
+`class:"resolve"` 的记录**没有** `nativeAction`：原生对这类事件只有一句 `info` 提示
+（`//depot/f#2 - is opened and not being changed`），没有动作词。记录里宁可诚实地缺席，
+也不去编一个 p4 不会打印的词。
 
 `clientFile` 拼不出 client 语法（退化成**本地路径**）有两档，都在 stderr 上告警，而且**都
 做了节流**——一个工作区上万个文件，逐条告警会把 stderr 淹掉：
@@ -95,11 +106,28 @@
 | clean | `delete` | `deleting` | 删掉 depot 里没有的本地文件 |
 | clean | `revert` | `reverting` | 用 have 版本覆盖本地改动 |
 | clean | `restore` | `restoring` | 从 depot 写回本地缺失的文件 |
+| sync | `add` | `adding` | 目标处有、工作区没有 → 写进来 |
 | sync | `update` | `updating` | 拉到目标版本 |
 | sync | `revert` | `reverting` | 目标版本没变、本地内容不对 → 还原 |
 | sync | `restore` | `restoring` | 本地缺失 → 写回目标版本 |
 | sync | `delete` | `deleting` | 目标时刻不在库 → 删掉本地文件 |
+| sync | `resolve` | `scheduling` | 已打开、have 不在目标版本上 → 原生把 have 拉到目标版本、挂上待 resolve，内容一个字不改 |
 | 任意 | `handoff` | `handoff` 字段的值 | 转交给原生 p4 的文件，见下节 |
+
+`sync` 的类在两种模式下的**来源不同**（`force` 字段区分）：
+
+- 强制修复（`force:true`）的四类（`update` / `revert` / `restore` / `delete`）来自 δ 自己的
+  差异分析，那是「无论本地改没改都修成目标版本」；
+- 普通同步（`force:false`）只发原生**打算传**的文件，即 `add` / `update` / `delete` 三类，
+  外加 `resolve` 那一类。普通同步不做强制修复，所以 `revert` / `restore` 在它那里永不出现。
+
+`resolve` 那一类普通同步也不是照单全收：`p4 opened` 给的是范围内**全部**已打开文件，而
+原生只对 have 不在目标版本上的那些说话（have 已经在目标版本上的，预演连一句提示都没有），
+所以只有 `haveRev != 目标版本` 的已打开文件才成一条 `resolve` 记录。
+
+`resolve` 的动作词是 `scheduling` 而不是 `resolving`：δ 不做合并，它只是把文件交给原生记账。
+消费方看到 `class:"resolve"` 就知道「这个文件现在是打开的，have 会被拉到目标版本」，接下来
+`p4 resolve` 是用户的事。
 
 **`open` 的 `revert_*` 三组不是 `reconcile -a -e -d` 的一部分**——它们是 `p4 revert -a` 的
 语义（把「已打开但内容没变」的文件撤销打开）。实测对照：原生 `p4 reconcile -n -a -e -d`
@@ -112,7 +140,7 @@
 ### `kind:"file"` 的 `class:"handoff"` 变体
 
 ```json
-{"kind":"file","mode":"open","class":"handoff","action":"reconcile","handoff":"reconcile","depotFile":"//depot/ws/x.bin","clientFile":"//bench/ws/x.bin","applied":true}
+{"kind":"file","mode":"open","class":"handoff","action":"reconcile","handoff":"reconcile","depotFile":"//depot/ws/x.bin","clientFile":"//bench/ws/x.bin","applied":true,"force":false}
 ```
 
 `handoff` 字段取值 `"reconcile"` / `"clean"` / `"sync"`，说明这一批被交给原生 p4 的哪条
@@ -170,12 +198,13 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 | 字段 | 说明 |
 |---|---|
 | `mode` | 同 file 记录 |
+| `force` | 同 file 记录：`--sync --force` 是 `true`，普通同步与其余模式是 `false` |
 | `ok` | 这一轮是否有结论（**唯一**可信度凭据） |
 | `applied` | 是否带 `-a` 真跑了 |
 | `total` | `counts` 各值之和。口径是**「δ 给出逐文件动作的文件数」**：转交出去又没有逐条翻译的那批不进 `counts`，所以 clean / sync 的预演与应用、open 的应用都不含它；open 的预演例外（逐条翻译，见「`class:"handoff"` 变体」），那批进 `counts` |
 | `counts` | `class` → 数量；**只出现非零项**，缺席即 0。`handoff` 永不出现（它没有逐文件动作，`class:"handoff"` 的记录也从来不是「一个动作」） |
-| `scopeMatched` | 匹配到东西的入口数 |
-| `unmatched` | 落空入口数 |
+| `scopeMatched` | 匹配到东西的入口数；**普通同步是 `null`**——它不做本地扫描，「入口匹配了几个」这个结论它拿不到。`null` 是「不知道」，不是 0 |
+| `unmatched` | 落空入口数；普通同步恒为 0，理由同上 |
 | `elapsedMs` | 整轮墙钟毫秒 |
 | `reason` | `null`，或 `"no-entry-matched"`（入口全落空）；其余失败一律 `"error"` |
 
@@ -191,6 +220,10 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 阶段是固定枚举：`start` `analyze` `digest` `report` `done`。`step` 是阶段在表里的下标 + 1，
 单调不回跳，`total` 恒为 5。消费者**只许把它当进度提示**，不许拿它当结论。
 
+普通同步（`--sync` 不带 `--force`）走的是另一张表——它没有 analyze / digest，却有
+preview / filter / apply：`start` `preview` `filter` `apply` `done`（同样 5 段）。报一个
+这一轮根本不会出现的阶段，只会让消费方以为工具卡住了，所以按模式换表。`total` 两种都是 5。
+
 只收「顺序主干」上的阶段：`depot` / `scan` / `have` 三路是并发跑的，从并发分支里发进度会让
 `step` 回跳，而回跳的进度条比没有进度条更难读。这三路的细节走 `message`（自由文本）。
 
@@ -203,6 +236,10 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 | `--no-scope-file` | 忽略工作区里的 `.p4delta-scope`。编辑器自己持有范围（聚焦目录 + `reconcile.excludeFolders`），不希望在别人的配置上再叠一层 |
 | `--no-revert-groups` | 抑制 `open` 模式的 `revert_add` / `revert_edit` 两组，并把 `revert_delete` 并进 `reopen_edit`，语义回到逐行等于 `p4 reconcile -a -e -d`（理由见上一节的例外） |
 
+`--sync` 的两档由 `--force` 分：不带是**普通同步**（`force:false`，把工作区拉到目标版本，
+覆盖保护与 opened 交给原生），带上是**强制修复**（`force:true`，修成目标版本）。两者的记录
+形状差别见上文 `sync` 那几行。
+
 ## 与原生引擎的已知差异
 
 写进契约是因为消费方**有权知道**，不是因为它们可以忽略：
@@ -213,6 +250,15 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
   `p4 reconcile`；除 open 的预演（逐条翻译成正常 file 记录）外，转交的那批只以 `handoff`
   记录出现，没有逐文件动作，也不进 `counts`。
 - **归档版本（`headAction=archive`）与从未同步过的文件**：跳过并单独汇报，不进 `counts`。
+- **普通同步不扫工作区，也不读摘要缓存**：`--sync`（不带 `--force`）只问原生「你打算传哪些
+  文件」，再按范围过滤。所以它没有 mtime 捷径那类差异，也**不承诺比原生 `p4 sync` 快**——
+  省下的是 δ 自己的扫描与摘要，原生该传的字节一个不少。代价是 `scopeMatched` 发 `null`
+  （见 summary 表）。
+- **普通同步对已打开文件的补查**：原生对「已打开、have 不在目标版本上」的文件只给一句 `info`
+  提示，路径埋在文本里，正文记录一条都没有。δ 不解析那句文本，而是补跑两条只读查询
+  （`p4 opened` + `p4 fstat`，规模由打开数决定）拿身份，再按精确规格下发——这些文件因此
+  以 `class:"resolve"` 出现在记录流里。have 已经在目标版本上的已打开文件原生连提示都不发，
+  δ 也不把它们报出来。补查失败或解释不了那批提示时整轮停下，不拿一份少了东西的答案去写。
 - **名字里带 p4 filespec 元字符（`@` `#` `*` `%`）的文件**：δ 报出来并去 `p4 add`，而 p4 拒收这
   类名字（要 `-f` 才肯），于是这一组会失败、`ok:false`——实测原生 `p4 reconcile` 是发一条
   `severity:2` 的警告后**跳过**。两者对同一份工作区给出的清单因此可能差这一条。δ 内部查

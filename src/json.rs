@@ -58,15 +58,30 @@ fn action_for(mode: Mode, class: &str) -> &'static str {
         (Mode::Clean, "delete") => "deleting",
         (Mode::Clean, "revert") => "reverting",
         (Mode::Clean, "restore") => "restoring",
+        // 普通同步的三类：原生把文件写进工作区、就地更新、或从工作区移除。
+        (Mode::Sync, "add") => "adding",
         (Mode::Sync, "update") => "updating",
+        (Mode::Sync, "delete") => "deleting",
+        // 已打开的文件：原生只把 have 推到目标版本，内容不动、合并留给用户。
+        // 动作词用 scheduling 而不是 resolving，正是为了不说「正在做合并」。
+        (Mode::Sync, "resolve") => "scheduling",
+        // 强制修复多出来的两类：本地内容不对的还原、本地缺失的写回。
         (Mode::Sync, "revert") => "reverting",
         (Mode::Sync, "restore") => "restoring",
-        (Mode::Sync, "delete") => "deleting",
         _ => "unknown",
     }
 }
 
 static JSON_MODE: AtomicBool = AtomicBool::new(false);
+
+/// 本轮是不是强制修复（`--sync --force`）。文件记录、handoff 与 summary 都带这一项：
+/// 普通同步与强制修复共用 `mode:"sync"` 与一部分 `class`（`update` / `delete`），
+/// 消费方要区分它们只能靠这个布尔。
+static FORCE_MODE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_force(force: bool) {
+    FORCE_MODE.store(force, Ordering::Relaxed);
+}
 
 /// 拼 client 语法要用的两样东西。`root` 是 clientspec 的根，`client` 是客户端名。
 #[derive(Debug)]
@@ -97,6 +112,19 @@ static LEDGER: Mutex<Ledger> = Mutex::new(Ledger {
 /// 只收「顺序主干」上的阶段：`depot` / `scan` / `have` 三路是并发跑的（`futures::join!`），
 /// 从并发分支里发进度会让 `step` 回跳，而回跳的进度条比没有进度条更难读。
 const PHASES: [&str; 5] = ["start", "analyze", "digest", "report", "done"];
+
+/// 普通同步那条路走的阶段不一样（没有 analyze / digest，却有 preview / filter / apply）。
+/// 换成它，`step` / `total` 才对得上实际路径——进度条报一个这一轮根本不会出现的阶段，
+/// 消费方只会以为工具卡住了。
+static PHASES_OVERRIDE: Mutex<Option<&'static [&'static str]>> = Mutex::new(None);
+
+pub(crate) fn set_phases(phases: &'static [&'static str]) {
+    *PHASES_OVERRIDE.lock().unwrap() = Some(phases);
+}
+
+fn phases() -> &'static [&'static str] {
+    PHASES_OVERRIDE.lock().unwrap().unwrap_or(&PHASES)
+}
 
 pub(crate) fn set_json_mode(enabled: bool) {
     JSON_MODE.store(enabled, Ordering::Relaxed);
@@ -300,6 +328,14 @@ pub(crate) struct FileRecord<'a> {
     /// 且 add 也带——但那是「将要成为的版本」而不是 have，翻译时按 class 摘掉）。
     pub(crate) rev: Option<u32>,
     pub(crate) applied: bool,
+
+    /// 普通同步的阶段：`preview` 或 `apply`。其余模式（含强制修复）是 `None`，记录里也就
+    /// 没有这一项——它们的报告是「这一轮的计划」，不分成两个阶段。
+    pub(crate) stage: Option<&'static str>,
+
+    /// 原生报出的动作原文，普通同步独有（`added` / `updated` / `deleted` / `refreshed`）。
+    /// 消费方要跟 `p4` 自己的输出对齐时看它，别去反推 [`action_for`] 的派生值。
+    pub(crate) native_action: Option<&'a str>,
 }
 
 pub(crate) fn emit_file(record: &FileRecord<'_>) {
@@ -315,11 +351,18 @@ pub(crate) fn emit_file(record: &FileRecord<'_>) {
         "depotFile": record.depot_file,
         "clientFile": client_syntax(record.client_file),
         "applied": record.applied,
+        "force": FORCE_MODE.load(Ordering::Relaxed),
     });
 
     let object = value.as_object_mut().expect("json! 造出来的一定是对象");
     if let Some(rev) = record.rev {
         object.insert("rev".to_owned(), json!(rev.to_string()));
+    }
+    if let Some(stage) = record.stage {
+        object.insert("stage".to_owned(), json!(stage));
+    }
+    if let Some(native_action) = record.native_action {
+        object.insert("nativeAction".to_owned(), json!(native_action));
     }
 
     emit(&value);
@@ -361,6 +404,7 @@ pub(crate) fn emit_handoff_files(
             "depotFile": file.depot_file,
             "clientFile": client_syntax(&file.client_file),
             "applied": applied,
+            "force": FORCE_MODE.load(Ordering::Relaxed),
         }));
     }
 }
@@ -399,6 +443,8 @@ pub(crate) fn emit_native_reconcile_records(mode: Mode, lines: &[String], applie
             client_file: &file.client_file,
             rev: file.rev,
             applied,
+            stage: None,
+            native_action: None,
         });
     }
 }
@@ -494,7 +540,8 @@ pub(crate) fn emit_progress(phase: &str, message: Option<&str>) {
         return;
     }
 
-    let step = PHASES
+    let phases = phases();
+    let step = phases
         .iter()
         .position(|known| *known == phase)
         .map(|index| index + 1)
@@ -506,7 +553,7 @@ pub(crate) fn emit_progress(phase: &str, message: Option<&str>) {
             "kind": "progress",
             "phase": phase,
             "step": step,
-            "total": PHASES.len(),
+            "total": phases.len(),
             "message": message,
         }),
     );
@@ -535,14 +582,24 @@ pub(crate) fn emit_summary(mode: Mode, ok: bool, applied: bool, elapsed_ms: u128
         Some(ledger.reason.unwrap_or("error"))
     };
 
+    // `scopeMatched` 允许是 null：普通同步拿不到「入口匹配了几个」这个结论（原生的
+    // 结构化输出把「已最新」与「未匹配」说成同一种记录，见 `normal_sync`）。**不知道**
+    // 不是零匹配，所以这里发 null 而不是 0，消费方也就不会把「没算」读成「一个都没中」。
+    let scope_matched = if SCOPE_MATCHED_UNKNOWN.load(Ordering::Relaxed) {
+        serde_json::Value::Null
+    } else {
+        json!(SCOPE_MATCHED.load(Ordering::Relaxed))
+    };
+
     emit(&json!({
         "kind": "summary",
         "mode": mode.as_str(),
         "ok": ok,
         "applied": applied,
+        "force": FORCE_MODE.load(Ordering::Relaxed),
         "total": total,
         "counts": counts,
-        "scopeMatched": SCOPE_MATCHED.load(Ordering::Relaxed),
+        "scopeMatched": scope_matched,
         "unmatched": ledger.unmatched,
         "elapsedMs": elapsed_ms,
         "reason": reason,
@@ -553,8 +610,17 @@ pub(crate) fn emit_summary(mode: Mode, ok: bool, applied: bool, elapsed_ms: u128
 /// `warn_unmatched_entries` 里数得到，所以这里由那一处一并记下。
 static SCOPE_MATCHED: AtomicUsize = AtomicUsize::new(0);
 
+/// 本轮压根算不出「入口匹配了几个」。普通同步置上它，summary 里 `scopeMatched` 就是 null。
+static SCOPE_MATCHED_UNKNOWN: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn set_scope_matched(matched: usize) {
     SCOPE_MATCHED.store(matched, Ordering::Relaxed);
+    SCOPE_MATCHED_UNKNOWN.store(false, Ordering::Relaxed);
+}
+
+/// 明确表示「这个结论拿不到」，见 [`SCOPE_MATCHED_UNKNOWN`]。
+pub(crate) fn set_scope_matched_unknown() {
+    SCOPE_MATCHED_UNKNOWN.store(true, Ordering::Relaxed);
 }
 
 /// 写一条记录到 stdout。管道断了（`| head`）不该让整轮变成崩溃——报告写不出去是消费方
@@ -596,7 +662,7 @@ mod tests {
             (Mode::Clean, ["delete", "revert", "restore"].as_slice()),
             (
                 Mode::Sync,
-                ["update", "revert", "restore", "delete"].as_slice(),
+                ["add", "update", "resolve", "revert", "restore", "delete"].as_slice(),
             ),
         ] {
             for class in classes {

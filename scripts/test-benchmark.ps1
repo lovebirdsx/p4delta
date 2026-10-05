@@ -407,7 +407,8 @@ function Test-PassesOnlyPreviewArguments {
     $cases = @(
         @{ name = 'open';  extra = @();                                              expected = @('-l', '-w', $Workspace, $PathResolved) },
         @{ name = 'clean'; extra = @('-Mode', 'clean');                              expected = @('-l', '-w', $Workspace, '--clean', $PathResolved) },
-        @{ name = 'sync';  extra = @('-Mode', 'sync', '-To', '12345', '-VerifyAll'); expected = @('-l', '-w', $Workspace, '--sync', '--to', '12345', '--verify-all', $PathResolved) },
+        @{ name = 'sync';  extra = @('-Mode', 'sync');                               expected = @('-l', '-w', $Workspace, '--sync', $PathResolved) },
+        @{ name = 'sync-force'; extra = @('-Mode', 'sync', '-Force', '-To', '12345', '-VerifyAll'); expected = @('-l', '-w', $Workspace, '--sync', '--force', '--to', '12345', '--verify-all', $PathResolved) },
         @{ name = 'prune'; extra = @('-NoPruneIgnoredDirs');                         expected = @('-l', '-w', $Workspace, '--no-prune-ignored-dirs', $PathResolved) }
     )
 
@@ -625,6 +626,8 @@ function Test-RejectsBadArguments {
         @{ label = '-To 只在 sync 下有意义'; args = @('-Mode', 'clean', '-To', '5') },
         @{ label = '-To 不能是负数'; args = @('-Mode', 'sync', '-To', '-1') },
         @{ label = '-To 不能超出 u32'; args = @('-Mode', 'sync', '-To', '4294967296') },
+        @{ label = '-Force 只在 sync 下有意义'; args = @('-Mode', 'clean', '-Force') },
+        @{ label = '-VerifyAll 需要 -Force'; args = @('-Mode', 'sync', '-VerifyAll') },
         @{ label = '-VerifyAll 只在 sync 下有意义'; args = @('-VerifyAll') },
         @{ label = '-Rounds 小于 1'; args = @('-Rounds', '0') },
         @{ label = '-Binary 不存在'; args = @(); binary = (Join-Path $Root '没有这个.exe') },

@@ -36,7 +36,8 @@
     传给 p4delta 的起始目录（位置参数）。必须是已存在的本地目录。
 
 .PARAMETER Mode
-    open / clean / sync 三选一，默认 open（不带模式开关的那个）。
+    open / clean / sync 三选一，默认 open（不带模式开关的那个）。sync 指的是**普通同步**
+    （原生 `p4 sync` 的对等物）；强制修复要另加 -Force。
 
 .PARAMETER Rounds
     计时轮数，默认 5，不含预热那一轮。
@@ -45,9 +46,14 @@
     仅 sync：--to <changelist>。0（默认）表示不传，即目标为 head。取值范围与 CLI 的 u32
     一致（1..4294967295），负数与非数字在这里就被挡下来。
 
+.PARAMETER Force
+    仅 sync：--sync --force，也就是强制修复（「只传真正需要传的文件」的 `p4 sync -f`）。
+    不带时是普通同步——它只报原生打算传的文件，候选来自 `p4 sync -n`，不读摘要。
+
 .PARAMETER VerifyAll
-    仅 sync：--verify-all，不信任 mtime 与摘要缓存的推断——**每轮都会绕过摘要缓存重算**，
-    所以这种模式下的秒数天然是「冷缓存」的，预热也改不了这一点。
+    仅 sync --force：--verify-all，不信任 mtime 与摘要缓存的推断——**每轮都会绕过摘要缓存
+    重算**，所以这种模式下的秒数天然是「冷缓存」的，预热也改不了这一点。普通同步不读摘要，
+    这个开关没有可放大的东西，CLI 那边也要求 `--force`。
 
 .PARAMETER NoPruneIgnoredDirs
     加 --no-prune-ignored-dirs，关掉忽略目录剪枝，用于结果与性能对照。
@@ -67,6 +73,11 @@
     .\scripts\benchmark.ps1 -Binary .\target\release\p4delta.exe -Workspace your-workspace -Path E:\project\src `
         -Mode sync -To 12345 -Rounds 3
     sync 到 changelist 12345（预演），3 轮计时。
+
+.EXAMPLE
+    .\scripts\benchmark.ps1 -Binary .\target\release\p4delta.exe -Workspace your-workspace -Path E:\project\src `
+        -Mode sync -Force -VerifyAll
+    强制修复的 head 版，每轮绕过摘要缓存重算。
 #>
 [CmdletBinding()]
 param(
@@ -76,6 +87,7 @@ param(
     [ValidateSet('open', 'clean', 'sync')] [string] $Mode = 'open',
     [int] $Rounds = 5,
     [int64] $To = 0,
+    [switch] $Force,
     [switch] $VerifyAll,
     [switch] $NoPruneIgnoredDirs,
     [string] $OutDir,
@@ -129,8 +141,13 @@ function Get-UsageErrors {
     if ($To -ne 0 -and $Mode -ne 'sync') {
         $errors.Add("-To 只在 -Mode sync 下有意义（--to 是 sync 的目标 changelist）。")
     }
-    if ($VerifyAll -and $Mode -ne 'sync') {
-        $errors.Add('-VerifyAll 只在 -Mode sync 下有意义（--verify-all 是 sync 的开关）。')
+    if ($Force -and $Mode -ne 'sync') {
+        $errors.Add('-Force 只在 -Mode sync 下有意义（--force 是强制修复的开关）。')
+    }
+    if ($VerifyAll -and -not $Force) {
+        # CLI 那边 `--verify-all` 就要求 `--force`：普通同步根本不读摘要，放行它等于让用户
+        # 以为「验证过全部文件」。这里提前说清，别等 p4delta 以用法错误退出。
+        $errors.Add('-VerifyAll 需要 -Force：它放大的只有强制修复的摘要候选，普通同步不读摘要。')
     }
 
     return $errors.ToArray()
@@ -148,6 +165,7 @@ function Get-PreviewArguments([string] $TargetPath) {
         'clean' { $result.Add('--clean') }
         'sync' {
             $result.Add('--sync')
+            if ($Force) { $result.Add('--force') }
             if ($To -ne 0) {
                 $result.Add('--to')
                 $result.Add($To.ToString())
@@ -524,6 +542,7 @@ if ($outputCreated) {
             workspace             = $Workspace
             path                  = $PathFull
             mode                  = $Mode
+            force                 = [bool] $Force
             to                    = if ($To -ne 0) { $To } else { $null }
             verify_all            = [bool] $VerifyAll
             no_prune_ignored_dirs = [bool] $NoPruneIgnoredDirs

@@ -8,18 +8,25 @@
 cargo build --release --locked
 pwsh -File scripts/benchmark.ps1 -Binary ./target/release/p4delta.exe `
     -Workspace <client> -Path <本地目录> -OutDir <扫描范围外的新输出目录>
-# 可选：-Mode clean，或 -Mode sync -To <CL> -VerifyAll
+# 可选：-Mode clean，或 -Mode sync（普通同步）
+#                -Mode sync -Force          强制修复
+#                -Mode sync -Force -To <CL> 目标 changelist（-To 只在 sync 下；-VerifyAll 需要 -Force）
 # 剪枝对照：相同场景另跑一份 -NoPruneIgnoredDirs
 pwsh -File scripts/test-benchmark.ps1
 ```
+
+`result.json` 的 `parameters` 里记着实际发出去的那套模式开关（`mode` / `force` / `to` / `verify_all`），
+所以结果文件自己说得清它是哪一档跑出来的。
 
 每次输出到新目录，保留原始 stdout/stderr 与 `result.json`；预热与计时轮的动作和完整路径按区分
 大小写的多重集比较，乱序不算差异，重复数量参与比较。输出目录与测量目录不得互相包含，避免
 基准日志污染扫描。遇到转交原生 P4 的不支持文件时，因清单不完整而拒绝报告成功的基准结果。
 对照不同构建或剪枝开关时，先核对动作一致，再比较多轮耗时，不能只比最快的一轮。
 
-脚本不清除摘要缓存，也不控制操作系统文件缓存；正常档是自然预热后的重复测量，`-VerifyAll`
-仍每轮绕过摘要缓存与时间戳捷径，不是“冷操作系统缓存”测量。峰值工作集只覆盖主进程，
+脚本不清除摘要缓存，也不控制操作系统文件缓存；正常档是自然预热后的重复测量，`-Force -VerifyAll`
+仍每轮绕过摘要缓存与时间戳捷径，不是“冷操作系统缓存”测量。**普通 `-Mode sync` 不读摘要缓存**，
+所以它天然没有「缓存冷热」这个变量——那也正是它不能拿来跟 `-Force` 档比秒数的原因：两者做的
+事不一样（一个问原生打算传什么，一个自己做全量比对）。峰值工作集只覆盖主进程，
 不包含 P4 子进程；退出后无法取得有效峰值时，使用运行期间每 50 ms 刷新采样所得的下界，
 始终取不到有效值则记 `null`。目前没有分阶段耗时、服务端负载或进程树峰值统计，也不在 CI
 里设耗时硬阈值。脚本测试使用假 CLI 与模拟进程对象，不访问真实 P4。

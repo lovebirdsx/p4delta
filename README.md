@@ -4,7 +4,9 @@ P4V 里的 `Reconcile Offline Work` 慢得令人抓狂，本程序是它的替�
 
 加 `--clean` 时它反向工作：不拿工作区去更新 depot，而是**用 depot 修正工作区**，等价于 `p4 clean`（`p4 reconcile -w`）。
 
-加 `--sync` 时它把工作区拉到目标 depot 版本（默认 head，`--to <CL>` 指定 changelist），等价于「只传真正需要传的文件」的 `p4 sync -f`。
+加 `--sync` 时它把工作区拉到目标 depot 版本（默认 head，`--to <CL>` 指定 changelist），等价于
+把原生 `p4 sync` 的范围收窄到你指定的入口——覆盖保护与「已打开的文件」仍由 p4 判定。要「无论
+本地改没改，都把工作区修成目标版本」，加上 `--force`，那才是 `p4 sync -f` 的对等物。
 
 操作对象可以限制在一组目录与文件上——命令行参数，或工作区里长期生效的 `.p4delta-scope`
 配置；排除项永远优先。见「操作范围」。
@@ -87,27 +89,30 @@ Get-FileHash .\p4delta-<版本>-x86_64-pc-windows-msvc.zip -Algorithm SHA256
 - `p4delta Reconcile`：默认模式，等价于依次执行 "Reconcile Offline Work" 和 "Revert Unchanged"。
 - `p4delta Clean (preview)`：clean 模式的预演，只打印不动作。
 - `p4delta Sync to changelist (preview)`：把你**指定的那个目录**拉到**右键那一行的 changelist**。
-  这一条只在 P4V 的 History 视图里、对着**已提交**的 changelist 出现：changelist 自动带上，
-  弹框问目录。
+  走的是**强制修复**（`--sync --force`）：未打开文件上的本地改动会被覆盖。这一条只在 P4V 的
+  History 视图里、对着**已提交**的 changelist 出现：changelist 自动带上，弹框问目录。
 - `p4delta Sync this folder to changelist (preview)`：把**右键选中的那个目录**拉到你**填的
-  changelist**。这一条在 Workspace / Depot 树里右键时出现：目录自动带上，弹框问 changelist 号。
+  changelist**，同样是强制修复。这一条在 Workspace / Depot 树里右键时出现：目录自动带上，
+  弹框问 changelist 号。
 - `... Clean (APPLY - irreversible)` 与两条 `... Sync ... (APPLY - irreversible)`：
   上面几条的实际执行版，**不可逆**。它们注册在 `p4delta (irreversible)` 子菜单里；不想要哪条
   就在装的时候加 `-WithoutCleanApply` / `-WithoutSyncApply`（后者管两条）。
 
 为什么两条 sync 入口都得手填一半，见下面「从 History 视图同步到某个 changelist」。
 
-sync 模式的 head 版（不带 `--to`）没有注册进 P4V——它的动作同样会覆盖本地改动。要手工建的话，
-Arguments 填 `--sync -w $c -l %D`，先读「sync 模式」一节。
+**只做日常版本更新（不动本地改动）就别用这两条**：它们带 `--force`，会覆盖未打开文件上的本地
+改动。那种场合自己在 P4V 里加一条 `--sync -w $c -l %D`（普通同步，可以先去掉 `-a` 跑预演），
+先读「sync 模式」一节。head 版的两条（不带 `--to`）都没有注册进 P4V：普通同步那条只是「跟着
+上游走」，装了多半也是误点；强制修复那条与你手上这份文件无关，没有入口也就不必担心。
 
 去掉 `-a` 就是预演（dry run）：照常扫描比对并打印结果，但不向 p4 应用任何变更。
 
 ### 从 History 视图同步到某个 changelist
 
 在 History 视图里右键一个已提交的 changelist，选 `p4delta Sync to changelist`：那个号直接进了
-`--sync --to <CL>`，工作区被拉回那一刻的状态。弹框问的是**目录**——扫描与还原的范围就是它，
-不是整个工作区。从 History 的路径栏复制即可，本地路径（`E:\project\...`）与 depot 路径
-（`//depot/...`）都收。
+`--sync --force --to <CL>`，工作区被拉回那一刻的状态（强制修复：未打开文件上的本地改动会被
+覆盖）。弹框问的是**目录**——判定与动作的范围就是它，不是整个工作区。从 History 的路径栏复制
+即可，本地路径（`E:\project\...`）与 depot 路径（`//depot/...`）都收。
 
 反过来，在 Workspace 或 Depot 树里右键一个目录，选 `p4delta Sync this folder to changelist`：
 目录就是右键的那一个，弹框问 changelist 号。
@@ -184,10 +189,15 @@ Arguments 里的 `$c` 是 P4V 展开的当前 workspace，`%D` 是右键选中�
 安装脚本会把实际清理那条放进单独的 `p4delta (irreversible)` 文件夹，手工建的话也建议这么摆。
 
 想从 History 视图同步到某个 changelist 的话，同样再建两条：Arguments 填
-`--sync -w $c -l $D --to %S` 做预演，填 `-a --sync -w $c -l $D --to %S` 做实际执行，并且
-**勾上 "Prompt for arguments"**、Prompt Text 填「要同步哪个目录？……」——`$D` 就是那个输入框
-里填的内容。想从工作区树同步某个目录的话，再建两条：`--sync -w $c -l %D --to $D` 与
-`-a --sync -w $c -l %D --to $D`，同样勾 Prompt、Prompt Text 填「要同步到哪个 changelist？……」。
+`--sync --force -w $c -l $D --to %S` 做预演，填 `-a --sync --force -w $c -l $D --to %S` 做实际
+执行，并且**勾上 "Prompt for arguments"**、Prompt Text 填「要同步哪个目录？……」——`$D` 就是那个
+输入框里填的内容。想从工作区树同步某个目录的话，再建两条：`--sync --force -w $c -l %D --to $D`
+与 `-a --sync --force -w $c -l %D --to $D`，同样勾 Prompt、Prompt Text 填
+「要同步到哪个 changelist？……」。
+
+那四条带 `--force`，是因为它们问的都是「回到某个 changelist」——强制修复。只想要普通同步
+（不动本地改动）就把 `--force` 去掉：`--sync -w $c -l %D` 是 head 版，`--sync -w $c -l %D --to $D`
+是某个 changelist 版；不带 `-a` 先看清单更稳妥。
 
 每条 sync 工具都得勾 Prompt 才有用：目录与 changelist 只能自动一个，另一个不勾就是空的。
 为什么不能两个都自动，见上面「从 History 视图同步到某个 changelist」一节。
@@ -348,11 +358,45 @@ depot，而是把工作区修正到与 depot 一致。它对三类**未打开**�
 - `p4 clean -K`（抑制 ktext 关键字展开）没有对应开关，工具始终按 p4 的默认行为展开关键字。
 - 需要的是 `read` 权限，而不是 `open` 权限。
 
-## sync 模式（`p4 sync -f` 对等）
+## sync 模式
 
-`--sync` 把工作区拉到**目标 depot 版本**——默认 head，`--to <CL>` 指定某个 changelist——
-语义等价于 `p4 sync -f`，但只下发真正需要传的文件，而不是把整个工作区重传一遍。
-几十万文件的工作区上，这是小时级与秒级的差别。
+`--sync` 把工作区拉到**目标 depot 版本**——默认 head，`--to <CL>` 指定某个 changelist。
+不加 `--force` 时它是**普通同步**，也就是原生 `p4 sync` 的对等物：
+
+- **先问 p4**：工具让原生预演一遍（`p4 sync -n`），只做三件事——按范围过滤出候选、让每个候选
+  精确到 `//depot/file#rev`、把规格交回原生 `p4 sync` 执行。覆盖保护、已打开的文件、have 更新
+  全由 p4 判定，工具不替它做决定。
+- **未打开文件上的本地改动不会被覆盖**（p4 的 noclobber 保护），可写文件挡下来时报的是同一个错。
+- **不删 depot 里没有的本地文件**——那是用户自己的东西（这与 `--clean` 的分水岭）。
+- **不做自动 resolve**：已打开、have 又落后于目标的文件，原生会把 have 推到目标版本并挂上
+  待 resolve，合并留给用户。
+
+它**不承诺比原生 `p4 sync` 快**：省下的是 p4delta 自己的扫描与摘要计算，原生该传的字节一个
+不少。它的价值在范围——`.p4delta-scope` 与 `-<path>` 排除项对它是**硬边界**（原生 p4 没有这个
+概念），范围外的文件既不报也不动。
+
+报告里的四组：
+
+| 组 | 判据 | 动作 |
+| --- | --- | --- |
+| `Add` | 目标处有、工作区没有 | 写进来 |
+| `Update` | 工作区有一份，但不是目标版本 | 拉到目标版本 |
+| `Delete` | 目标时刻该路径不在库，工作区却有 | 从工作区移除，并清掉 have 记录 |
+| `Opened` | 文件已打开、have 不是目标版本 | 把 have 拉到目标版本；落后于目标时挂上待 resolve，内容一个字不改 |
+
+前三组由原生预演给出，不是本地扫描的结果——所以「本地改了但没落后」的文件不会出现（本来也
+不该动它）。`Opened` 那一组要绕一下：原生对这类事件只印一句提示（`#2 - is opened and not
+being changed`），路径埋在文本里、正文记录一条都没有，工具于是补跑两条只读查询（`p4 opened`
+与 `p4 fstat`）去认这些文件。判据是 have **不在目标版本上**——have 已经在目标版本上的已打开
+文件，原生连一句都不说，工具也不把它们报出来。
+
+不带 `-a` 仍是预演：报出要做的四组，一个字节都不写（磁盘、have、opened、摘要缓存都不动）。
+
+### 强制修复（`--sync --force`）
+
+加上 `--force` 后语义变成「无论本地改没改，都把工作区修成目标版本」，等价于**只传真正需要传
+的文件**的 `p4 sync -f`，而不是把整个工作区重传一遍。几十万文件的工作区上，那是小时级与秒级
+的差别。
 
 四组动作：
 
@@ -381,23 +425,31 @@ depot，而是把工作区修正到与 depot 一致。它对三类**未打开**�
 
 不带 `-a` 仍是预演。只是预演也会打印那句覆盖警告——代价得在授权之前就看得见。
 
-### 快档与 `--verify-all`
+> **强制修复不可逆。** 它丢弃未打开文件上的本地改动，删掉目标时刻不在库的本地文件，
+> 两者都没法用 p4 找回来。普通同步没有这个风险——需要它就别加 `--force`。
 
-默认档沿用摘要缓存与时间戳捷径：与 have 的 syncTime 相差不超过一秒的文件不再重算摘要。
-**所以默认档是近似而不是保证**——改过内容却保住了 mtime 的文件（编辑器保留时间戳、从备份
-恢复、脚本改写）会被静默漏掉。这是它相对 `p4 sync -f` 唯一的新增失败模式，`p4 sync -f` 没有
-这个问题，因为它一律重传。
+### 强制修复的快档与 `--verify-all`
+
+强制修复的默认档沿用摘要缓存与时间戳捷径：与 have 的 syncTime 相差不超过一秒的文件不再重算
+摘要。**所以默认档是近似而不是保证**——改过内容却保住了 mtime 的文件（编辑器保留时间戳、从
+备份恢复、脚本改写）会被静默漏掉。这是它相对 `p4 sync -f` 唯一的新增失败模式，`p4 sync -f`
+没有这个问题，因为它一律重传。
 
 `--verify-all` 把推断换成验证：目标版本没变的文件全部重算摘要，**摘要缓存也不看**——缓存里
 放的是上一轮算出的值，拿它下结论就还是推断。代价是每次运行都要全量读盘（算出的摘要仍写回缓存，
 默认档接着受益）。成功语也分档——只有这一档会打印 `The synced files match the target depot
 revision.`，默认档只说 `Synced N files in ... seconds.`。
 
+`--verify-all` 只对强制修复有意义（`--sync --verify-all` 是用法错误）：普通同步根本不读摘要，
+没有可放大的东西，放行它等于让用户以为「验证过全部文件」。同理，普通同步也不读摘要缓存——
+这与性能数字里那条 mtime 捷径无关，它压根不走那条管线。
+
 ### 回到某个 changelist（`--to`）
 
-`--to 12345` 拉到那个 changelist 时刻的状态，而不是 head：目标之后提交的新版本会被**退回旧版**，
-目标之后才创建的路径会被**删掉**（`Delete` 组）。这与 `p4 sync -f ./...@12345` 的判定一致——
-那边把这类文件一并报成 `deleted as`。
+`--to 12345` 拉到那个 changelist 时刻的状态，而不是 head，两种模式都支持：目标之后提交的新
+版本会被**退回旧版**，目标之后才创建的路径会被**删掉**（`Delete` 组）。强制修复那边的判定与
+`p4 sync -f ./...@12345` 一致——原生把这类文件一并报成 `deleted as`；普通同步那边则直接由原生
+预演给出，用户手工敲 `p4 sync ./...@12345` 会发生什么，这里就发生什么。
 
 > **这一组会删本地文件，而且没有反悔余地。** 目标 CL 之后新增的文件都在此列，哪怕内容是你刚
 > 写的；删除版本没有内容，`sync @CL` 也找不回来。先跑预演，`-l` 会把它们逐个列出来。
@@ -470,14 +522,21 @@ $ p4delta --json -l .            # 预演，stdout 只有 JSONL
 
 - `p4delta` 不实现 move/add 与 move/delete 的配对识别。
 - `--clean` 不还原 head revision 是归档版本的文件，只跳过并汇报；Apple/Resource 与认不出的 `headType` 则转交 `p4 clean`。
-- `--sync` 的默认档是**近似而不是保证**：它信任时间戳与摘要缓存，改过内容却保住 mtime 的文件会被
-  静默漏掉（`p4 sync -f` 没有这个失败模式，它一律重传）。要保证就用 `--verify-all`。归档版本的文件
-  同样只跳过并汇报；Apple/Resource 与认不出的 `headType` 转交 `p4 sync -f`。
+- `--sync --force` 的默认档是**近似而不是保证**：它信任时间戳与摘要缓存，改过内容却保住 mtime
+  的文件会被静默漏掉（`p4 sync -f` 没有这个失败模式，它一律重传）。要保证就用 `--verify-all`。
+  归档版本的文件同样只跳过并汇报；Apple/Resource 与认不出的 `headType` 转交 `p4 sync -f`。
+  普通同步（不带 `--force`）不走这条管线，也就没有这个失败模式。
 - `--sync --to <CL>` 会**删掉目标 changelist 之后创建的文件**（它们在那时还不存在），且无法用
-  `sync @CL` 找回内容。先跑预演，`-l` 会列出来。
-- `--sync -a` 的删除组里若有文件被别的进程占着（编辑器开着、杀毒软件正在扫），`p4 sync -f
-  #none` 会在删除上重试约十秒才放弃，那一组会明显卡一下。这是 p4 自身的行为，不是 p4delta
-  加的重试；失败会被报出来（见退出码一节），只是要等。
+  `sync @CL` 找回内容——两种模式都一样。先跑预演，`-l` 会列出来。
+- `--sync --force -a` 的删除组里若有文件被别的进程占着（编辑器开着、杀毒软件正在扫），
+  `p4 sync -f #none` 会在删除上重试约十秒才放弃，那一组会明显卡一下。这是 p4 自身的行为，
+  不是 p4delta 加的重试；失败会被报出来（见退出码一节），只是要等。
+- 普通同步对**已打开、have 不在目标版本上**的文件要补跑两条只读查询（`p4 opened` 与
+  `p4 fstat`）才能拿到它们的身份：原生对这类事件只给一句提示文本（"is opened and not being
+  changed"），路径埋在文本里，正文记录一条都没有。这条补查只在预演真的报了那句话时才跑，
+  规模由打开数决定，不影响大工作区；补查失败或解释不了那批提示时整轮停下并报错。
+- 文件**开着的时候被别人删掉**（目标处这个路径是删除状态）：普通同步会停下报错，不猜原生会
+  怎么做——那种现场没法在沙箱里复现，也就无从证明。先 revert 或 submit 那个文件再同步。
 - `p4 clean -K`（抑制 ktext 关键字展开）没有暴露，clean 始终按 p4 的默认行为展开关键字。
 - `--clean` 或 `--sync` 与 `-c` 同时给出时 `-c` 被忽略（各自会打印一行告警）。
 - depot 路径里含 `#`、`%`、`@`、`*`，或以 `...` 结尾的文件名会被 p4 当成通配符解析，转交路径、
@@ -502,7 +561,10 @@ $ p4delta --json -l .            # 预演，stdout 只有 JSONL
   `<PromptText>` 之后）实测那个浏览按钮只能选**文件**、选不了目录，对问目录的 prompt 没用，
   所以也不写。
 - sync 那几条**已在真实 P4V 里点过**（2026-10-03）：两条入口都出现在预期的菜单里、prompt 正常
-  弹出，留空点 OK 以退出码 1 报 `No path given`，输出进 P4V 自己的输出窗。剩余未知见下一条。
+  弹出，留空点 OK 以退出码 1 报 `No path given`，输出进 P4V 自己的输出窗。**2026-10-05 起这四条
+  的参数多了 `--force`**（把「回到某个 changelist」与新的普通同步分开），元素形状与 prompt 没动，
+  但按 [docs/dev/release.md](docs/dev/release.md) 的规矩这一段要重新点一遍——本轮没装进 P4V，
+  所以还没复验。剩余未知见下一条。
 - prompt 里粘的目录若**含空格**，P4V 如何把它拼进命令行没有实测（我们这边的路径都不含空格）。
   含空格的路径建议改用命令行调用。
 - 安装路径里含空格时（用户名带空格就会），`<Command>` 能否被 P4V 正确解析尚未实测。安装脚本会在

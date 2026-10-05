@@ -371,15 +371,19 @@ function Get-DesiredTools([switch] $WithoutCleanApply, [switch] $WithoutSyncAppl
         # 目录那条 prompt 上不加浏览按钮（`<ShowBrowse>`）：2026-10-03 在 GUI 里实测，那个按钮
         # 打开的是**文件**选择器，选不了目录——给了反而把人往「选个文件、工具报不是目录」上引。
         # 目录路径只能手打或粘贴。
-        @{ Name = $SyncHistoryPreviewTool; Arguments = '--sync -w $c -l $D --to %S'; Prompt = $FolderPromptText; Folder = $null },
-        @{ Name = $SyncFolderPreviewTool; Arguments = '--sync -w $c -l %D --to $D'; Prompt = $ChangelistPromptText; Folder = $null }
+        #
+        # 四条都带 `--force`：这些入口的用途是「把这一段拉回那一刻的状态」，也就是原来的
+        # `--sync` 语义（覆盖未打开文件上的本地改动）。不带 `--force` 的普通同步只把工作区
+        # 拉到目标版本、不动本地改动，放进「回到某个 changelist」的菜单里会名不副实。
+        @{ Name = $SyncHistoryPreviewTool; Arguments = '--sync --force -w $c -l $D --to %S'; Prompt = $FolderPromptText; Folder = $null },
+        @{ Name = $SyncFolderPreviewTool; Arguments = '--sync --force -w $c -l %D --to $D'; Prompt = $ChangelistPromptText; Folder = $null }
     )
     if (-not $WithoutCleanApply) {
         $specs += @{ Name = $CleanApplyTool; Arguments = '-a --clean -w $c -l %D'; Prompt = ''; Folder = $IrreversibleFolder }
     }
     if (-not $WithoutSyncApply) {
-        $specs += @{ Name = $SyncHistoryApplyTool; Arguments = '-a --sync -w $c -l $D --to %S'; Prompt = $FolderPromptText; Folder = $IrreversibleFolder }
-        $specs += @{ Name = $SyncFolderApplyTool; Arguments = '-a --sync -w $c -l %D --to $D'; Prompt = $ChangelistPromptText; Folder = $IrreversibleFolder }
+        $specs += @{ Name = $SyncHistoryApplyTool; Arguments = '-a --sync --force -w $c -l $D --to %S'; Prompt = $FolderPromptText; Folder = $IrreversibleFolder }
+        $specs += @{ Name = $SyncFolderApplyTool; Arguments = '-a --sync --force -w $c -l %D --to $D'; Prompt = $ChangelistPromptText; Folder = $IrreversibleFolder }
     }
     return $specs
 }

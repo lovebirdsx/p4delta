@@ -20,7 +20,7 @@ use crate::charset::{
 use crate::cli::Options;
 use crate::json::sayln;
 use crate::model::HaveRecord;
-use crate::p4::marshal::MarshalStreamParser;
+use crate::p4::marshal::{MarshalRecord, MarshalRecordReader, MarshalStreamParser};
 
 // 参数改成从 stdin 交给 p4 之后（见 [`argument_payload`]），这个数字不再是 Win32 命令行
 // 长度上限（32767 字符，https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/command-line-string-limitation）。
@@ -318,6 +318,301 @@ pub(crate) fn build_p4_command(
     cmd.kill_on_drop(true);
 
     (cmd, payload)
+}
+
+/// 严格版参数载荷：每个参数都必须能**无损**写进 p4 的命令字符集，且不含会把
+/// `-x` 的一行拆成两行的字符。
+///
+/// 与 [`argument_payload`] 的差别是立场，不是编码：那一版把表达不了的字符换成数字引用、
+/// 只提醒一句（适合 `p4 ignores` 这类「判不出来就放宽」的调用），这一版直接拒绝。
+/// 普通同步下发的每条参数都是「p4 必须原样认出的东西」——一个文件规格认不出来，
+/// 结果就是那个文件静默地没被同步，而整轮照报成功。
+fn strict_argument_payload(args: &[String]) -> Result<Vec<u8>> {
+    let encoding = p4_command_encoding();
+    let mut payload = Vec::new();
+
+    for arg in args {
+        // `-x` 是「一行一个参数」，路径里含换行或 NUL 会被拆成两条、或截断成一个别的
+        // 规格。这种名字在 Windows 上建不出来，在 Unix 上是极少见的病态输入——
+        // 拒绝它，而不是让 p4 拿到一个没人写过的路径。
+        if arg.contains(['\n', '\r', '\0']) {
+            bail!("Refusing to send a p4 argument containing a line break or NUL: {arg:?}");
+        }
+
+        let (bytes, _, had_errors) = encoding.encode(arg);
+        if had_errors {
+            bail!(
+                "\"{arg}\" cannot be written in {}; point P4COMMANDCHARSET at a charset that can.",
+                encoding.name()
+            );
+        }
+
+        payload.extend_from_slice(&bytes);
+        payload.push(b'\n');
+    }
+
+    Ok(payload)
+}
+
+/// 组装一次结构化查询的 p4 调用：参数一律走 stdin，编码**严格**校验。
+///
+/// 与 [`build_p4_command`] 分开而不是加个开关：后者的宽松编码策略是 [FailureMode::Warn]
+/// 那条路径的一部分（`p4 ignores` 认不出名字也要照跑），两者的取舍相反，混在一个函数里
+/// 早晚会有人把开关传错。
+fn build_p4_command_strict(
+    program: &Path,
+    work_dir: &str,
+    always_args: &[&str],
+    batched_args: &[String],
+    client: Option<&str>,
+) -> Result<(Command, Option<Vec<u8>>)> {
+    let payload = strict_argument_payload(batched_args)?;
+
+    let mut cmd = Command::new(program);
+    cmd.current_dir(work_dir);
+    // p4 在 Windows 上按继承来的 PWD 找 .p4config，显式指定 cwd 时必须同时清掉 PWD。
+    cmd.env_remove("PWD");
+
+    if !payload.is_empty() {
+        cmd.arg("-x")
+            .arg("-")
+            .arg("-b")
+            .arg(batched_args.len().to_string());
+        cmd.stdin(Stdio::piped());
+    }
+
+    if let Some(client) = client {
+        cmd.arg("-c");
+        cmd.arg(client);
+    }
+
+    cmd.args(always_args);
+
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    Ok((cmd, (!payload.is_empty()).then_some(payload)))
+}
+
+/// 一次结构化 `-G` 调用的产出。
+pub(crate) struct MarshalRun {
+    /// `code:"stat"` 的记录：命令的正文。
+    pub(crate) records: Vec<MarshalRecord>,
+
+    /// `code:"info"` 的提示。与 [`RecordVerdict::Diagnostic`] 分开，因为它们的含义相反：
+    /// 那类「无事可做」的提示说明正文已经说完了，而 `info` 说明 p4 打算做的事**没进正文
+    /// 记录**——路径只写在消息文本里。普通同步据此知道该去补查已打开文件的身份。
+    pub(crate) notices: Vec<String>,
+
+    /// p4 报出的失败。进程起不来、参数编不出来、管道或解析损坏时直接 `Err`——
+    /// 那些情况下连「p4 说了什么」都不完整，汇总也就无从谈起。
+    pub(crate) failures: Vec<String>,
+}
+
+/// 一条 marshal 记录在「这一轮算不算成功」上的分量。
+///
+/// 判据来自沙箱实测（2024.1），不是从文档推的：
+///
+/// | 情形 | `code` | `severity` | 退出码 |
+/// |---|---|---|---|
+/// | 文件动作（正文） | `stat` | 缺席 | 0 |
+/// | `file(s) up-to-date.` / `no such file(s).` | `error` | 2 | 0 |
+/// | `is opened and not being changed` 那类 | `info` | 缺席（有 `level`） | 0 |
+/// | `Can't clobber writable file` | `error` | 3 | 1 |
+/// | `Unintelligible revision specification` | `error` | 3 | 1 |
+///
+/// 两个 2 级的情形**无法**只靠结构化字段分开——`generic` 也都是 17。所以这里不试着
+/// 分类它们：2 级一概当提示转出去，而整轮的成败由「有没有 3 级 / 退出码非零」决定。
+/// 未知 `code` 或 `severity` 缺失一律按失败处理：p4 换一种说法时宁可红一次，
+/// 也不能把「这条记录我没读懂」当成「这条记录说没事」。
+///
+/// `info` 单独归 [`RecordVerdict::Notice`]：它和 2 级错误一样不影响成败，但它是**唯一**
+/// 会告诉我们「p4 还打算动一些没进正文记录的文件」的信号（实测：已打开文件的 have 推进
+/// 只以 `info` 出现，路径埋在消息文本里）。
+fn classify_record(record: &MarshalRecord, command: &str) -> RecordVerdict {
+    let encoding = p4_encoding();
+    let Ok(code) = record.text("code", encoding) else {
+        return RecordVerdict::Failure(format!("p4 {command} returned an undecodable record"));
+    };
+
+    let message = || {
+        record
+            .text("data", encoding)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "(no message)".to_owned())
+            .trim_end()
+            .to_owned()
+    };
+
+    match code.as_deref() {
+        Some("stat") => RecordVerdict::Body,
+        Some("info") => RecordVerdict::Notice(message()),
+        Some("error") => {
+            let severity = record
+                .text("severity", encoding)
+                .ok()
+                .flatten()
+                .and_then(|text| text.parse::<i32>().ok());
+            match severity {
+                // 3 = error、4 = fatal（`p4 help` 里的 severity 分级）。
+                Some(level) if level >= 3 => RecordVerdict::Failure(message()),
+                Some(_) => RecordVerdict::Diagnostic(message()),
+                None => RecordVerdict::Failure(format!(
+                    "p4 {command} returned an error record without a usable severity"
+                )),
+            }
+        }
+        Some(other) => RecordVerdict::Failure(format!(
+            "p4 {command} returned a record with an unknown code \"{other}\""
+        )),
+        None => RecordVerdict::Failure(format!("p4 {command} returned a record without a code")),
+    }
+}
+
+enum RecordVerdict {
+    /// 不带结论的正文（`stat`）。
+    Body,
+    /// p4 打算做点什么的提示：那件事**没有**对应的正文记录，只有这行文本。
+    Notice(String),
+    /// 可以忽略的提示：p4 对「无事可做」也写字，那是正常结果而不是失败。
+    Diagnostic(String),
+    /// 失败：消息直接进整轮的错误汇总。
+    Failure(String),
+}
+
+/// 顺序跑完一批结构化 `-G` 调用，收齐记录与失败。
+///
+/// **顺序**而不是并发：这条路只服务普通同步，而它的写入动作由 p4 自己判定覆盖保护与
+/// opened 状态，多进程并发下发并没有被验证过；先要正确，再谈快。
+pub(crate) async fn run_p4_marshal_batched(
+    options: &Options,
+    work_dir: &str,
+    command: &str,
+    always_args: &[&'static str],
+    batched_args: &[String],
+) -> Result<MarshalRun> {
+    let batches = compute_batches(batched_args);
+    let mut run = MarshalRun {
+        records: Vec::new(),
+        notices: Vec::new(),
+        failures: Vec::new(),
+    };
+
+    for range in batches {
+        // 解析或管道损坏会在这里变成 Err，调用方据此停止后续批次——已经落地的动作不回滚，
+        // 但也不会在「p4 说了什么」不完整的情况下继续往下发。
+        let slice = run_p4_marshal_slice(
+            options,
+            work_dir,
+            command,
+            always_args,
+            &batched_args[range],
+        )
+        .await?;
+        run.records.extend(slice.records);
+        run.notices.extend(slice.notices);
+        run.failures.extend(slice.failures);
+    }
+
+    Ok(run)
+}
+
+/// 跑一批结构化调用中的一片。
+pub(crate) async fn run_p4_marshal_slice(
+    options: &Options,
+    work_dir: &str,
+    command: &str,
+    always_args: &[&'static str],
+    batched_args: &[String],
+) -> Result<MarshalRun> {
+    let program = crate::locate::p4_exe()?;
+    let (mut cmd, payload) = build_p4_command_strict(
+        program,
+        work_dir,
+        always_args,
+        batched_args,
+        options.workspace.as_deref(),
+    )?;
+
+    let mut child = cmd.spawn()?;
+    let P4Pipes {
+        arguments,
+        stdout,
+        stderr,
+    } = take_p4_pipes(&mut child, payload)?;
+
+    // 三条管道并发推：只读 stdout 时，塞满 stderr 管道的子进程会永远阻塞；
+    // 参数那一侧同理——写不完的载荷会把 p4 堵在读取上，而它又在等我们读输出。
+    let write_args = write_p4_arguments(arguments);
+    let read_stdout = read_marshal_records(stdout);
+    let read_stderr = read_p4_stderr(stderr);
+
+    let (_, records, stderr_bytes) = futures::join!(write_args, read_stdout, read_stderr);
+    let records = records?;
+
+    let status = child.status().await?;
+
+    let mut run = MarshalRun {
+        records: Vec::new(),
+        notices: Vec::new(),
+        failures: Vec::new(),
+    };
+    for record in &records {
+        match classify_record(record, command) {
+            RecordVerdict::Body => run.records.push(record.clone()),
+            // 原生提示照原样转出去：它就是用户手工跑 p4 时会看到的那几行，
+            // 而「preview 与真实动作一致」的保证正建立在用户看得见它们上。
+            RecordVerdict::Notice(message) => {
+                eprintln!("{message}");
+                run.notices.push(message);
+            }
+            RecordVerdict::Diagnostic(message) => eprintln!("{message}"),
+            RecordVerdict::Failure(message) => run.failures.push(message),
+        }
+    }
+
+    let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+    let stderr_text = stderr_text.trim();
+    if !status.success() {
+        run.failures
+            .push(format!("p4 {command} exited with {status}: {stderr_text}"));
+    } else if !stderr_text.is_empty() {
+        // 退出码为 0 但 stderr 有输出：实测 `-G` 下 p4 把逐文件错误写在记录流里、
+        // stderr 是空的，所以这里有东西就意味着出现了没进记录流的说法。宁可红一次。
+        run.failures
+            .push(format!("p4 {command} wrote to stderr: {stderr_text}"));
+    }
+
+    Ok(run)
+}
+
+/// 逐块读 p4 的 `-G` 输出并解析成 marshal 记录。
+///
+/// 与 [`read_p4_lines`] 的分工：那个解码文本行（`p4 ignores` / `p4 where` 那类给人看的
+/// 输出），这个读二进制记录流。两者都不适合几千万行的响应，但结构化查询的正文就是
+/// 「每个要动的文件一条记录」，规模由候选决定。
+async fn read_marshal_records(stream: async_process::ChildStdout) -> Result<Vec<MarshalRecord>> {
+    let mut reader = MarshalRecordReader::new(p4_encoding());
+    let mut stdout = stream;
+    let mut chunk = vec![0u8; READ_BUFFER_SIZE];
+    let mut records = Vec::new();
+
+    loop {
+        let read = stdout.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+
+        reader.push_chunk(&chunk[..read], &mut |record| {
+            records.push(record.clone());
+            Ok(())
+        })?;
+    }
+
+    reader.finish()?;
+    Ok(records)
 }
 
 /// 一次 p4 调用的三条管道。

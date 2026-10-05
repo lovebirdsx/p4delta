@@ -271,6 +271,7 @@ pub(crate) async fn apply_clean(
                 title: &render_title(spec.title, rows.len()),
                 list: options.list,
                 applied: options.apply,
+                stage: None,
             },
             &rows,
         );

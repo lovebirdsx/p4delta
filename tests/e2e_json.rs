@@ -399,15 +399,16 @@ fn clean_and_sync_report_their_own_class_tables() {
     assert_eq!(clean.summary()["mode"], "clean");
     assert_eq!(clean.summary()["total"], 3);
 
-    // sync：把一个文件钉回旧版本。clean 那一步造出来的本地状态留着不动——
-    // sync 会按自己的分类学把它们各归一类（改动的还原、缺失的写回），正好一并钉住。
+    // 强制修复：把一个文件钉回旧版本。clean 那一步造出来的本地状态留着不动——
+    // 强制修复会按自己的分类学把它们各归一类（改动的还原、缺失的写回），正好一并钉住。
+    // 普通同步（不带 `--force`）没有这套分类学，它只报原生打算传的文件，见 e2e_sync_normal.rs。
     sandbox.commit("newer.txt", "v1\n");
     sandbox.p4_ok(&["edit", "newer.txt"]);
     sandbox.write("newer.txt", "v2\n");
     sandbox.p4_ok(&["submit", "-d", "second revision"]);
     sandbox.p4_ok(&["sync", "-f", "newer.txt#1"]);
 
-    let sync = run_json(&sandbox, &["--sync", "."]);
+    let sync = run_json(&sandbox, &["--sync", "--force", "."]);
 
     assert!(sync.ok, "{}", sync.stderr);
     let mut classes = sync.classes();
@@ -654,11 +655,11 @@ fn the_batch_only_handoff_paths_still_carry_both_paths() {
     sandbox.write("w_resource.dat", "resource payload v2 changed\n");
 
     for (mode, args, command) in [
-        ("clean", ["--clean", "."], "clean"),
-        ("sync", ["--sync", "."], "sync"),
-        ("open", ["-a", "."], "reconcile"),
+        ("clean", ["--clean", "."].as_slice(), "clean"),
+        ("sync", ["--sync", "--force", "."].as_slice(), "sync"),
+        ("open", ["-a", "."].as_slice(), "reconcile"),
     ] {
-        let run = run_json(&sandbox, &args);
+        let run = run_json(&sandbox, args);
 
         assert!(run.ok, "{mode}: {}", run.stderr);
         let records = records_for(&run, "//depot/main/w_resource.dat");

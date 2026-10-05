@@ -1,8 +1,9 @@
 //! p4delta：Perforce Helix Core 工作区工具。
 //!
 //! reconcile 模式等价 P4V 的 `Reconcile Offline Work`（快 10–100 倍），`--clean` 等价
-//! `p4 clean`，`--sync` 等价 `p4 sync -f`；三者共用同一条扫描与摘要缓存管线：从服务器取
-//! depot 状态、扫描本地工作区、计算并缓存文件摘要，再比对两者。
+//! `p4 clean`，`--sync` 是普通同步（判定权交给原生 p4），`--sync --force` 才是
+//! 「只传真正需要传的文件」的 `p4 sync -f`；后三者共用同一条扫描与摘要缓存管线，
+//! 普通同步不在这条管线上——它既不扫工作区也不读摘要缓存。
 
 use std::env;
 use std::fs::File;
@@ -23,6 +24,7 @@ mod digest;
 mod json;
 mod locate;
 mod model;
+mod normal_sync;
 mod p4;
 mod path;
 mod prune;
@@ -38,8 +40,9 @@ use crate::charset::init_p4_encoding;
 use crate::json::{Mode, sayln};
 use crate::locate::check_p4_exe_env;
 use crate::model::WorkspaceCache;
+use crate::normal_sync::run_normal_sync;
 use crate::reconcile::reconcile_scope;
-use crate::scope::evaluate_scope;
+use crate::scope::{evaluate_scope, evaluate_scope_strict};
 
 /// 读写文件的缓冲区大小：缓存读写、摘要计算、p4 输出流三处共用。
 ///
@@ -51,12 +54,13 @@ pub(crate) const READ_BUFFER_SIZE: usize = 128 * 1024;
 ///
 /// 参数由调用方（二进制入口）解析后传入，这样库本身不依赖进程级的参数解析。
 ///
-/// 入口与 [`run_once`] 之间夹着 JSON 模式的 summary：**任何**返回路径（成功、`bail!`、
+/// 入口与 `run_once` 之间夹着 JSON 模式的 summary：**任何**返回路径（成功、`bail!`、
 /// 早退）都要发一条 `kind:"summary"`，消费方靠它在「跑完了」与「跑挂了」之间划线。
 /// 写成包一层而不是散在各个 `return` 上，是因为后者迟早会漏一处，而漏掉的那处会被读成
 /// 「没有结论」——那还算好的；真正糟的是漏在成功路径上，整轮工作白做。
 pub fn run(mut options: Options) -> Result<()> {
     json::set_json_mode(options.json);
+    json::set_force(options.sync && options.force);
     let start_time = Instant::now();
 
     let result = run_once(&mut options);
@@ -123,7 +127,23 @@ fn run_once(options: &mut Options) -> Result<()> {
     // 求值本轮范围：位置参数与 `.p4delta-scope` 取交集、去重。没有路径也没有配置、
     // 或两者交集为空，都在这里报错退出——「什么事都没做」不该报告成功。P4V 那边的
     // prompt 留空正好落到「没给路径」这一支（`-l $D` 展开成空）。
-    let scope = task::block_on(evaluate_scope(options))?;
+    //
+    // 普通同步用严格求值：范围是它交给 p4 的问题边界，少一条入口等于换了个问题去问，
+    // 而答案会被当成完整结论报出去（见 `ScopePolicy`）。
+    //
+    // 「入口匹配了几个」这个结论普通同步拿不到，要在**求值之前**就声明：范围求值本身
+    // 失败时 summary 照样要发，而那时它已经没机会声明了（见 `json::set_scope_matched_unknown`）。
+    let strict_scope = options.sync && !options.force;
+    if strict_scope {
+        json::set_scope_matched_unknown();
+    }
+    let scope = task::block_on(async {
+        if strict_scope {
+            evaluate_scope_strict(options).await
+        } else {
+            evaluate_scope(options).await
+        }
+    })?;
 
     // 记录里的 clientFile 是 client 语法，拼它需要 clientspec 的根。放在这里（而不是
     // 报告层）是因为这是唯一同时握着 options 与 scope 的地方。
@@ -138,13 +158,16 @@ fn run_once(options: &mut Options) -> Result<()> {
         sayln!("Clean mode: updating the workspace to match the depot.");
     }
     if options.sync {
-        // 说清目标是哪个版本：head 与指定 changelist 是两种不同的结果，
-        // 而用户未必记得自己没写 --to。
+        // 说清目标是哪个版本，以及这一轮是「普通同步」还是「强制修复」：后者会丢弃本地
+        // 改动，两者共用 `--sync`，光看模式名分不出来。
+        let mode = if options.force {
+            "Sync (force) mode: repairing"
+        } else {
+            "Sync mode: updating"
+        };
         match options.to {
-            Some(changelist) => {
-                sayln!("Sync mode: updating the workspace to changelist {changelist}.")
-            }
-            None => sayln!("Sync mode: updating the workspace to the head revision."),
+            Some(changelist) => sayln!("{mode} the workspace to changelist {changelist}."),
+            None => sayln!("{mode} the workspace to the head revision."),
         }
     }
 
@@ -165,6 +188,19 @@ fn run_once(options: &mut Options) -> Result<()> {
 
     if options.verbose {
         options.list = true;
+    }
+
+    // 普通同步在这里分叉，**在加载摘要缓存之前**：它不扫工作区、不算摘要、不查 have
+    // 时间戳，也就没有任何理由去碰那块缓存（不读、不写、不存在时更不该凭空创建）。
+    // 强制修复（`--sync --force`）与 open / clean 照旧走下面整条 reconcile 管线。
+    if options.sync && !options.force {
+        task::block_on(run_normal_sync(options, &scope))?;
+        json::emit_progress("done", None);
+        sayln!(
+            "Operation completed in {} seconds.",
+            start_time.elapsed().as_secs_f32()
+        );
+        return Ok(());
     }
 
     let mut cache: WorkspaceCache = Default::default();

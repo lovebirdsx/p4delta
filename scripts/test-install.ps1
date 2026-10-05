@@ -14,11 +14,17 @@
     -NoP4Check。PATH 上，除最后一条用例（唯一碰真注册表的：先快照、finally 还原）外，
     其余一律带 -WithoutPath，绝不碰这台机器的 PATH。也**别同时跑两份测试**——两份快照
     会互相覆盖。
+
+    那条唯一碰真注册表的用例可以用 -SkipRealPath 单独摘掉（CI 上更窄的口子，不是默认）。
 #>
 [CmdletBinding()]
 param(
     # 失败时保留现场，方便手工看生成的文件。
-    [switch] $Keep
+    [switch] $Keep,
+
+    # 只跳过 Test-UserPathIsManagedByDefault——全套里唯一碰 HKCU\Environment\Path 的用例。
+    # 默认照跑：其余用例都带 -WithoutPath，「默认会写 PATH」这条行为只有它能验。
+    [switch] $SkipRealPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -231,10 +237,10 @@ function Test-FreshInstall {
     Assert-OurTool $doc $CleanApplyTool '-a --clean -w $c -l %D'
     # sync 两条入口各自动一半、手补一半：History 那条自动 changelist（%S），prompt 问目录；
     # 工作区树那条自动目录（%D），prompt 问 changelist。
-    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync -w $c -l $D --to %S' $FolderPromptText
-    Assert-OurTool $doc $SyncHistoryApplyTool '-a --sync -w $c -l $D --to %S' $FolderPromptText
-    Assert-OurTool $doc $SyncFolderPreviewTool '--sync -w $c -l %D --to $D' $ChangelistPromptText
-    Assert-OurTool $doc $SyncFolderApplyTool '-a --sync -w $c -l %D --to $D' $ChangelistPromptText
+    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync --force -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncHistoryApplyTool '-a --sync --force -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderPreviewTool '--sync --force -w $c -l %D --to $D' $ChangelistPromptText
+    Assert-OurTool $doc $SyncFolderApplyTool '-a --sync --force -w $c -l %D --to $D' $ChangelistPromptText
 
     # 编码：P4V 自己导出的文件没有 BOM，这里也不该有。
     $head = [System.IO.File]::ReadAllBytes($ToolsPath)[0..2]
@@ -337,8 +343,8 @@ function Test-IrreversibleToolsUseASubmenu {
     $doc = Read-ToolsDocument
     Assert-Equal 7 $doc.SelectNodes('//CustomToolDef').Count '默认七个工具'
     Assert-OurTool $doc $CleanApplyTool '-a --clean -w $c -l %D'
-    Assert-OurTool $doc $SyncHistoryApplyTool '-a --sync -w $c -l $D --to %S' $FolderPromptText
-    Assert-OurTool $doc $SyncFolderApplyTool '-a --sync -w $c -l %D --to $D' $ChangelistPromptText
+    Assert-OurTool $doc $SyncHistoryApplyTool '-a --sync --force -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderApplyTool '-a --sync --force -w $c -l %D --to $D' $ChangelistPromptText
 
     # 三条不可逆的共用一个子菜单，四条安全的都留在顶层。
     $folders = $doc.SelectNodes('//CustomToolFolder')
@@ -412,8 +418,8 @@ function Test-WithoutCleanApplySkipsCleanApply {
     Assert-Equal 6 $doc.SelectNodes('//CustomToolDef').Count '-WithoutCleanApply 时只有六个工具'
     Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
     Assert-OurTool $doc $CleanPreviewTool '--clean -w $c -l %D'
-    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync -w $c -l $D --to %S' $FolderPromptText
-    Assert-OurTool $doc $SyncFolderPreviewTool '--sync -w $c -l %D --to $D' $ChangelistPromptText
+    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync --force -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderPreviewTool '--sync --force -w $c -l %D --to $D' $ChangelistPromptText
     Assert-True ($null -eq (Get-Tool $doc $CleanApplyTool)) '不可逆的 clean 不该注册'
     # 子菜单留着：sync 那两条不可逆的还在里面。clean 的退出口不该把同住一个子菜单的邻居带走。
     Assert-Equal 1 $doc.SelectNodes('//CustomToolFolder').Count '装 sync 那两条的子菜单还在'
@@ -447,8 +453,8 @@ function Test-WithoutCleanApplyRemovesRegisteredCleanApply {
     Assert-OtherToolIntact $doc
     Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
     Assert-OurTool $doc $CleanPreviewTool '--clean -w $c -l %D'
-    Assert-OurTool $doc $SyncHistoryApplyTool '-a --sync -w $c -l $D --to %S' $FolderPromptText
-    Assert-OurTool $doc $SyncFolderApplyTool '-a --sync -w $c -l %D --to $D' $ChangelistPromptText
+    Assert-OurTool $doc $SyncHistoryApplyTool '-a --sync --force -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderApplyTool '-a --sync --force -w $c -l %D --to $D' $ChangelistPromptText
     Assert-Equal ($backupsBefore + 1) (Get-BackupCount) '真摘掉了就该走一次备份 + 保存'
 
     # 退出口自身幂等：再跑一次，字节不变、不多出备份。跨过一秒的理由同上一条用例。
@@ -492,8 +498,8 @@ function Test-WithoutSyncApplySkipsSyncApply {
     Assert-Equal 5 $doc.SelectNodes('//CustomToolDef').Count '-WithoutSyncApply 时只有五个工具'
     Assert-OurTool $doc $ReconcileTool '-a -w $c -l %D'
     Assert-OurTool $doc $CleanPreviewTool '--clean -w $c -l %D'
-    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync -w $c -l $D --to %S' $FolderPromptText
-    Assert-OurTool $doc $SyncFolderPreviewTool '--sync -w $c -l %D --to $D' $ChangelistPromptText
+    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync --force -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderPreviewTool '--sync --force -w $c -l %D --to $D' $ChangelistPromptText
     Assert-True ($null -eq (Get-Tool $doc $SyncHistoryApplyTool)) '不可逆的 sync 不该注册'
     Assert-True ($null -eq (Get-Tool $doc $SyncFolderApplyTool)) '不可逆的 sync 不该注册'
     # 子菜单留着：clean 那条不可逆的还在里面。sync 的退出口不该把邻居带走。
@@ -517,8 +523,8 @@ function Test-BothWithoutSwitchesClearTheFolder {
 
     $doc = Read-ToolsDocument
     Assert-Equal 4 $doc.SelectNodes('//CustomToolDef').Count '三条都摘掉后只剩四条安全的'
-    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync -w $c -l $D --to %S' $FolderPromptText
-    Assert-OurTool $doc $SyncFolderPreviewTool '--sync -w $c -l %D --to $D' $ChangelistPromptText
+    Assert-OurTool $doc $SyncHistoryPreviewTool '--sync --force -w $c -l $D --to %S' $FolderPromptText
+    Assert-OurTool $doc $SyncFolderPreviewTool '--sync --force -w $c -l %D --to $D' $ChangelistPromptText
     Assert-Equal 0 $doc.SelectNodes('//CustomToolFolder').Count '三条都摘掉后空掉的子菜单应当被清掉'
 }
 
@@ -659,13 +665,20 @@ $cases = @(
     'Test-BothWithoutSwitchesClearTheFolder',
     'Test-IrreversibleFolderKeepsForeignTools',
     'Test-Uninstall',
-    'Test-WhatIfChangesNothing',
-    # 唯一碰真注册表的用例，放最后：万一进程被强杀没走到 finally，也不带偏前面的用例。
-    'Test-UserPathIsManagedByDefault'
+    'Test-WhatIfChangesNothing'
 )
+
+# 唯一碰真注册表的用例，放最后：万一进程被强杀没走到 finally，也不带偏前面的用例。
+# （用 -SkipRealPath 时整条不进列表，`$cases` 里就没有它。）
+if (-not $SkipRealPath) {
+    $cases += 'Test-UserPathIsManagedByDefault'
+}
 
 $failed = 0
 Write-Host "install.ps1 测试（$([System.IO.Path]::GetFileName($HostExe))）"
+if ($SkipRealPath) {
+    Write-Host '  skip Test-UserPathIsManagedByDefault（-SkipRealPath：这条要动真实用户 PATH）'
+}
 
 foreach ($case in $cases) {
     try {

@@ -175,6 +175,8 @@ pub(crate) struct GroupReport<'a> {
     pub(crate) title: &'a str,
     pub(crate) list: bool,
     pub(crate) applied: bool,
+    /// 普通同步才有：`preview` 或 `apply`。其余模式是 `None`。
+    pub(crate) stage: Option<&'static str>,
 }
 
 /// 打印一类变更的标题、逐文件清单，并发这一组的 JSON 记录。
@@ -200,6 +202,8 @@ pub(crate) fn report_group(report: &GroupReport<'_>, rows: &[GroupRow<'_>]) {
             client_file: row.client_file,
             rev: row.rev,
             applied: report.applied,
+            stage: report.stage,
+            native_action: None,
         });
     }
 }
@@ -341,6 +345,7 @@ pub(crate) async fn apply_changes(
                 title: &spec.title_with(rows.len()),
                 list: options.list,
                 applied: options.apply,
+                stage: None,
             },
             &rows,
         );

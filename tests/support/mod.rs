@@ -569,6 +569,14 @@ impl Sandbox {
         let _ = fs::remove_file(path.with_extension("bin.tmp"));
     }
 
+    /// 被测程序会写的 digest 缓存路径（预测值，见 [`Sandbox::remove_predicted_cache`]）。
+    ///
+    /// 普通同步的用例拿它断「不读也不写缓存」：这条路径上出现 `Loading cache from` 那句
+    /// 就说明整条摘要管线还是被跑了。
+    pub fn cache_path(&self) -> Option<PathBuf> {
+        self.predicted_cache_path()
+    }
+
     fn predicted_cache_path(&self) -> Option<PathBuf> {
         let name = format!("digests_{}.bin", self.client);
         if cfg!(windows) {
@@ -595,10 +603,10 @@ impl Sandbox {
 }
 
 /// `-l` 清单里可能出现的动作标签：前八个来自 `src/reconcile/changes.rs` 的
-/// `GROUPS`，后三个来自 `src/reconcile/clean.rs` 的 `CLEAN_GROUPS` 与
-/// `src/reconcile/sync.rs` 的 `SYNC_GROUPS`（两组共用 `Revert` / `Restore` / `Delete`，
-/// 只有 `Update` 是 sync 独有的）。
-const CHANGE_LABELS: [&str; 11] = [
+/// `GROUPS`，`Revert` / `Restore` / `Delete` 来自 `src/reconcile/clean.rs` 的
+/// `CLEAN_GROUPS` 与 `src/reconcile/sync.rs` 的 `SYNC_GROUPS`，最后两个来自
+/// `src/normal_sync.rs` 的 `GROUPS`（普通同步独有）。
+const CHANGE_LABELS: [&str; 12] = [
     "Add",
     "Edit",
     "Reopen Edit",
@@ -610,8 +618,10 @@ const CHANGE_LABELS: [&str; 11] = [
     // clean 模式
     "Revert",
     "Restore",
-    // sync 模式独有
+    // 两种 sync 都有
     "Update",
+    // 普通同步独有
+    "Opened",
 ];
 
 /// 从 `-l` 的输出里取出 (动作标签, 文件路径)。
