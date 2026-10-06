@@ -43,10 +43,14 @@ CI 用 Windows PowerShell 5.1 与 PowerShell 7 各跑一遍。两个脚本都**�
 pwsh -File scripts/test-install.ps1 -SkipRealPath
 ```
 
-发布脚本也有黑盒测试，它在一次性 git 仓库里真跑一遍改版本号、提交、打附注 tag、推送，只把 `cargo` 换成垫片：
+发布脚本也有黑盒测试，它在一次性 git 仓库里真跑一遍改版本号、提交、打附注 tag、推送，
+只把 `cargo` 换成垫片（Windows 上是 `cargo.cmd` 转发到 `cargo.ps1`），不构建、不联网：
 
-```bash
-bash scripts/test-release.sh
+```powershell
+pwsh -File scripts/test-release.ps1
 ```
+
+它跑在 CI 的 `release-script` job 上（windows-latest + pwsh）：发布脚本本身就是给这个环境写的，
+垫片那一套也只在 Windows 上成立。`-Keep` 通过时也保留现场，失败则一律保留。
 
 部分用例需要机器上有 `p4`（用来读 `.p4ignore`、跑真实 marshal 输出）。缺失时它们会输出 `skipping: p4 is not available` 后跳过，但通过用例的输出默认被捕获，不能靠 CI 日志里没有这行来判断覆盖完整。CI 设置 `P4_E2E_REQUIRED=1`，让缺少工具直接失败。

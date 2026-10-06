@@ -151,10 +151,14 @@ jobs:
         shell: pwsh
         run: ./scripts/test-benchmark.ps1
 
-  # release.sh 的黑盒测试：在一次性 git 仓库里真跑一遍改版本号、提交、打附注 tag、推送，
+  # release.ps1 的黑盒测试：在一次性 git 仓库里真跑一遍改版本号、提交、打附注 tag、推送，
   # 只有 cargo 换成垫片——所以不需要构建产物，也不联网。
+  # 放在 windows-latest：发布脚本本来就是给 Windows 用的（PowerShell 7 + Git for Windows），
+  # 垫片也得走 .cmd 那一套；换到 ubuntu 上跑，验的就不是要发布的那份环境了。
   release-script:
-    runs-on: ubuntu-24.04
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
-      - run: bash scripts/test-release.sh
+      - name: release.ps1 的黑盒测试
+        shell: pwsh
+        run: ./scripts/test-release.ps1

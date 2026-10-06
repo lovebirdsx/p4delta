@@ -20,28 +20,26 @@ pwsh -File scripts/install-local.ps1 -Restore     # 把本地安装之前的那�
 脚本会打印本地构建的版本号和 git 修订号（有未提交改动会标出来）——本地构建与发布版版本号相同，
 装的是哪份代码只能靠它分辨。
 
-`scripts/test-release.sh` 是发布脚本的黑盒测试，见 [testing.md](testing.md)。
+`scripts/test-release.ps1` 是发布脚本的黑盒测试，见 [testing.md](testing.md)。
 
 ## 发布检查清单
 
-1. 跑 `bash scripts/release.sh`。**不写版本号就自动升**：默认补丁号 +1（0.1.3 → 0.1.4），
-   升次版本号用 `--minor`（0.1.3 → 0.2.0），主版本号用 `--major`（0.1.3 → 1.0.0）；也可以
-   直接写死一个，`bash scripts/release.sh 0.2.0`。想先看一遍加 `--dry-run`。
+1. 跑 `pwsh -File scripts/release.ps1`。**不写版本号就自动升**：默认补丁号 +1（0.1.3 → 0.1.4），
+   升次版本号用 `-Minor`（0.1.3 → 0.2.0），主版本号用 `-Major`（0.1.3 → 1.0.0）；也可以
+   直接写死一个，`pwsh -File scripts/release.ps1 0.2.0`。想先看一遍加 `-DryRun`。
 
    它把版本号写进三处——`Cargo.toml` 的 `version`、`p4delta.exe.manifest` 的四段程序集版本、
    `Cargo.lock` 里 `p4delta` 的条目——再跑一遍本地门禁（fmt / clippy / test），然后提交、
    打附注 tag、推送。exe 里的 VERSIONINFO 由 `build.rs` 从 `Cargo.toml` 现算，不用管。门禁想
-   跳过用 `--skip-check`，只想在本地备好、暂不推送用 `--no-push`。
+   跳过用 `-SkipCheck`，只想在本地备好、暂不推送用 `-NoPush`。
 
    推之前它会先检查：工作区干净、当前在 `main` 上、新版本确实比当前大、tag 本地与远端都
    不存在、本地不落后远端。任何一条不满足都当场拒绝——这些正是「推出去才发现」的坑，
    而 tag 推出去就收不回来了（同一版本号不能发两次，自动升号也一样受这条约束）。
 
-   Git Bash 里直接跑就行；PowerShell 与 cmd 里也可以，只要 PATH 里的 `bash` 是 Git 自带的
-   那个（`where bash` 的第一条应当是 `...\Git\usr\bin\bash.exe`）。若第一条是
-   `C:\Windows\System32\bash.exe`，那是 WSL，脚本会在另一个文件系统视图里跑，不是你要的——
-   这种情况用绝对路径调 Git 自带的那个（路径随你的 Git 安装位置，默认在
-   `C:\Program Files\Git\bin\bash.exe`）：`& "<Git>\bin\bash.exe" scripts/release.sh`。
+   发布脚本只有这一份实现，要求 **PowerShell 7**（`pwsh -v` 应是 7.x），发版得在装了它的机器上
+   做。别改用 Windows PowerShell 5.1：它跟原生命令之间传非 ASCII 文本要过一遍系统代码页
+   （参数与输出都是），`chore: 发布 vX.Y.Z` 这类提交信息与 git 自己的中文输出都可能乱码。
 2. 剩下的交给 `.github/workflows/release.yml`：复用 CI 当门禁，构建，断言产物里的版本与 tag
    一致、CRT 是静态链接的，打包 zip 与 `SHA256SUMS`，建 release。盯进度用 `gh run watch`。
 3. release 建好后，在一台装了 P4V 的机器上核对一遍：从 zip 跑 `install.ps1` → 重启 P4V →
