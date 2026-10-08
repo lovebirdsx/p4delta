@@ -3,7 +3,8 @@
   "about": [
     "`.p4delta-scope` 的共享契约向量：语言无关，Rust 与 TypeScript 两侧跑同一批。",
     "每条用例给出输入（配置正文、命令行目标、命令行排除项）与预期（规范化结果、错误、成员关系）。",
-    "两侧都必须真的求值，而不是只比「解析没报错」。"
+    "两侧都必须真的求值，而不是只比「解析没报错」。",
+    "platform 是「分隔符形状 × 大小写身份」的档位：windows（反斜杠 + 折大小写）、macos（正斜杠 + 折）、unix（正斜杠 + 不折）三档互不相容——macOS 与另外两档都不同，必须单列。any 表示跟随本机。"
   ],
   "rules": [
     "配置是一个 JSON 对象，只接受 include 与 exclude 两个键；多出来的键报错，不静默忽略。",
@@ -24,6 +25,7 @@
   ],
   "roots": {
     "windows": "C:\\ws",
+    "macos": "/ws",
     "unix": "/ws"
   },
   "cases": [
@@ -241,6 +243,19 @@
     {
       "name": "case-is-folded-on-windows",
       "platform": "windows",
+      "config": "{\"include\": [{\"dir\": \"Src\"}]}",
+      "expect": {
+        "include": ["Src"],
+        "exclude": [],
+        "members": {
+          "src/a.txt": true,
+          "SRC/a.txt": true
+        }
+      }
+    },
+    {
+      "name": "case-is-folded-on-macos",
+      "platform": "macos",
       "config": "{\"include\": [{\"dir\": \"Src\"}]}",
       "expect": {
         "include": ["Src"],

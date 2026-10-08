@@ -1374,8 +1374,21 @@ mod tests {
 
         const CONTRACT: &str = include_str!("../tests/fixtures/scope-contract.json");
 
+        /// 本机属于契约里的哪一档。「分隔符形状 × 大小写身份」的三档互不相容，
+        /// 而 macOS 与另外两档都不同（分隔符同 unix、大小写同 windows），所以它必须
+        /// 单列——并进 unix 会让 `case-is-significant-on-unix` 在这台机器上失败。
+        ///
+        /// 编辑器侧把这个字段当「用哪种风格求值」用（它的路径身份是运行时的显式参数，
+        /// 每条用例在任意宿主上都能跑），这边只能按宿主过滤：Rust 的路径身份是编译期
+        /// 定死的，没有第二种风格可切。
         fn platform() -> &'static str {
-            if cfg!(windows) { "windows" } else { "unix" }
+            if cfg!(windows) {
+                "windows"
+            } else if cfg!(target_os = "macos") {
+                "macos"
+            } else {
+                "unix"
+            }
         }
 
         fn root() -> &'static str {
