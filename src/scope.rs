@@ -878,17 +878,22 @@ mod tests {
         ScopeEntry::new(path.to_owned(), kind)
     }
 
+    /// 平台形状的 client root。测试路径都得挂在它下面：`canonical_local_path` 会把相对路径
+    /// 拼到 cwd 上，而 `C:\ws` 在 Unix 上正是一个相对路径。
+    #[cfg(windows)]
+    const ROOT: &str = r"C:\ws";
+    #[cfg(not(windows))]
+    const ROOT: &str = "/ws";
+
     /// 平台形状的测试路径。`local_path_key` 与 `path_is_under_key` 都按 `MAIN_SEPARATOR`
     /// 切组件，硬编码的 `C:\ws\...` 在 Unix 上只是一串普通字符，父子关系判不出来。
     fn ws_path(parts: &[&str]) -> String {
         let sep = std::path::MAIN_SEPARATOR;
         if parts.is_empty() {
-            return format!("C:{sep}ws");
+            return ROOT.to_owned();
         }
-        format!("C:{sep}ws{sep}{}", parts.join(&sep.to_string()))
+        format!("{ROOT}{sep}{}", parts.join(&sep.to_string()))
     }
-
-    const ROOT: &str = "C:\\ws";
 
     fn config_of(text: &str) -> ScopeFile {
         ScopeFile {

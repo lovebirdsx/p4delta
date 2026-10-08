@@ -26,7 +26,15 @@ wsl -d Ubuntu-24.04 -e bash -lc 'cd /mnt/e/git_project/p4delta && \
   CARGO_TARGET_DIR=$HOME/p4delta-target cargo test --lib --locked <过滤词>'
 ```
 
-别并发跑两个 rustup（同时写同一个 toolchain 目录会 `recovering from a partially installed toolchain`、报 `bin/rust-gdb` 冲突而装坏）；撞上时再跑一次 `rustup toolchain list` 触发同步自愈。这个仓库踩过「只在 Windows 上过」的坑——用例硬编码 `C:\ws\...`，而 `local_path_key` 按 `MAIN_SEPARATOR` 切组件，于是 ubuntu 与 macos 上失败、Windows 上照过。推 CI 前先在 WSL 里复现一遍 Linux 侧。
+别并发跑两个 rustup（同时写同一个 toolchain 目录会 `recovering from a partially installed toolchain`、报 `bin/rust-gdb` 冲突而装坏）；撞上时再跑一次 `rustup toolchain list` 触发同步自愈。
+
+要在这边跑 e2e（而不只是 `--lib`）就先下一份 Linux 版 p4：`bash scripts/fetch-p4-tools.sh`，再把 `P4_EXE` 指过去。它按 `uname` 挑包，往 `vendor/` 放的是无后缀的 `p4`/`p4d`，与 Windows 侧那两个 `.exe` 并存，也不进版本库。
+
+这个仓库反复踩过「只在 Windows 上过」的坑——用例硬编码 `C:\ws\...`，而 `local_path_key` 按 `MAIN_SEPARATOR` 切组件、假造路径还未必是本地意义上的绝对路径，于是 ubuntu 与 macos 上失败、Windows 上照过。推 CI 前先在 WSL 里复现一遍 Linux 侧。形态有三种，写用例时对着查：
+
+- **写死的路径键**（`records.contains_key("e:\\ws\\kept.txt")`）：期望值该用 `local_path_key(...)` 表达，那才是产线口径，折叠平台上它自然折成小写。
+- **写死的盘符根**（`const ROOT: &str = "C:\\ws"`）：按平台定义，Unix 侧从 `/` 起。`C:\ws` 在 Unix 上是个**相对**路径，`canonical_local_path` 会把它拼到 cwd 上。
+- **只在大小写上不同的两条路径**（`Snow_Normal` / `Snow_normal`）：它们只在不区分大小写的平台上折成同一个键，依赖这个前提的用例得按 `path_identity_ignores_case()` 分支。
 
 ## ACP：非 ASCII 命令行参数
 

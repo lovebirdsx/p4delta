@@ -392,7 +392,7 @@ impl WorkspaceState {
 mod tests {
     use super::*;
 
-    use crate::path::local_path_key;
+    use crate::path::{local_path_key, path_identity_ignores_case};
 
     // ---- 枚举解析 ----
 
@@ -489,10 +489,18 @@ mod tests {
 
     // ---- DepotState::build_mapping 的大小写冲突决胜 ----
 
-    /// 两条只在大小写上不同的客户端路径；`local_path_key` 把它们折成同一个键，
-    /// 于是后插入的记录必须与已存在的那条比个高下。
+    /// 两条客户端路径。不区分大小写的平台上它们只在大小写上不同（`Snow_Normal.uasset` 与
+    /// `Snow_normal.uasset` 是 p4 里两个 depot 路径、一个本地文件），`local_path_key` 折成
+    /// 同一个键，于是后插入的记录必须与已存在的那条比个高下。
+    ///
+    /// 区分大小写的平台上这是两个真文件，键撞不到一起。那里让两条记录用同一个路径——决胜规则
+    /// 要处理的是同一个键下的两条记录，与那个键是怎么撞上来的无关，这样在哪个平台都能测它。
     const UPPER_PATH: &str = r"C:\WS\Snow_Normal.uasset";
-    const LOWER_PATH: &str = r"C:\WS\Snow_normal.uasset";
+    const LOWER_PATH: &str = if path_identity_ignores_case() {
+        r"C:\WS\Snow_normal.uasset"
+    } else {
+        UPPER_PATH
+    };
 
     /// `depot_file` 在这里当标签用，决胜结果靠它区分是哪一条胜出。
     fn tagged(

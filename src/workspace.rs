@@ -585,7 +585,7 @@ mod tests {
     use clap::Parser;
 
     use crate::model::{DepotFileRecord, FileAction};
-    use crate::path::local_path_key;
+    use crate::path::{local_path_key, path_identity_ignores_case};
 
     /// 被 view 排除的路径在 `p4 where` 的输出里多一个 `unmap` 字段，这是唯一的信号；
     /// 其余记录则要交出 depot 路径。两个投影来自同一份输出，这条用例把两边都钉住。
@@ -662,9 +662,17 @@ mod tests {
     #[test]
     fn unmapped_files_are_dropped_even_with_a_different_case() {
         // 扫描结果的路径大小写与 p4 返回的未必一致，过滤要按归一化后的键来。
+        // 折大小写是折叠平台上的事，那里故意用另一种拼法；其余平台的键逐字比，
+        // 两个来源就得用同一种拼法，否则测的就不是过滤而是平台差异了。
+        let scanned_case_variant = if path_identity_ignores_case() {
+            r"C:\ws\B.TMP"
+        } else {
+            r"C:\ws\b.tmp"
+        };
+
         let files = vec![
             NewFile::unmapped(r"C:\ws\a.txt".to_owned()),
-            NewFile::unmapped(r"C:\ws\B.TMP".to_owned()),
+            NewFile::unmapped(scanned_case_variant.to_owned()),
             NewFile::unmapped(r"C:\ws\c.txt".to_owned()),
         ];
         let records = vec![
@@ -696,13 +704,19 @@ mod tests {
         );
     }
 
-    /// 裁决行里的路径是 p4 回显的本地路径，盘符大小写未必与请求一致（实测 `E:\` 回来是 `e:\`）。
+    /// 裁决行里的路径是 p4 回显的本地路径，盘符大小写未必与请求一致（实测 `E:\` 回来是 `e:\`），
+    /// 匹配走的是归一化后的路径键。折大小写是折叠平台上的事：那里才用两种拼法，
+    /// 其余平台键逐字比，回显与请求就得是同一种拼法。
     #[test]
     fn ignored_refusals_match_across_case() {
-        let lines = vec![r"e:\ws\使用说明.txt - ignored file can't be added.".to_owned()];
-        let requested: HashSet<String> = [local_path_key(r"E:\ws\使用说明.txt")]
-            .into_iter()
-            .collect();
+        let (echoed, requested_form) = if path_identity_ignores_case() {
+            (r"e:\ws\使用说明.txt", r"E:\ws\使用说明.txt")
+        } else {
+            (r"/ws/使用说明.txt", r"/ws/使用说明.txt")
+        };
+
+        let lines = vec![format!("{echoed}{IGNORED_REFUSAL_SUFFIX}")];
+        let requested: HashSet<String> = [local_path_key(requested_form)].into_iter().collect();
 
         let (refused, unrecognized) = parse_ignored_refusals(&lines, &requested);
 

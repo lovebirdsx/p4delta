@@ -579,9 +579,12 @@ mod tests {
         assert_eq!(records[0].head_rev, Some(3));
         assert_eq!(records[0].have_rev, Some(3));
         assert_eq!(records[0].file_size, Some(1234));
-        // 非 ASCII 路径解码后原样保留，查询键照旧折成小写。
+        // 非 ASCII 路径解码后原样保留，查询键照旧走平台那一套路径身份。
         assert_eq!(records[1].client_file, "E:\\ws\\中文.txt");
-        assert_eq!(records[1].client_file_lower, "e:\\ws\\中文.txt");
+        assert_eq!(
+            records[1].client_file_lower,
+            local_path_key("E:\\ws\\中文.txt")
+        );
     }
 
     /// 去重只该去掉「同一条记录被查了两遍」，不能顺手吃掉大小写不同的另一个文件。

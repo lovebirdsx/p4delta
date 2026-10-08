@@ -423,9 +423,11 @@ mod tests {
         let records = parse_p4_have_output(&data, UTF_8).unwrap();
 
         assert_eq!(records.len(), 1);
+        // 键照旧走 `local_path_key`：折叠平台上折成小写，其余平台原样。
+        let key = local_path_key("E:\\中文\\私服使用说明.docx");
         let record = records
-            .get("e:\\中文\\私服使用说明.docx")
-            .expect("key should be the ascii-lowercased utf8 path");
+            .get(&key)
+            .expect("key should be the utf8 path under the platform's path identity");
         assert_eq!(record.sync_time, Some(1700000000));
     }
 
@@ -457,7 +459,10 @@ mod tests {
         let records = parse_p4_have_output(&data, UTF_8).unwrap();
 
         assert_eq!(records.len(), 1, "错误记录不该产出 have 记录");
-        assert!(records.contains_key("e:\\ws\\kept.txt"), "{records:?}");
+        assert!(
+            records.contains_key(&local_path_key("E:\\ws\\kept.txt")),
+            "{records:?}"
+        );
     }
 
     #[test]
@@ -558,6 +563,6 @@ mod tests {
 
         // 完整的记录留了下来，被截断的那条丢弃，而不是污染这次解析。
         assert_eq!(records.len(), 1);
-        assert!(records.contains_key("e:\\a.txt"));
+        assert!(records.contains_key(&local_path_key("E:\\a.txt")));
     }
 }

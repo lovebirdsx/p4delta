@@ -4,6 +4,7 @@
 //! 必须统一成与 p4 返回的 clientFile 一致的本地路径键才能正确匹配。
 
 use std::borrow::Cow;
+use std::path::{Component, Path, PathBuf};
 
 /// 本地路径分隔符的统一形式：Windows 上把 `/` 换成 `\`，其他平台原样返回。
 /// 只用于本地路径（工作区文件与 p4 返回的 clientFile），不能用于 depot 路径。
@@ -44,7 +45,10 @@ pub(crate) fn local_path_key(path: &str) -> String {
 }
 
 /// 平台的文件系统是否不区分大小写，见 [`local_path_key`]。
-pub(crate) fn path_identity_ignores_case() -> bool {
+///
+/// `const` 是为了让测试能在编译期按平台定形它们假造的路径（见 `model.rs` 的
+/// `LOWER_PATH`），平台口径仍只有这一处。
+pub(crate) const fn path_identity_ignores_case() -> bool {
     cfg!(any(windows, target_os = "macos"))
 }
 
@@ -61,8 +65,36 @@ pub(crate) fn uppercase_drive_letter(path: &mut str) {
 /// 解析失败时退回原路径，不让路径形式导致整个运行失败。
 pub(crate) fn absolute_local_path(path: &str) -> String {
     std::path::absolute(path)
-        .map(|absolute| normalize_local_path_owned(absolute.display().to_string()))
+        .map(|absolute| {
+            normalize_local_path_owned(resolve_dot_components(&absolute).display().to_string())
+        })
         .unwrap_or_else(|_| normalize_local_path_owned(path.to_owned()))
+}
+
+/// 词法上清掉 `.` 与 `..` 组件。
+///
+/// `std::path::absolute` 只在 Windows 上做这件事（那边走 `GetFullPathNameW`），Unix 上会把
+/// `..` 原样留下——`/ws/../other` 于是仍是 `/ws/../other`。范围归属是按字符串前缀判的
+/// （`path_is_under_key`），留着 `..` 会把 client root 的兄弟目录读成它自己的子路径，
+/// 一次 `--clean -a` 就可能作用到工作区之外。
+///
+/// 只按字面消解，符号链接指向哪里不看——Windows 那边与 p4 自己都是这个口径。
+fn resolve_dot_components(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // 已经在根上时 `..` 就是根自己（`/..` 与 `/` 是同一个目录），
+                // pop 失败即保持原样。
+                resolved.pop();
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+
+    resolved
 }
 
 /// 范围里路径的规范拼法：绝对化、统一分隔符、盘符大写。
@@ -171,10 +203,16 @@ mod tests {
                 "\\\\server\\share\\file.txt"
             );
         } else {
-            // Unix 上不折大小写（见 `case_folding_follows_the_platform_identity`），
-            // 也不把反斜杠当分隔符——它是合法的文件名字符。
-            assert_eq!(local_path_key("/ws/File.txt"), "/ws/File.txt");
+            // 反斜杠在 Unix 上是合法的文件名字符，不是分隔符，哪个平台都不能动它。
             assert_eq!(local_path_key("/ws/back\\slash.txt"), "/ws/back\\slash.txt");
+            // 大小写跟平台的文件系统走：macOS 折（见 `case_folding_follows_the_platform_identity`），
+            // 其余 Unix 不折。
+            let expected = if path_identity_ignores_case() {
+                "/ws/file.txt"
+            } else {
+                "/ws/File.txt"
+            };
+            assert_eq!(local_path_key("/ws/File.txt"), expected);
         }
     }
 
@@ -209,6 +247,36 @@ mod tests {
 
         assert_eq!(local_path_key(&absolute_local_path("./src")), expected);
         assert_eq!(local_path_key(&absolute_local_path("src/.")), expected);
+    }
+
+    /// `..` 必须消解掉，`./src/../src` 与 `src` 是同一个目录。留着 `..` 不只是拼法难看：
+    /// 范围归属按字符串前缀判，`/ws/../other` 会被读成 `/ws` 的子路径。
+    /// Windows 上由 `GetFullPathNameW` 代劳，Unix 上没有这层，得自己来。
+    #[test]
+    fn parent_components_are_resolved_lexically() {
+        let root = env::current_dir().unwrap();
+        let expected = local_path_key(&root.join("src").display().to_string());
+
+        assert_eq!(
+            local_path_key(&absolute_local_path("./src/../src")),
+            expected
+        );
+        assert_eq!(
+            local_path_key(&absolute_local_path("src/./../src/.")),
+            expected
+        );
+
+        // 退到父目录：消解掉 `..` 之后就该是父目录自己，而不是带 `..` 的原串。
+        let parent = root.parent().expect("crate 根一定有上级目录");
+        let up = absolute_local_path(&format!(
+            "{}{}..",
+            root.display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        assert_eq!(
+            local_path_key(&up),
+            local_path_key(&parent.display().to_string())
+        );
     }
 
     #[test]
