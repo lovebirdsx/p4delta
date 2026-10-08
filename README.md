@@ -262,54 +262,86 @@ client view 里的排除行（例如 `-//depot/....tmp`）会让 p4 完全看不
 
 ### 入口
 
-位置参数就是入口，目录与文件可以混用：
+位置参数就是入口，目录与文件可以混用；**每个参数就是一条目标**：
 
 ```powershell
-p4delta -w "your-workspace" -l "Source\Client;Source\Script;readme.txt"
-p4delta -w "your-workspace" -l Source\Client Source\Script      # 与上面等价
-p4delta -w "your-workspace" -l "Source\Client;-Source\Client\Generated"
+p4delta -w "your-workspace" -l Source\Client Source\Script readme.txt
+p4delta -w "your-workspace" -l Source\Client --exclude-dir Source\Client\Generated
+p4delta -w "your-workspace" -l --exclude-file local.ini .
 ```
 
 - **目录入口**递归整棵子树；**文件入口**只处理那一个文件，不会"顺手"用父目录把范围放大。
 - **文件路径允许本地不存在**：「本地删掉了、depot 还有」正是 open for delete 要看的状态，
-  直接把它当入口就能补齐这一步。目录在本地不存在时，只有显式写 `...` 后缀才按目录处理。
-- `-` 前缀表示**排除**：目录按整棵子树匹配，文件按精确路径匹配。以 `-` 开头的真实文件名
-  写成 `./-name`。排除项想单独占一个参数时，得写成 `-- a -x` 或与别的条目用 `;` 连起来
-  （`"a;-x"`）——`-c`、`-w` 这些都是本工具真实的短选项，不能一律当路径收。
-- 一条参数里可用 `;` 分隔多个条目——P4V 的 prompt 只有一个输入框，这是它的入口形态。
+  直接把它当入口就能补齐这一步。目录在本地不存在时，只有显式写 `...` 后缀才按目录处理
+  （`some-folder/...`）。
+- 参数**不按 `;` 拆分**，也**没有 `-` 前缀那套排除写法**：一条参数就是一条路径，里面的
+  `;`、空格、`#`、`@`、`%` 都是文件名的合法字符。排除项走 `--exclude-dir` /
+  `--exclude-file`（都可重复），目录按整棵子树匹配，文件按精确路径匹配。
 - 重叠的入口先归并再查询（`a` 与 `a/b` 只留 `a`），同一个文件不会收到两条命令。
 - `//depot/...` 形式的 depot 路径也可以传，会翻译成对应的工作区路径。
 
 ### 持久范围（`.p4delta-scope`）
 
-范围通常长期不变，可以写进工作区里的 `.p4delta-scope`：
+范围通常长期不变，可以写进 **client root** 下的 `.p4delta-scope`：
 
-```
-# 整行注释；空行忽略
-Source/Client
-Source/Script
--Package/Server/Res
-//depot/main/src/...
+```json
+{
+  "include": [{ "dir": "Source/Client" }, { "dir": "Source/Script" }],
+  "exclude": [{ "dir": "Package/Server/Res" }, { "file": "local.ini" }]
+}
 ```
 
-- **位置**：从第一个位置参数所在目录（没有参数时从当前目录）向上查找，与 p4 找 `.p4config`
-  的行为一致；放在工作区根就管整个工作区。
-- **相对路径以配置文件所在目录为基准**——配置放在子目录时，语义自然变成"以此目录为根"。
+- **位置固定**：只读 **client root** 下的这一份（client spec 里固定的 `Root`，不是
+  `p4 info` 按 cwd 报的 `clientRoot`——后者会随 AltRoot 变）。打开子目录、
+  换个参数顺序都不会换一份配置——往上找（`p4-config` 那种发现规则）已经不在契约里。
+- **相对路径以 client root 为基准**，分隔符只认 `/`（反斜杠是错误，不是另一种写法）。
+  归一化重复分隔符与 `.`，按组件消解 `..`；任何一步越出 root 就报错。
+- 每条**恰好**一个 `dir` 或 `file`：目录含整棵子树，文件精确匹配。类型由写出来的那个键决定，
+  **不 stat、不按本地存不存在猜**——「本地还不存在的输出目录」正是常见的一条。
+- 省略 `include`（或整份写成 `{}`）＝整个 client root；`include: []` 是**明确的空集**，
+  与「没写」不是一回事。省略 `exclude` 与 `[]` 同义。
 - **配置是硬上限**：最终 include = 配置 ∩ 参数，exclude = 配置 ∪ 参数，且 exclude 永远优先
-  （"排除整个目录、再单独捞回其中一项"不在此列）。配置里只写 exclude 时，include 默认就是
-  配置文件所在目录，也就是"整个工作区减去排除项"。
+  （"排除整个目录、再单独捞回其中一项"不在此列）。配置里只写 exclude 时 include 就是整个
+  client root，也就是"整个工作区减去排除项"。
 - 不给任何路径时直接用配置的范围；两者都没有才报 `No path given`。给了路径却一条都落不到
   工作区里（比如 depot 路径不在 client view 内）时报错退出，不会退回配置范围——那等于把操作
-  放大到你没点过的东西上。
+  放大到你没点过的东西上。交集空掉同理。
 - 配置文件自身两侧同时排除：既不会被当成待新增扫出来，被提交进 depot 时也不会被当成
   待删除（团队共享范围配置是常见做法，只排除一侧会把它删掉）。
-- 语法错误会带行号报错退出；配置存在却没有条目时视为无配置并告警。
+- 空文件、`null`、错类型、未知字段、**重复键**、非法路径一律**报错**退出，绝不退化成缺省值
+  ——只有 ENOENT（文件不存在）才是"没有配置"。
 
 ### 入口没用上时
 
 一个入口在 depot 与本地都找不到任何东西时会打印一行告警（多半是拼错了），不影响其他入口——
 一次操作一个视图，前提是你能从输出里看出范围真的生效了。**一条都没匹配上**则是错误、整轮以
 退出码 1 结束：什么都没做不该报成功。传入的路径与配置范围完全不相交时同理。
+
+### 范围由调用方给出（编辑器 / 脚本）
+
+调用方不该把机器生成的路径拼回文本语法（路径里的 `;`、空格、`#`、`@`、`%` 都是文件名的
+一部分），也不该靠"本地存不存在"去猜目录还是文件。为此这一组开关按**声明**工作：
+
+```powershell
+# 只要这个子树，但跳过它的输出目录（反复给 --exclude-dir 就是多条）
+p4delta -w "$c" -a -l --client-root "$r" --no-scope-file --exclude-dir "$r\Source\Generated" "$r\Source"
+# 忽略 client root 下的 .p4delta-scope：范围只认这次给的参数
+p4delta -w "$c" -a -l --client-root "$r" --no-scope-file "$r\Source"
+```
+
+- `--exclude-dir <path>` / `--exclude-file <path>`（可重复）是**本次操作**的排除：按参数自己
+  声明的类型解析（不 stat、不按存在性猜），相对路径以 **client root** 为基准，编辑器传绝对
+  路径。与配置里的排除取并集，同样无条件优先。
+- `--client-root <path>` **不是**任意的配置目录选择器：它必须是该 client 的**固定 `Root`**
+  （client spec 里那个，`p4 client -o` 报的就是它）。对不上、拿不到、或落在 AltRoots 上，一律
+  **失败关闭**——换一个根就是换一份范围配置。平时不必传：工具自己去 client spec 里取固定
+  `Root`，并用 `p4 info` 核对这次调用不是从某个 AltRoot 的目录里发起的（`p4 info` 的
+  `clientRoot` 随 cwd 变，报的就是那个 AltRoot）。
+- `--no-scope-file` 只忽略**持久配置**，不忽略本次的 `--exclude-*`，也不忽略 client view。
+- 普通同步（`--sync` 不带 `--force`）**不接受** `--exclude-*`：那条路的范围就是 client view、
+  每个动作由原生判定，一次性的排除会把"原生会做什么"换成另一个问题。要持久边界就写进
+  `.p4delta-scope`（那份排除对普通同步同样生效），要一次性降噪就用 `--clean` 或
+  `--sync --force`。
 
 ## 会修正的不一致
 
@@ -372,8 +404,8 @@ depot，而是把工作区修正到与 depot 一致。它对三类**未打开**�
   待 resolve，合并留给用户。
 
 它**不承诺比原生 `p4 sync` 快**：省下的是 p4delta 自己的扫描与摘要计算，原生该传的字节一个
-不少。它的价值在范围——`.p4delta-scope` 与 `-<path>` 排除项对它是**硬边界**（原生 p4 没有这个
-概念），范围外的文件既不报也不动。
+不少。它的价值在范围——`.p4delta-scope` 的排除项对它是**硬边界**（原生 p4 没有这个概念），
+范围外的文件既不报也不动。
 
 报告里的四组：
 
@@ -503,12 +535,13 @@ $ p4delta --json -l .            # 预演，stdout 只有 JSONL
 {"kind":"summary","mode":"open","ok":true,"applied":false,"total":1,"counts":{"edit":1},"scopeMatched":1,"unmatched":0,"elapsedMs":12,"reason":null}
 ```
 
-给编辑器 / 脚本用的三个附加开关：
+给编辑器 / 脚本用的附加开关：
 
 | 开关 | 作用 |
 | --- | --- |
-| `--client-root <PATH>` | client 根目录。`clientFile` 要拼成 `//<client>/<相对路径>`，给了就省掉一次 `p4 info` |
-| `--no-scope-file` | 忽略工作区里的 `.p4delta-scope`：范围完全由调用方给定，不在别人的配置上再叠一层 |
+| `--client-root <PATH>` | client 根目录。**必须是该 client 的固定 `Root`**（client spec 里那个，对不上、拿不到、落在 AltRoots 上一律失败关闭）；它同时是 `.p4delta-scope` 的归属、相对路径的基准与 `clientFile` 拼 `//<client>/<相对路径>` 的根。平时不必传：工具从 client spec 取固定 `Root`，再用 `p4 info` 核对 cwd 没停在 AltRoot 上 |
+| `--no-scope-file` | 忽略 client root 下的 `.p4delta-scope`：范围只认调用方给的东西（位置参数与 `--exclude-*`），不在别人的配置上再叠一层 |
+| `--exclude-dir` / `--exclude-file` <PATH>（可重复） | 本次操作的排除，相对路径以 client root 为基准；类型按参数声明，不 stat。与配置里的排除取并集且永远优先。普通同步不接受它（见「操作范围」） |
 | `--no-revert-groups` | 输出逐行等于 `p4 reconcile -a -e -d`（见「会修正的不一致」里那三组 revert 的说明） |
 
 两条消费方最该记住的规矩：**`kind:"summary"` 是「这一轮有结论」的唯一凭据**（进程崩溃或被

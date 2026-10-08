@@ -478,42 +478,46 @@ fn without_the_flag_stdout_stays_human_readable() {
     );
 }
 
-/// `--client-root` 与 clientspec 的 Root 对不上时，退化成 本地路径 的 `clientFile` 必须
-/// 留痕：**第一条逐条点名，其余按整轮汇总**。记录流本身看不出这种退化（就是一个不以
-/// `//` 开头的值），而真实触发面不只是「用户写错根」——盘符大小写、junction 形式的根、
-/// client view 把文件映射到根之外，都会让一部分记录悄悄换一种拼法。
+/// `--client-root` 与 client 的 Root 对不上时**失败关闭**，而不是换一份范围继续跑。
 ///
-/// 节流是契约的一部分：一个工作区上万个文件，逐条告警会把 stderr 淹掉。
+/// 它曾经是一句告警加「clientFile 退化成本地路径」的容错。固定归属之后不再是容错：范围配置
+/// 只从那个 root 读、相对路径以它为基准、p4 子进程也以它为 cwd——换一个根就是换一份范围，
+/// 而记录里的 `clientFile` 拼法也会跟着变，两者叠加起来是一种「看起来跑通了」的错答案。
 #[test]
-fn a_mismatched_client_root_degrades_loudly_but_only_once() {
+fn a_mismatched_client_root_is_refused() {
     let Some(sandbox) = support::sandbox_or_skip() else {
         return;
     };
+
     offline_drift(&sandbox);
 
-    let run = run_json(&sandbox, &["--client-root", "/not/the/client/root", "."]);
+    // 带上 `-a`：真越过了那道检查，下面「什么都没打开」就是空断言。
+    let run = run_json(
+        &sandbox,
+        &["-a", "--client-root", "/not/the/client/root", "."],
+    );
 
-    assert!(run.ok, "{}", run.stderr);
-    for record in run.files() {
-        let client_file = record["clientFile"].as_str().expect("clientFile 必须有");
-        assert!(
-            !client_file.starts_with("//"),
-            "拼不出 client 语法就该原样退回本地路径：{record}"
-        );
-    }
-
-    assert_eq!(
-        run.stderr.matches("is not under the client root").count(),
-        1,
-        "退化的第一条逐条点名，其余不许刷屏：{}",
+    assert!(
+        !run.ok,
+        "对不上的 --client-root 必须是失败：{:?}",
+        run.records
+    );
+    assert!(
+        run.stderr.contains("is not the root of client"),
+        "报错要点名是对不上：{}",
         run.stderr
     );
     assert!(
-        run.stderr
-            .contains("3 record(s) had clientFile fall back to the local path"),
-        "整轮结束时要有条数汇总：{}",
+        run.stderr.contains("/not/the/client/root"),
+        "报错要带上用户给的那个路径：{}",
         run.stderr
     );
+    assert!(
+        !run.records.iter().any(|record| record["kind"] == "file"),
+        "失败关闭意味着一条文件记录都不该有：{:?}",
+        run.records
+    );
+    assert!(sandbox.opened().is_empty(), "什么都不该打开");
 }
 
 /// 某个 depot 路径名下的记录（正常情况下恰好一条，重复就是同一批被报了两次）。

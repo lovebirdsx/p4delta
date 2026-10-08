@@ -232,3 +232,24 @@ fn a_file_deleted_at_head_is_removed_from_the_workspace() {
     );
     assert!(sandbox.opened().is_empty(), "clean never opens files");
 }
+
+/// clean 不打开任何文件，`-c` 对它没有意义。但它也不该是个用法错误——直接报错会让
+/// 「预演时顺手带上 -c」的习惯用法失效，所以是告警加忽略。
+///
+/// 这条要真实连接才谈得上（范围配置挂在 client root 上），所以在沙箱里而不是 `tests/cli.rs`。
+#[test]
+fn a_changelist_is_ignored_with_a_warning() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox
+        .cli()
+        .args(["--clean", "-c", "5", "-l"])
+        .arg(".")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("--changelist 5 is ignored"))
+        .stdout(predicate::str::contains("Clean mode"))
+        .stdout(predicate::str::contains("Using pending changelist 5").not());
+}

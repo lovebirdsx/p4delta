@@ -20,8 +20,9 @@ src/cli.rs         命令行参数（clap derive）
 src/charset.rs     p4 输出字符集的解析、缓存与解码
 src/locate.rs      p4 可执行文件的定位（P4_EXE → PATH → P4V 安装目录）
 src/model.rs       领域数据模型：depot 记录、工作区文件、摘要缓存
-src/path.rs        本地路径规范化与路径键
-src/scope.rs       操作范围：入口解析、`.p4delta-scope` 配置、交集与排除
+src/path.rs        本地路径规范化、路径键、p4 file spec 转义（`escape_file_spec`）
+src/scope.rs       操作范围：目标解析、集合代数（配置 ∩ 目标 − 排除）、client root 归属
+src/scope_config.rs  client root 下的 `.p4delta-scope`：严格 JSON 解析与路径规范化
 src/cache.rs       摘要缓存的阶段间保存（全量序列化 + 临时文件改名）
 src/digest.rs      p4 摘要计算与「自 sync 起未改动」判定
 src/prune.rs       .p4ignore 分析、预扫描、目录剪枝决策

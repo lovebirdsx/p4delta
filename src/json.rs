@@ -15,8 +15,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde_json::json;
 
-use crate::cli::Options;
-use crate::p4::process::{FailureMode, run_p4_command_slice};
 use crate::path::normalize_local_path;
 
 /// 三模式。`class` 枚举必须配 `mode` 读（同一个 `delete` 在 open 与 clean 下含义相反）。
@@ -158,49 +156,14 @@ pub(crate) use sayln;
 
 /// 定下拼 client 语法要用的根与客户端名。
 ///
-/// `--client-root` 给了就用它（编辑器正是靠这个省掉一次 `p4 info` 往返）；没给就问一次
-/// `p4 info`，取它报的 `clientRoot`。两者都拿不到时留 `None`，[`client_syntax`] 退化成
-/// 原样返回本地路径——那种输出消费方仍能用（它本来就把非 `//` 开头的值当本地路径），
-/// 但会丢掉「两条引擎给出同一种拼法」这个好处，所以留一行 warning 在 stderr 上。
-pub(crate) async fn resolve_client_spec(options: &Options, work_dir: &str, client: &str) {
-    if !is_json() {
-        return;
-    }
-
-    if let Some(root) = &options.client_root {
-        *CLIENT_SPEC.lock().unwrap() = Some(ClientSpec {
-            root: root.clone(),
-            client: client.to_owned(),
-        });
-        return;
-    }
-
-    // `info` 不吃文件参数，走 slice 版：batched 版按文件参数切片，零参数等于一次都不跑。
-    let args: [&str; 3] = ["-Mj", "-Ztag", "info"];
-    let root =
-        match run_p4_command_slice(options, work_dir, &args, &[], false, FailureMode::Warn).await {
-            Ok(lines) => lines.iter().find_map(|line| {
-                let record: serde_json::Value = serde_json::from_str(line).ok()?;
-                record["clientRoot"].as_str().map(str::to_owned)
-            }),
-            Err(error) => {
-                eprintln!("Warning: failed to read the client root from p4 info: {error}");
-                None
-            }
-        };
-
-    match root {
-        Some(root) => {
-            *CLIENT_SPEC.lock().unwrap() = Some(ClientSpec {
-                root,
-                client: client.to_owned(),
-            });
-        }
-        None => eprintln!(
-            "Warning: no client root available, clientFile will be the local path \
-             (pass --client-root to avoid this)."
-        ),
-    }
+/// 根是这一轮**已确认的 client root**（`.p4delta-scope` 的归属、相对路径的基准、p4 子进程的
+/// cwd 都是它），由 `scope::resolve_client_root` 在碰任何文件之前定下来，这里只记下来给
+/// [`client_syntax`] 用。
+pub(crate) fn set_client_spec(client_root: &str, client: &str) {
+    *CLIENT_SPEC.lock().unwrap() = Some(ClientSpec {
+        root: client_root.to_owned(),
+        client: client.to_owned(),
+    });
 }
 
 /// 本地路径 → client 语法（`//<client>/<相对路径>`）。
@@ -208,14 +171,16 @@ pub(crate) async fn resolve_client_spec(options: &Options, work_dir: &str, clien
 /// 拼不出来（没有根、路径不在根下）时**原样返回本地路径**：契约允许这种退化，消费方把
 /// 不以 `//` 开头的值当本地路径用。绝不返回空串或半截路径。
 ///
-/// 退化不是无声的：整根拿不到时 [`resolve_client_spec`] 留过一行 warning，路径不在根下时
-/// 这里补一行（见 [`warn_degraded_client_file`]）。真实触发面不只是「用户写错根」——编辑器
-/// 自己算 root，盘符大小写不一致、junction/symlink 形式的根、client view 把文件映射到根
-/// 之外，都会让一部分记录悄悄降级成另一种拼法。
+/// 退化不是无声的：[`warn_degraded_client_file`] 点名第一条，[`report_degraded_client_files`]
+/// 收尾汇总。真实触发面不只是「根写错」——根由 `scope::resolve_client_root` 从 p4 自己的账上
+/// 取（拿不到、或与 `--client-root` 对不上就失败关闭，跑不到这里），所以剩下的都是「根是对的、
+/// 路径却不在它下面」：盘符大小写不一致、junction/symlink 形式的根、client view 把文件映射到
+/// 根之外。
 pub(crate) fn client_syntax(local: &str) -> String {
     let spec = CLIENT_SPEC.lock().unwrap();
     let Some(spec) = spec.as_ref() else {
-        // 根整个拿不到：`resolve_client_spec` 已经为这一档留过 warning，这里只记账。
+        // 没定过根：`scope::resolve_client_root` 是唯一的来源，失败即整轮中止，所以这一支
+        // 只是记账用的防御——真走到这里，退化的条数仍要报到汇总里。
         DEGRADED_CLIENT_FILES.fetch_add(1, Ordering::Relaxed);
         return local.to_owned();
     };
@@ -237,7 +202,7 @@ fn warn_degraded_client_file(local: &str, root: &str) {
     if DEGRADED_CLIENT_FILES.fetch_add(1, Ordering::Relaxed) == 0 {
         eprintln!(
             "Warning: \"{local}\" is not under the client root \"{root}\", its clientFile will \
-             be the local path. Pass --client-root with the client's Root to fix this; further \
+             be the local path. Check that the client view maps this file under the root; further \
              records are only summarized at the end."
         );
     }
@@ -252,7 +217,7 @@ static DEGRADED_CLIENT_FILES: AtomicUsize = AtomicUsize::new(0);
 
 /// 整轮结束时汇总退化的 clientFile，见 [`DEGRADED_CLIENT_FILES`]。
 ///
-/// 只有一条时不再多说：那一条已经逐条点名过了（整根拿不到时是 `resolve_client_spec` 那句）。
+/// 只有一条时不再多说：那一条已经逐条点名过了（见 [`warn_degraded_client_file`]）。
 pub(crate) fn report_degraded_client_files() {
     if !is_json() {
         return;

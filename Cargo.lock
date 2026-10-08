@@ -841,6 +841,7 @@ dependencies = [
  "md-5",
  "predicates",
  "rayon",
+ "serde",
  "serde_json",
  "walkdir",
 ]

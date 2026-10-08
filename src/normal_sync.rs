@@ -221,7 +221,7 @@ const GROUPS: [GroupSpec; 4] = [
 pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<()> {
     crate::json::set_phases(&PHASES);
 
-    let work_dir = scope.first_dir.as_str();
+    let work_dir = scope.work_dir.as_str();
     let specs = scope.query_specs(options.to);
 
     sayln!(
@@ -710,7 +710,7 @@ mod tests {
         Scope {
             includes: entries,
             excludes: ExcludeSet::from_dir_keys(&excludes),
-            first_dir: String::new(),
+            work_dir: String::new(),
         }
     }
 

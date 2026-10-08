@@ -294,12 +294,15 @@ fn an_opened_file_at_the_target_revision_is_not_a_candidate() {
 /// 已打开的文件落在排除项里：补查会看见它，但一条规格都不许下发。
 ///
 /// 补查走的是只读查询（`p4 opened` / `p4 fstat`），范围过滤在它之后——排除项是硬边界。
+/// 这里的排除来自**配置**：一次性的 `--exclude-*` 与普通同步冲突（见 `tests/cli.rs`），
+/// 而持久范围对普通同步同样生效。
 #[test]
 fn an_opened_file_outside_the_scope_is_never_written_to() {
     let Some(sandbox) = support::sandbox_or_skip() else {
         return;
     };
 
+    sandbox.write(".p4delta-scope", r#"{"exclude": [{"dir": "generated"}]}"#);
     sandbox.commit("generated/tracked.txt", "first\n");
     sandbox.p4_ok(&["edit", "generated/tracked.txt"]);
     sandbox.write("generated/tracked.txt", "second\n");
@@ -317,7 +320,8 @@ fn an_opened_file_outside_the_scope_is_never_written_to() {
 
     sandbox
         .cli()
-        .args(["--sync", "-a", "--", ".", "-generated"])
+        .args(["--sync", "-a"])
+        .arg(".")
         .assert()
         .success();
 
@@ -498,12 +502,15 @@ fn an_early_target_matches_what_native_p4_would_do() {
 }
 
 /// scope 是硬边界：只读查询可以覆盖被排除的部分，但一个字都不许写下去。
+///
+/// 同前一条，排除来自配置——`--exclude-*` 与普通同步冲突，配置里的排除照旧生效。
 #[test]
 fn an_excluded_directory_is_never_written_to() {
     let Some(sandbox) = support::sandbox_or_skip() else {
         return;
     };
 
+    sandbox.write(".p4delta-scope", r#"{"exclude": [{"dir": "generated"}]}"#);
     // generated 里既有已跟踪的落后文件，也有 depot 里没有的新文件。
     sandbox.commit("generated/tracked.txt", "first\n");
     sandbox.p4_ok(&["edit", "generated/tracked.txt"]);
@@ -514,7 +521,8 @@ fn an_excluded_directory_is_never_written_to() {
 
     sandbox
         .cli()
-        .args(["--sync", "-a", "-l", "--", ".", "-generated"])
+        .args(["--sync", "-a", "-l"])
+        .arg(".")
         .assert()
         .success()
         .stdout(predicate::str::contains("generated").not());
@@ -539,10 +547,10 @@ fn the_implicit_scope_file_is_never_touched() {
     };
 
     const SCOPE_NAME: &str = ".p4delta-scope";
-    // 只写排除项：include 默认取配置文件所在目录（也就是工作区根），
-    // 于是这个文件自己正好落在范围之内——隐式排除要挡的就是它。
-    const V1: &str = "-ignored\n";
-    const V2: &str = "-ignored\n# 团队共享的范围配置\n";
+    // 只写排除项：include 省略即整个 client root，于是这个文件自己正好落在范围之内——
+    // 隐式排除要挡的就是它。
+    const V1: &str = r#"{"exclude": [{"dir": "ignored"}]}"#;
+    const V2: &str = r#"{"exclude": [{"dir": "ignored"}, {"dir": "build"}]}"#;
 
     sandbox.commit(SCOPE_NAME, V1);
     sandbox.p4_ok(&["edit", SCOPE_NAME]);

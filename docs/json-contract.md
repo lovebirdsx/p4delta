@@ -36,13 +36,17 @@
 6. **预演与应用给出同一批文件**：`-a` 不改文件集合，只把记录标成 `applied:true`。转交给
    原生 p4 的那批是唯一的例外——open 预演拿得到逐条动作（正常 file 记录），open 应用只能
    整批报 `class:"handoff"`；两边点的是同一批文件。
-7. scope 位置参数接受 `<path>/...`（`...` 展开按 depot/have 列表做，与磁盘无关）；**消费方给的
-   路径一律原样使用**，不替它做 p4 百分号转义（唯一的例外是 δ 内部查 client view 映射的那次
-   `p4 where`，见「已知差异」）。
-8. **入口可以带 `-` 前缀表示排除**（`-<path>`，目录整棵子树用 `-<path>/...`）。排除是硬
-   上限：落在排除里的文件既不报（一条记录都没有）也不动。编辑器把
-   `reconcile.excludeFolders` 直接翻成这些入口发过来，δ 侧不再有自己的 carve 逻辑；
-   路径以 `-` 开头的真实文件要写成 `./-<name>`。
+7. scope 位置参数接受 `<path>/...`（`...` 展开按 depot/have 列表做，与磁盘无关）；**每个参数
+   就是一条目标**，不按 `;` 拆分、也不认 `-` 前缀那套排除写法。路径里的 `;`、空格、`#`、
+   `@`、`%` 都是文件名的合法字符：**本地原始路径**与交给 p4 的 **file spec** 是两种东西，
+   `%xx` 转义只在 p4 边界上做一次（`path::escape_file_spec`，范围查询、动作调用、`p4 where`
+   共用），记录里回给消费方的始终是原始本地路径。
+8. **排除走 `--exclude-dir` / `--exclude-file`**（可重复）。相对路径以 client root 为基准，
+   类型由参数自己声明（不 stat、不按存在性猜）。排除是硬上限：落在排除里的文件既不报
+   （一条记录都没有）也不动。配置文件里的排除与它取并集且同样优先。普通同步（`--sync`
+   不带 `--force`）**不接受**这两个开关：那条路的范围就是 client view、每个动作由原生判定，
+   一次性的排除会把"原生会做什么"换成另一个问题（持久边界写进 `.p4delta-scope`，那份排除
+   对普通同步照样生效）。
 
 ## 记录
 
@@ -75,16 +79,13 @@
 （`//depot/f#2 - is opened and not being changed`），没有动作词。记录里宁可诚实地缺席，
 也不去编一个 p4 不会打印的词。
 
-`clientFile` 拼不出 client 语法（退化成**本地路径**）有两档，都在 stderr 上告警，而且**都
-做了节流**——一个工作区上万个文件，逐条告警会把 stderr 淹掉：
+`clientFile` 拼不出 client 语法（退化成**本地路径**）只有一档：**路径不在 client root 下**
+（盘符大小写不一致、junction / symlink 形式的根、client view 把文件映射到根之外）。根本身
+拿不到不是一档退化——那是失败关闭（见「范围配置」），跑不到拼 `clientFile` 这一步。
 
-- clientspec 的根整个拿不到（没给 `--client-root`、`p4 info` 也问不出 `clientRoot`）：开跑
-  时记一行 warning；
-- 路径不在根下（根给错、盘符大小写不一致、junction / symlink 形式的根、client view 把文件
-  映射到根之外）：**第一条逐条点名**（点名的是路径与根，正好是排查需要的两样东西）。
-
-两档都记账，整轮结束时汇总成一句「N 条记录的 clientFile 退化成 本地路径」；只有一条时不再
-重复——那一条已经点名过了。
+告警做了节流——一个工作区上万个文件，逐条告警会把 stderr 淹掉：**只点名第一条**（点名的
+是路径与根，正好是排查需要的两样东西），整轮结束时汇总成一句「N 条记录的 clientFile 退化
+成 本地路径」；只有一条时不再重复——那一条已经点名过了。
 
 退化之后记录仍然可用（消费方本来就把非 `//` 开头的值当本地路径用），但记录流会变成两种
 拼法混排，所以必须留痕。匹配判据在 Windows 上大小写不敏感（那里的文件系统如此），其余
@@ -203,7 +204,7 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 | `applied` | 是否带 `-a` 真跑了 |
 | `total` | `counts` 各值之和。口径是**「δ 给出逐文件动作的文件数」**：转交出去又没有逐条翻译的那批不进 `counts`，所以 clean / sync 的预演与应用、open 的应用都不含它；open 的预演例外（逐条翻译，见「`class:"handoff"` 变体」），那批进 `counts` |
 | `counts` | `class` → 数量；**只出现非零项**，缺席即 0。`handoff` 永不出现（它没有逐文件动作，`class:"handoff"` 的记录也从来不是「一个动作」） |
-| `scopeMatched` | 匹配到东西的入口数；**普通同步是 `null`**——它不做本地扫描，「入口匹配了几个」这个结论它拿不到。`null` 是「不知道」，不是 0 |
+| `scopeMatched` | 匹配到东西的入口数；**普通同步是 `null`**——判定权在原生手里，「入口匹配了几个」这个结论它拿不到。`null` 是「不知道」，不是 0 |
 | `unmatched` | 落空入口数；普通同步恒为 0，理由同上 |
 | `elapsedMs` | 整轮墙钟毫秒 |
 | `reason` | `null`，或 `"no-entry-matched"`（入口全落空）；其余失败一律 `"error"` |
@@ -232,15 +233,70 @@ preview / filter / apply：`start` `preview` `filter` `apply` `done`（同样 5 
 | 开关 | 作用 |
 |---|---|
 | `--json` | 打开本契约 |
-| `--client-root <path>` | client 根目录。给了就不必自己去问 `p4 info`（窄查询正是靠它省掉一次往返）。**只有拼 client 语法用**，不参与任何范围判断 |
-| `--no-scope-file` | 忽略工作区里的 `.p4delta-scope`。编辑器自己持有范围（聚焦目录 + `reconcile.excludeFolders`），不希望在别人的配置上再叠一层 |
+| `--client-root <path>` | client 根目录。**必须是该 client 的固定 `Root`**（client spec 里那一个 `p4 client -o` 报的；对不上、拿不到、落在 AltRoots 上一律失败关闭）。它同时是 `.p4delta-scope` 的归属、相对路径的基准，以及拼 client 语法（记录里的 `clientFile`）用的根；平时不必传：工具从 client spec 取固定 `Root`，再用 `p4 info` 核对 cwd 没停在 AltRoot 上（`p4 info` 的 `clientRoot` 随 cwd 变，从 AltRoot 里发起时报的就是那个 AltRoot，不能当成根本身） |
+| `--no-scope-file` | 忽略 client root 下的 `.p4delta-scope`：**只**让持久配置缺席，本次的 `--exclude-*` 与 client view 照旧生效 |
+| `--exclude-dir <path>` / `--exclude-file <path>` | 可重复。本次操作的排除，目录按整棵子树、文件按精确路径；类型由参数声明（不 stat），相对路径以 client root 为基准。与配置里的排除取并集且同样优先。**普通同步不接受它**（见「硬条款」8） |
 | `--no-revert-groups` | 抑制 `open` 模式的 `revert_add` / `revert_edit` 两组，并把 `revert_delete` 并进 `reopen_edit`，语义回到逐行等于 `p4 reconcile -a -e -d`（理由见上一节的例外） |
 
 `--sync` 的两档由 `--force` 分：不带是**普通同步**（`force:false`，把工作区拉到目标版本，
 覆盖保护与 opened 交给原生），带上是**强制修复**（`force:true`，修成目标版本）。两者的记录
 形状差别见上文 `sync` 那几行。
 
-## 与原生引擎的已知差异
+## 范围配置（持久边界）
+
+持久边界写在 **client root 下**的 `.p4delta-scope`（严格 JSON，UTF-8）。位置固定：不向上查找、
+不认嵌套配置——一个 client 只有一份，就在根上。文件不存在是正常情况（ENOENT），**其它任何
+读取失败都 fail closed**（权限、是个目录、坏 JSON），绝不退化成「没有配置」继续跑。
+
+```json
+{
+  "include": [
+    { "dir": "src" },
+    { "file": "README.md" }
+  ],
+  "exclude": [
+    { "dir": "build" },
+    { "file": "src/generated.rs" }
+  ]
+}
+```
+
+- 顶层只认 `include` / `exclude` 两个键，值都是数组；
+- 每条目**恰好**有 `dir` 或 `file` 之一：类型由声明决定，δ 不去 stat、不按存在性猜；
+- 路径是**相对 client root 的 POSIX 相对路径**（分隔符一律 `/`；`"."` 目录条目表示根）。
+  绝对路径、盘符、`\`、NUL、`*` `?` 一律拒绝；
+- 省略 `include` = 整个 client root；`"include": []` = 显式的空集，两者不是一回事；
+- 重复键（同一份 JSON 里出现两次 `include`）、不认识的字段、类型不对，一律拒绝整份配置。
+  机器给的集合宁可拒绝，不可静默扩大范围；
+- 配置文件自身恒被排除（隐含一条 `file` 排除），消费方不必自己写。
+
+规则的**逐条向量**（含平台大小写策略、分量边界、父目录目标的钳制、排除盖住目标的报错等）
+见 `tests/fixtures/scope-contract.json`——那是本契约的语言无关版本，语言侧的实现都用同一份
+向量对拍（Rust 侧由 `src/scope.rs` 的 `mod contract` 消费）。改动本节任何一条规则，必须同步
+改这份 fixture。
+
+`--no-scope-file` 让这份配置整份缺席（不读、坏配置也不报）；本次的 `--exclude-*` 与 client
+view 不受它影响。
+
+### 求值
+
+`配置包含 ∩ 目标 − 配置排除 − 本次排除`；配置缺席时包含即目标。目标只来自位置参数
+（每个参数一条，`<path>/...` 的展开按 depot / have 列表做，与磁盘无关），排除只来自
+`--exclude-dir` / `--exclude-file`（本次）与配置的 `exclude`（持久），两者取并集且优先于包含。
+
+机器可读的入口一律 fail closed，失败发生在碰任何 p4、任何写之前：
+
+- 配置文件不是合法 JSON、顶层不是对象、出现上面任何一条禁止项；
+- 目标既没有被配置覆盖、也不在 client view 里（`--sync` 那条路径用严格求值：一条定位不了的
+  目标就是错误，不是「悄悄少一块」）；
+- 一个目标被排除整个盖住（排除写宽了要报出来，不能静默给出空集）；
+- 一份配置都没覆盖到任何目标（两侧范围不相交）；
+- `--client-root` 与 client spec 的固定 `Root` 对不上、那个 `Root` 拿不到，或调用目录落在
+  AltRoots 上（`p4 info` 报的根与固定 `Root` 不是一回事）。
+  换一个根，同一批本地路径对 depot 的映射就变了，范围也跟着变——这里**刻意**是失败关闭，
+  不降级、不告警后继续。
+
+## 与原生引擎的已知差异## 与原生引擎的已知差异
 
 写进契约是因为消费方**有权知道**，不是因为它们可以忽略：
 

@@ -12,7 +12,9 @@ use crate::cli::Options;
 use crate::json::sayln;
 use crate::model::{DepotState, WorkspaceFile, WorkspaceState};
 use crate::p4::process::{FailureMode, run_p4_command_batched, split_command_line_paths};
-use crate::path::{local_path_key, normalize_local_path_owned, path_is_under_key};
+use crate::path::{
+    escape_file_spec, local_path_key, normalize_local_path_owned, path_is_under_key,
+};
 use crate::prune::{
     IGNORES_ARGS, PrunePlan, has_pruned_ancestor, parse_ignores_output, plan_directory_pruning,
 };
@@ -387,23 +389,6 @@ fn parse_where_lines(lines: &[String]) -> Vec<WhereRecord> {
     records
 }
 
-/// p4 的 filespec 元字符在路径里的转义。
-///
-/// 名字里带 `@` / `#` / `*` / `%` 的文件，p4 会把它们当版本说明符或通配符解析，逐文件
-/// 查询当场报错（`Invalid changelist/client/label/date '@2024.txt'`），于是一个这样的名字
-/// 就能让整批新增文件查不到映射。p4 认 `%xx` 转义，编码后它能正常回答映射，回给我们的
-/// `depotFile` 也正是 p4 自己对这类文件的拼法。
-///
-/// 只用在 `p4 where` 这种**问路**的查询上。动作类调用仍传原样路径：那类文件名 p4 本来
-/// 就不收（`p4 add` 要 `-f` 才肯），工具的立场是把失败如实报出来，而不是悄悄替用户加 `-f`。
-fn escape_filespec_metacharacters(path: &str) -> String {
-    // `%` 必须最先换，否则会把后面刚生成的 `%40` 又编码一遍。
-    path.replace('%', "%25")
-        .replace('#', "%23")
-        .replace('@', "%40")
-        .replace('*', "%2A")
-}
-
 /// 用 `p4 where` 的结果给新增文件补齐：剔掉被排除的路径，其余配上 depot 路径。
 ///
 /// 比较按本地路径键（大小写与分隔符已归一），与扫描结果一致——p4 回的路径形式与本地
@@ -456,7 +441,7 @@ pub(crate) async fn map_new_paths(
 
     let paths: Vec<String> = files
         .iter()
-        .map(|file| escape_filespec_metacharacters(&file.client_file))
+        .map(|file| escape_file_spec(&file.client_file))
         .collect();
 
     let lines = run_p4_command_batched(
@@ -481,7 +466,7 @@ pub(crate) async fn gather_workspace(
     let start_time = Instant::now();
 
     let roots = scope.directory_roots();
-    let plan = plan_directory_pruning(options, &scope.first_dir, &roots, &scope.excludes).await?;
+    let plan = plan_directory_pruning(options, &scope.work_dir, &roots, &scope.excludes).await?;
 
     let (mut files, num_dirs, total_size) =
         collect_scope_files(&scope.includes, &plan.dirs, &scope.excludes)?;
@@ -503,7 +488,7 @@ pub(crate) async fn gather_workspace(
     sayln!("   Filtering workspace files.");
     let start_time = Instant::now();
 
-    let ignored_count = apply_file_ignores(options, &scope.first_dir, &mut files).await?;
+    let ignored_count = apply_file_ignores(options, &scope.work_dir, &mut files).await?;
 
     let mut workspace_state = WorkspaceState {
         num_files: files.len() - ignored_count,
@@ -657,23 +642,21 @@ mod tests {
     }
 
     /// 名字里带 p4 filespec 元字符的文件：不转义的话一个这样的名字就能让整批 `p4 where`
-    /// 当场失败，所有新增文件都拿不到映射。
+    /// 当场失败，所有新增文件都拿不到映射。转义函数本身在 `path.rs`，与范围入口、动作调用
+    /// 共用同一份（见 `escape_file_spec` 的文档）。
     #[test]
     fn filespec_metacharacters_are_escaped_for_the_mapping_query() {
         assert_eq!(
-            escape_filespec_metacharacters(r"C:\ws\report@2024.txt"),
+            escape_file_spec(r"C:\ws\report@2024.txt"),
             r"C:\ws\report%402024.txt"
         );
         // `%` 先换：否则后面生成的 `%40` 会被再编码一遍。
         assert_eq!(
-            escape_filespec_metacharacters("50%off#1*star.txt"),
+            escape_file_spec("50%off#1*star.txt"),
             "50%25off%231%2Astar.txt"
         );
         // 没有元字符的路径一个字节都不该动。
-        assert_eq!(
-            escape_filespec_metacharacters(r"C:\ws\readme.txt"),
-            r"C:\ws\readme.txt"
-        );
+        assert_eq!(escape_file_spec(r"C:\ws\readme.txt"), r"C:\ws\readme.txt");
     }
 
     #[test]

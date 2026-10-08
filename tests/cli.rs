@@ -1,15 +1,17 @@
 //! 黑盒 CLI 测试：只通过进程边界观察，不引用 crate 内部符号。
 //!
-//! 这些用例都不需要 p4：它们要么在参数解析阶段就结束，要么在「路径都用不上」这条
-//! 不碰服务器的分支上失败（一个可用的路径都没有时整轮退出码 1）。
+//! 这些用例都不需要 p4：它们要么在参数解析阶段就结束，要么在不碰服务器的分支上失败。
 //!
 //! 让它们不依赖机器上有没有 p4 的是 `cli()` 里的 `P4COMMANDCHARSET`，不是命令行的
 //! `--charset utf8`：`src/charset.rs` 的跳过条件要求 `P4CHARSET` 与 `P4COMMANDCHARSET`
 //! **都有**环境变量，命令行给的那个值不参与判断。少了它每条用例都会白起一个 `p4 set`。
+//!
+//! **范围求值不在这里**：范围配置挂在 client root 上，「这一轮是哪个 root」要先问 p4，
+//! 所以配置解析与否、交集空不空都要真实连接才谈得上。那些用例在 `tests/e2e_scope.rs`
+//! 的沙箱里（另有一批纯函数的在 `src/scope.rs` 的单元测试与共享契约向量里）。
 
 use assert_cmd::Command;
 use predicates::prelude::*;
-use std::path::PathBuf;
 
 /// 起一个命令行。清掉 P4CLIENT，否则本机的值会让「没有工作区」的用例失真。
 /// P4_EXE 同理：它是生产代码定位 p4 的第一顺位，本机残留一个值会改变下面每条用例的走向。
@@ -33,7 +35,28 @@ fn help_lists_the_flags_that_exist() {
         .stdout(predicate::str::contains("--clean"))
         .stdout(predicate::str::contains("--sync"))
         .stdout(predicate::str::contains("--to"))
-        .stdout(predicate::str::contains("--no-prune-ignored-dirs"));
+        .stdout(predicate::str::contains("--no-prune-ignored-dirs"))
+        .stdout(predicate::str::contains("--client-root"))
+        .stdout(predicate::str::contains("--no-scope-file"))
+        .stdout(predicate::str::contains("--exclude-dir"))
+        .stdout(predicate::str::contains("--exclude-file"));
+}
+
+/// 被撤掉的那套「机器可读范围」开关不该悄悄回来：`--scope-report` 之类现在是未知选项。
+#[test]
+fn the_removed_scope_flags_are_unknown() {
+    for flag in [
+        "--scope-report",
+        "--scope-from",
+        "--scope-request",
+        "--scope-snapshot",
+    ] {
+        cli()
+            .args(["-w", "some-workspace", flag])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(flag));
+    }
 }
 
 /// `--clean` 与 `--sync` 方向相反到无法同时满足：一个拿 depot 覆盖工作区并且**删**
@@ -63,52 +86,6 @@ fn sync_only_flags_without_sync_are_a_usage_error() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("--verify-all"));
-}
-
-/// clean 不打开任何文件，`-c` 对它没有意义。但它也不该是个用法错误——
-/// 直接报错会让「预演时顺手带上 -c」的习惯用法失效，所以是告警加忽略。
-/// 退出码 1 来自那条用不上的路径参数，与本用例关心的告警无关。
-#[test]
-fn clean_ignores_the_changelist_flag_with_a_warning() {
-    cli()
-        .args([
-            "--clean",
-            "-w",
-            "some-workspace",
-            "-c",
-            "5",
-            "--charset",
-            "utf8",
-        ])
-        .arg("this-path-does-not-exist-9f3c1e")
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("--changelist 5 is ignored"))
-        .stdout(predicate::str::contains("Clean mode"))
-        .stdout(predicate::str::contains("Using pending changelist 5").not());
-}
-
-/// sync 同样不打开文件，`-c` 对它也没有意义。但告警里要点出 `--to`——
-/// 「指定目标版本」正是用户最容易顺手写成 `-c` 的东西。
-#[test]
-fn sync_ignores_the_changelist_flag_with_a_warning() {
-    cli()
-        .args([
-            "--sync",
-            "-w",
-            "some-workspace",
-            "-c",
-            "5",
-            "--charset",
-            "utf8",
-        ])
-        .arg("this-path-does-not-exist-9f3c1e")
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("--changelist 5 is ignored"))
-        .stderr(predicate::str::contains("--to"))
-        .stdout(predicate::str::contains("Sync mode"))
-        .stdout(predicate::str::contains("Using pending changelist 5").not());
 }
 
 /// `-w` 必须仍然是 `--workspace` 的短名：P4V 的集成配置里写的是 `-w $c -l %D`。
@@ -156,19 +133,12 @@ fn missing_workspace_is_a_run_error() {
         ));
 }
 
-/// 一个路径都不给也是错误。P4V 的 prompt 留空时命令行上就是这种形状。
-#[test]
-fn a_run_without_a_path_is_an_error() {
-    cli()
-        .args(["-w", "some-workspace", "--charset", "utf8"])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("No path given"));
-}
-
 /// `P4_EXE` 指到不存在的文件是**配置错误**，不是「这台机器没有 p4」：后者由各调用点
 /// 降级处理（比如路径不存在就跳过），前者必须在做任何事之前就报出来——否则这个开关
 /// 会悄悄回落到系统里另一份 p4，等于没设。
+///
+/// （不给路径是另一种错误，但那条要真实连接才谈得上——见
+/// `tests/e2e_scope.rs::a_run_without_a_path_is_an_error`。）
 #[test]
 fn a_p4_exe_that_does_not_exist_is_a_config_error() {
     cli()
@@ -183,78 +153,37 @@ fn a_p4_exe_that_does_not_exist_is_a_config_error() {
         .stderr(predicate::str::contains("this-path-does-not-exist-9f3c1e").not());
 }
 
-/// 一个只装了 `.p4delta-scope` 的临时目录。
-///
-/// 范围配置的**解析与报错**全在 `evaluate_scope`（`src/scope.rs:497`）里发生，
-/// 早于 `src/lib.rs:156` 的 `reconcile_scope`——所以这一类用例一个 p4 进程都不需要，
-/// 没必要为它们各起一个 p4d 沙箱。名字带 pid：nextest 是 process-per-test 且并行调度，
-/// 固定名会让同时跑的进程互相踩。
-struct ScopeDir {
-    path: PathBuf,
-}
-
-impl ScopeDir {
-    fn new(name: &str, scope: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("p4delta-cli-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        std::fs::write(path.join(".p4delta-scope"), scope).expect("write scope file");
-        Self { path }
+/// 普通同步（`--sync` 不带 `--force`）的范围来自 client view、每个动作由原生判定，
+/// 本地排除项在那条路上没有可生效的地方——静默忽略比报错糟得多：调用方以为那条子树
+/// 不会被碰，而 p4 **会**去动它。这条检查在最前面，不需要连接就能得出结论。
+#[test]
+fn a_normal_sync_rejects_the_local_exclusions() {
+    for flag in ["--exclude-dir", "--exclude-file"] {
+        cli()
+            .args(["--sync", "-w", "some-workspace", flag, "some/path"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(flag))
+            .stderr(predicate::str::contains("--clean"));
     }
 
-    /// 起一个以该目录为工作目录的命令行——范围配置是从 cwd 往上找的。
-    fn cli(&self) -> Command {
-        let mut cmd = cli();
-        cmd.current_dir(&self.path);
-        cmd
-    }
-}
-
-impl Drop for ScopeDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-/// 传入的路径与配置范围完全不相交时什么都没得做，报错退出而不是静默成功。
-#[test]
-fn a_scope_that_does_not_overlap_the_given_paths_is_a_failure() {
-    let dir = ScopeDir::new("no-overlap", "src\n");
-
-    dir.cli()
-        .args(["-w", "some-workspace", "-a", "-l"])
-        .arg("readme.txt")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("do not overlap"));
-}
-
-/// 交集空掉的另一种成因是排除项把入口自己排掉了：报错里要把排除项列出来。
-///
-/// 不列的话这条消息看着自相矛盾——`scope: src` 配 `given: src/deep` 明明相交。
-#[test]
-fn a_scope_entry_that_exclusions_swallow_reports_the_exclusions() {
-    let dir = ScopeDir::new("excluded", "src\n-src/deep\n");
-
-    dir.cli()
-        .args(["-w", "some-workspace", "-a", "-l"])
-        .arg("src/deep")
-        .assert()
-        .failure()
-        // 分隔符两个平台都认：报错里是本地路径的原样，Windows 上全是反斜杠。
-        .stderr(predicate::str::is_match(r"excluded: -.*src[\\/]deep").unwrap());
-}
-
-/// 只有注释的配置等同于没有配置：不能因为「配置存在」就把配置文件所在目录整个当成范围。
-#[test]
-fn an_empty_scope_file_is_ignored() {
-    let dir = ScopeDir::new("empty-scope", "# 还没想好\n\n");
-
-    // 不给路径、配置又是空的：等于什么都没给，报错而不是默默扫遍整个目录。
-    dir.cli()
-        .args(["-w", "some-workspace", "-a", "-l"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("no entries"))
-        .stderr(predicate::str::contains("No path given"));
+    // 给 `--force`（或换个模式）就有地方生效了：不在这里挡，而是往下走去问 p4。
+    // 这里只断言「不是因为这条检查失败」——没有连接时它照样会退，但那是另一条路。
+    let output = cli()
+        .args([
+            "--sync",
+            "--force",
+            "-w",
+            "some-workspace",
+            "--exclude-dir",
+            "some/path",
+        ])
+        .arg("some-path")
+        .output()
+        .expect("run tool");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("not accepted by a normal sync"),
+        "带 --force 时不该被这条检查拦下: {stderr}"
+    );
 }

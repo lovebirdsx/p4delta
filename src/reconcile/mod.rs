@@ -45,8 +45,9 @@ pub(crate) async fn reconcile_scope(
     cache: &mut WorkspaceCache,
     cache_writer: &mut Option<CacheWriter>,
 ) -> Result<()> {
-    // cwd 取第一个入口的所在目录：`.p4config` / P4IGNORE 的发现跟着它走。
-    let work_dir = scope.first_dir.as_str();
+    // cwd 是这一轮已确认的 client root：`.p4config` / P4IGNORE 的发现跟着它走，
+    // 而不是跟着某个可选的入口目录漂。
+    let work_dir = scope.work_dir.as_str();
 
     sayln!(
         "Processing {} scope entr{}.",
@@ -63,7 +64,7 @@ pub(crate) async fn reconcile_scope(
         }
     }
 
-    let specs = scope.file_specs();
+    let specs = scope.query_specs(None);
 
     let (maybe_depot, maybe_workspace, maybe_have) = futures::join!(
         run_p4_fstat_all(options, work_dir, &specs),

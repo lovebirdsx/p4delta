@@ -1,0 +1,534 @@
+{
+  "version": 1,
+  "about": [
+    "`.p4delta-scope` 的共享契约向量：语言无关，Rust 与 TypeScript 两侧跑同一批。",
+    "每条用例给出输入（配置正文、命令行目标、命令行排除项）与预期（规范化结果、错误、成员关系）。",
+    "两侧都必须真的求值，而不是只比「解析没报错」。"
+  ],
+  "rules": [
+    "配置是一个 JSON 对象，只接受 include 与 exclude 两个键；多出来的键报错，不静默忽略。",
+    "include / exclude 里每条恰好一个 \"dir\" 或 \"file\"：dir 含整棵子树，file 只精确匹配那一个文件。类型由写出来的键决定，绝不按本地存不存在猜。",
+    "省略 include（或整份写成 {}）＝整个 client root；include: [] 是明确的空集，与「没写」不是一回事。exclude 省略与 [] 同义。",
+    "路径必须是 client root 相对的本地路径，分隔符只认 \"/\"。反斜杠、绝对路径、盘符、NUL、* 与 ? 一律报错。",
+    "归一化：丢掉空组件（//）、丢掉 \".\"、按组件消解 \"..\"；任何一步走出 root 就报错。文件名里的空格、中文、分号、#@% 全部原样保留（不 trim、不 URL decode）。",
+    "dir: \".\" 合法（就是 root 本身）；file: \".\" 非法。",
+    "重复键（同一个对象里出现两次同一个键）报错，而不是让后一个盖掉前一个——否则一个手误就会把整份范围换掉。",
+    "空文件、null、错容器类型、非法路径都报错，一律不当成缺省值。只有「文件不存在」（ENOENT）才是「没有配置」。",
+    "求值：include = 配置 ∩ 目标；exclude = 配置 ∪ 命令行排除，且 exclude 无条件优先。目标被排除项整个盖住就是错误，绝不回退到整个 root。",
+    "配置整个缺席时范围只由目标决定；没有配置也没有目标＝错误（绝不默认整个 root）。",
+    "生效的配置文件自身是隐式的 file 排除：它既不属于 include 也不属于 exclude 的声明列表，但 scope 判定里必须覆盖不到它。",
+    "目标一律与 client root 求交：root 的兄弟目录与 root 不相交（错误），而 root 的父目录包含 root，交出来仍然是 root（收窄成 root，不是错误）。",
+    "大小写策略跟着平台的文件系统走：Windows 与 macOS 折（Unicode 小写），其余平台不折。",
+    "路径比较按组件边界：dir \"gen\" 覆盖 gen/a.txt，不覆盖 gen2/a.txt。",
+    "成员关系 = 落在任一 include 入口之内，且不被任何排除项（含隐式那条）覆盖。"
+  ],
+  "roots": {
+    "windows": "C:\\ws",
+    "unix": "/ws"
+  },
+  "cases": [
+    {
+      "name": "no-config-and-no-targets-is-an-error",
+      "platform": "any",
+      "config": null,
+      "expect": { "error": "No path given" }
+    },
+    {
+      "name": "no-config-with-the-root-as-target",
+      "platform": "any",
+      "config": null,
+      "targets": [{ "path": ".", "kind": "directory" }],
+      "expect": {
+        "include": ["."],
+        "exclude": [],
+        "members": {
+          ".": true,
+          "src/a.txt": true,
+          "src/deep/b.txt": true
+        }
+      }
+    },
+    {
+      "name": "no-config-with-a-file-target",
+      "platform": "any",
+      "config": null,
+      "targets": [{ "path": "readme.txt", "kind": "file" }],
+      "expect": {
+        "include": ["readme.txt"],
+        "exclude": [],
+        "members": {
+          "readme.txt": true,
+          "readme.txt.bak": false,
+          "src/readme.txt": false
+        }
+      }
+    },
+    {
+      "name": "an-empty-file-is-an-error",
+      "platform": "any",
+      "config": "",
+      "targets": [{ "path": ".", "kind": "directory" }],
+      "expect": { "error": "not valid JSON" }
+    },
+    {
+      "name": "an-empty-object-covers-the-whole-root",
+      "platform": "any",
+      "config": "{}",
+      "expect": {
+        "include": ["."],
+        "exclude": [],
+        "members": { "src/a.txt": true, "deep/a/b/c.txt": true }
+      }
+    },
+    {
+      "name": "include-empty-array-is-an-explicit-empty-set",
+      "platform": "any",
+      "config": "{\"include\": []}",
+      "targets": [{ "path": ".", "kind": "directory" }],
+      "expect": { "error": "include <empty>" }
+    },
+    {
+      "name": "exclude-empty-array-means-no-exclusions",
+      "platform": "any",
+      "config": "{\"exclude\": []}",
+      "targets": [{ "path": ".", "kind": "directory" }],
+      "expect": {
+        "include": ["."],
+        "exclude": [],
+        "members": { "src/a.txt": true }
+      }
+    },
+    {
+      "name": "the-root-is-a-legal-dir-entry",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \".\"}]}",
+      "expect": {
+        "include": ["."],
+        "exclude": [],
+        "members": { "src/a.txt": true }
+      }
+    },
+    {
+      "name": "a-single-dir-entry",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"src\"}]}",
+      "targets": [{ "path": ".", "kind": "directory" }],
+      "expect": {
+        "include": ["src"],
+        "exclude": [],
+        "members": {
+          "src": true,
+          "src/a.txt": true,
+          "srcx/a.txt": false,
+          "readme.txt": false
+        }
+      }
+    },
+    {
+      "name": "a-file-entry-is-exact",
+      "platform": "any",
+      "config": "{\"include\": [{\"file\": \"readme.txt\"}]}",
+      "expect": {
+        "include": ["readme.txt"],
+        "exclude": [],
+        "members": {
+          "readme.txt": true,
+          "readme.txt.bak": false,
+          "src/readme.txt": false,
+          "src/a.txt": false
+        }
+      }
+    },
+    {
+      "name": "exclusions-beat-inclusions",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"src\"}], \"exclude\": [{\"dir\": \"src/gen\"}]}",
+      "expect": {
+        "include": ["src"],
+        "exclude": ["src/gen"],
+        "members": {
+          "src/a.txt": true,
+          "src/gen": false,
+          "src/gen/out.txt": false,
+          "docs/a.txt": false
+        }
+      }
+    },
+    {
+      "name": "a-config-with-only-exclusions-covers-the-root",
+      "platform": "any",
+      "config": "{\"exclude\": [{\"dir\": \"Generated\"}]}",
+      "targets": [{ "path": ".", "kind": "directory" }],
+      "expect": {
+        "include": ["."],
+        "exclude": ["Generated"],
+        "members": {
+          "Generated": false,
+          "Generated/out.txt": false,
+          "src/a.txt": true
+        }
+      }
+    },
+    {
+      "name": "component-boundaries-matter",
+      "platform": "any",
+      "config": "{\"exclude\": [{\"dir\": \"gen\"}]}",
+      "expect": {
+        "include": ["."],
+        "exclude": ["gen"],
+        "members": {
+          "gen": false,
+          "gen/a.txt": false,
+          "gen2/a.txt": true,
+          "src/gen/a.txt": true
+        }
+      }
+    },
+    {
+      "name": "a-file-exclusion-does-not-cover-descendants",
+      "platform": "any",
+      "config": "{\"exclude\": [{\"file\": \"local.txt\"}]}",
+      "expect": {
+        "include": ["."],
+        "exclude": ["local.txt"],
+        "members": {
+          "local.txt": false,
+          "local.txt.bak": true,
+          "sub/local.txt": true
+        }
+      }
+    },
+    {
+      "name": "an-empty-intersection-is-an-error",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"src\"}]}",
+      "targets": [{ "path": "docs", "kind": "directory" }],
+      "expect": { "error": "do not overlap" }
+    },
+    {
+      "name": "targets-narrow-inside-a-config",
+      "platform": "any",
+      "config": "{}",
+      "targets": [{ "path": "src/deep", "kind": "directory" }],
+      "expect": {
+        "include": ["src/deep"],
+        "exclude": [],
+        "members": {
+          "src/deep/c.txt": true,
+          "src/deep": true,
+          "src/a.txt": false
+        }
+      }
+    },
+    {
+      "name": "a-sibling-of-the-root-is-not-in-this-client",
+      "platform": "any",
+      "config": "{}",
+      "targets": [{ "path": "{root}/../other", "kind": "directory" }],
+      "expect": { "error": "do not overlap" }
+    },
+    {
+      "name": "a-parent-directory-target-clamps-to-the-root",
+      "platform": "any",
+      "config": "{}",
+      "targets": [{ "path": "{root}/..", "kind": "directory" }],
+      "expect": {
+        "include": ["."],
+        "exclude": [],
+        "members": { "src/a.txt": true }
+      }
+    },
+    {
+      "name": "case-is-folded-on-windows",
+      "platform": "windows",
+      "config": "{\"include\": [{\"dir\": \"Src\"}]}",
+      "expect": {
+        "include": ["Src"],
+        "exclude": [],
+        "members": {
+          "src/a.txt": true,
+          "SRC/a.txt": true
+        }
+      }
+    },
+    {
+      "name": "case-is-significant-on-unix",
+      "platform": "unix",
+      "config": "{\"include\": [{\"dir\": \"Src\"}]}",
+      "expect": {
+        "include": ["Src"],
+        "exclude": [],
+        "members": {
+          "Src/a.txt": true,
+          "src/a.txt": false,
+          "SRC/a.txt": false
+        }
+      }
+    },
+    {
+      "name": "unicode-names-are-preserved",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"源码/说明\"}]}",
+      "expect": {
+        "include": ["源码/说明"],
+        "exclude": [],
+        "members": {
+          "源码/说明/使用.txt": true,
+          "源码/其他.txt": false
+        }
+      }
+    },
+    {
+      "name": "spaces-semicolons-and-perforce-metacharacters-are-literal",
+      "platform": "any",
+      "config": "{\"include\": [{\"file\": \"使用 说明#1@x%.txt\"}, {\"dir\": \"a;b\"}]}",
+      "expect": {
+        "include": ["a;b", "使用 说明#1@x%.txt"],
+        "exclude": [],
+        "members": {
+          "使用 说明#1@x%.txt": true,
+          "使用 说明#1@x%.txt.bak": false,
+          "a;b/c.txt": true,
+          "a/b/c.txt": false,
+          "使用 说明#1@x%txt": false
+        }
+      }
+    },
+    {
+      "name": "a-file-exclusion-spares-its-neighbours",
+      "platform": "any",
+      "config": "{\"exclude\": [{\"file\": \"skip me.txt\"}]}",
+      "expect": {
+        "include": ["."],
+        "exclude": ["skip me.txt"],
+        "members": {
+          "skip me.txt": false,
+          "skip-me.txt": true,
+          "skip me.txt.bak": true
+        }
+      }
+    },
+    {
+      "name": "paths-are-normalized-component-wise",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"./src//deep/./\"}, {\"dir\": \"a/../b\"}]}",
+      "expect": {
+        "include": ["b", "src/deep"],
+        "exclude": [],
+        "members": {
+          "src/deep/c.txt": true,
+          "b/c.txt": true
+        }
+      }
+    },
+    {
+      "name": "a-duplicate-key-is-refused",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"a\"}], \"include\": [{\"dir\": \".\"}]}",
+      "expect": { "error": "duplicate key" }
+    },
+    {
+      "name": "an-unknown-field-is-refused",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \".\"}], \"focus\": [\"src\"]}",
+      "expect": { "error": "unknown field \"focus\"" }
+    },
+    {
+      "name": "an-entry-needs-exactly-one-type-key",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"a\", \"file\": \"b\"}]}",
+      "expect": { "error": "exactly one" }
+    },
+    {
+      "name": "an-entry-with-no-type-key-is-refused",
+      "platform": "any",
+      "config": "{\"include\": [{}]}",
+      "expect": { "error": "exactly one" }
+    },
+    {
+      "name": "an-absolute-path-is-refused",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"/abs\"}]}",
+      "expect": { "error": "absolute path" }
+    },
+    {
+      "name": "a-drive-letter-is-refused",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"C:/ws\"}]}",
+      "expect": { "error": "drive letter" }
+    },
+    {
+      "name": "a-backslash-is-refused",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"src\\\\deep\"}]}",
+      "expect": { "error": "backslash" }
+    },
+    {
+      "name": "stepping-above-the-root-is-refused",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"a/../../b\"}]}",
+      "expect": { "error": "steps above the client root" }
+    },
+    {
+      "name": "a-wildcard-is-refused",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"src/*.txt\"}]}",
+      "expect": { "error": "wildcard" }
+    },
+    {
+      "name": "the-recursive-suffix-is-not-a-path-component",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"src/...\"}]}",
+      "expect": { "error": "\"...\"" }
+    },
+    {
+      "name": "a-file-entry-may-not-name-the-root",
+      "platform": "any",
+      "config": "{\"include\": [{\"file\": \".\"}]}",
+      "expect": { "error": "names the client root itself" }
+    },
+    {
+      "name": "a-wrong-container-type-is-refused",
+      "platform": "any",
+      "config": "{\"include\": null}",
+      "expect": { "error": "must be an array" }
+    },
+    {
+      "name": "an-entry-must-be-an-object",
+      "platform": "any",
+      "config": "{\"include\": [\"src\"]}",
+      "expect": { "error": "must be a JSON object" }
+    },
+    {
+      "name": "an-entry-value-must-be-a-string",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": 7}]}",
+      "expect": { "error": "must be a string" }
+    },
+    {
+      "name": "an-empty-path-is-refused",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"\"}]}",
+      "expect": { "error": "empty path" }
+    },
+    {
+      "name": "configured-directories-need-not-exist-yet",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"out/generated\"}], \"exclude\": [{\"dir\": \"out/generated/tmp\"}]}",
+      "expect": {
+        "include": ["out/generated"],
+        "exclude": ["out/generated/tmp"],
+        "members": {
+          "out/generated/a.txt": true,
+          "out/generated/tmp/b.txt": false
+        }
+      }
+    },
+    {
+      "name": "cli-exclusions-union-with-the-configured-ones",
+      "platform": "any",
+      "config": "{\"exclude\": [{\"dir\": \"gen\"}]}",
+      "targets": [{ "path": ".", "kind": "directory" }],
+      "cliExcludes": [
+        { "path": "scratch", "kind": "directory" },
+        { "path": "local.txt", "kind": "file" }
+      ],
+      "expect": {
+        "include": ["."],
+        "exclude": ["gen", "local.txt", "scratch"],
+        "members": {
+          "gen/a.txt": false,
+          "scratch/b.txt": false,
+          "local.txt": false,
+          "local.txt.bak": true
+        }
+      }
+    },
+    {
+      "name": "cli-exclusions-may-narrow-a-subdirectory-target",
+      "platform": "any",
+      "config": null,
+      "targets": [{ "path": "src", "kind": "directory" }],
+      "cliExcludes": [{ "path": "src/gen", "kind": "directory" }],
+      "expect": {
+        "include": ["src"],
+        "exclude": ["src/gen"],
+        "members": {
+          "src/a.txt": true,
+          "src/gen/out.txt": false,
+          "docs/a.txt": false
+        }
+      }
+    },
+    {
+      "name": "a-subdirectory-target-still-uses-the-root-config",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"src\"}]}",
+      "targets": [{ "path": "src/deep", "kind": "directory" }],
+      "expect": {
+        "include": ["src/deep"],
+        "exclude": [],
+        "members": {
+          "src/deep/c.txt": true,
+          "src/a.txt": false
+        }
+      }
+    },
+    {
+      "name": "the-config-file-itself-is-implicitly-excluded",
+      "platform": "any",
+      "config": "{}",
+      "targets": [{ "path": ".", "kind": "directory" }],
+      "expect": {
+        "include": ["."],
+        "exclude": [],
+        "members": {
+          ".p4delta-scope": false,
+          "src/a.txt": true
+        }
+      }
+    },
+    {
+      "name": "a-target-under-an-exclusion-reports-the-exclusion",
+      "platform": "any",
+      "config": "{\"exclude\": [{\"dir\": \"src/deep\"}]}",
+      "targets": [{ "path": "src/deep", "kind": "directory" }],
+      "expect": { "error": "do not overlap" }
+    }
+  ],
+  "fileBytes": {
+    "about": [
+      "配置文件**字节**层面的向量：给的是原样字节（hex），两侧各自写到磁盘、各自用本仓的读取入口读。",
+      "这几条把「合法 UTF-8」与「坏了」分开：EF BF BD 是合法的 U+FFFD 字符，必须当普通文件名收下，不能按「正文里出现过替换字符」判坏。",
+      "非法字节（孤立 0xFF、截断的多字节序列）才是错，且必须是「不是合法 UTF-8」而不是 JSON 语法错。",
+      "BOM 按 δ 与编辑器的同一口径处理：保留字节本身，于是 BOM 开头照旧因「不是合法 JSON」被拒，不被悄悄吃掉。"
+    ],
+    "cases": [
+      {
+        "name": "a-literal-replacement-character-is-a-legal-name",
+        "hex": "7b22696e636c756465223a5b7b22646972223a2261efbfbd62227d5d7d",
+        "expect": { "include": ["a�b"], "exclude": [] }
+      },
+      {
+        "name": "a-lone-invalid-byte-is-refused",
+        "hex": "7b22696e636c756465223a5b7b22646972223a2278ff227d5d7d",
+        "expect": { "error": "not valid UTF-8" }
+      },
+      {
+        "name": "a-truncated-multibyte-sequence-is-refused",
+        "hex": "7b22696e636c756465223a5b7b22646972223a2278c328227d5d7d",
+        "expect": { "error": "not valid UTF-8" }
+      },
+      {
+        "name": "a-byte-order-mark-is-not-stripped",
+        "hex": "efbbbf7b22696e636c756465223a5b5d7d",
+        "expect": { "error": "not valid JSON" }
+      },
+      {
+        "name": "an-empty-file-is-refused",
+        "hex": "",
+        "expect": { "error": "not valid JSON" }
+      }
+    ]
+  }
+}

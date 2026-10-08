@@ -11,7 +11,7 @@ use crate::cli::Options;
 use crate::json::{FileRecord, Mode, count, emit_file, sayln};
 use crate::model::DepotState;
 use crate::p4::process::{FailureMode, run_p4_command_batched};
-use crate::path::local_path_key;
+use crate::path::{escape_file_spec, local_path_key};
 
 /// 一个新增文件（工作区里有、depot 里没有、也没打开过）。
 ///
@@ -354,7 +354,13 @@ pub(crate) async fn apply_changes(
             continue;
         }
 
-        let files: Vec<String> = rows.iter().map(|row| row.client_file.to_owned()).collect();
+        // 交给 p4 的是 **file spec**：本地路径里的 `#`/`@`/`%`/`*`/`?` 要转义一次，否则
+        // p4 会把 `notes#1.txt` 读成「notes 的第 1 版」。分析侧查得到、这里发不下去的话，
+        // 报告出来就是「发现了一条改动，然后失败」——而路径本身完全合法。
+        let files: Vec<String> = rows
+            .iter()
+            .map(|row| escape_file_spec(row.client_file))
+            .collect();
 
         for (args, use_changelist) in spec.commands {
             // 这一支只在 -a 时走到，所以永远是「真改状态」：任何一批失败都必须让整轮失败。

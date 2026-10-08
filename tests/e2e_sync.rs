@@ -893,3 +893,25 @@ fn normalize(changes: &[(String, String)]) -> Vec<(String, String)> {
 fn basename(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_owned()
 }
+
+/// sync 同样不打开文件，`-c` 对它也没有意义。但告警里要点出 `--to`——
+/// 「指定目标版本」正是用户最容易顺手写成 `-c` 的东西。
+///
+/// 这条要真实连接才谈得上（范围配置挂在 client root 上），所以在沙箱里而不是 `tests/cli.rs`。
+#[test]
+fn a_changelist_is_ignored_with_a_warning() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox
+        .cli()
+        .args(["--sync", "-c", "5", "-l"])
+        .arg(".")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("--changelist 5 is ignored"))
+        .stderr(predicate::str::contains("--to"))
+        .stdout(predicate::str::contains("Sync mode"))
+        .stdout(predicate::str::contains("Using pending changelist 5").not());
+}

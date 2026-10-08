@@ -27,7 +27,30 @@ pub fn default_view(client: &str) -> Vec<String> {
 /// 只写必要字段，其余交给 p4 补默认值；`Options` 显式写出来是为了不受
 /// 服务器默认值变化的影响。
 pub fn client_form(client: &str, root: &Path, view: &[String]) -> String {
+    client_form_with_alt_roots(client, root, view, &[])
+}
+
+/// 同 [`client_form`]，另附 `AltRoots`：同一个 client 的其它工作区根。
+///
+/// 多根布局用例靠它把 client 变成「同一个 client、多个根」——此时 `p4 info` 报的
+/// `clientRoot` 随 cwd 变，而 client spec 里的 `Root` 始终是第一个。
+pub fn client_form_with_alt_roots(
+    client: &str,
+    root: &Path,
+    view: &[String],
+    alt_roots: &[&Path],
+) -> String {
     let view: String = view.iter().map(|line| format!("\t{line}\n")).collect();
+    let alt_roots: String = if alt_roots.is_empty() {
+        String::new()
+    } else {
+        let mut field = String::from("AltRoots:\n");
+        for alt in alt_roots {
+            field.push_str(&format!("\t{}\n", alt.display()));
+        }
+        field.push('\n');
+        field
+    };
     format!(
         "Client: {client}\n\
          \n\
@@ -35,6 +58,7 @@ pub fn client_form(client: &str, root: &Path, view: &[String]) -> String {
          \n\
          Root: {root}\n\
          \n\
+         {alt_roots}\
          Options: noallwrite noclobber nocompress unlocked nomodtime normdir\n\
          \n\
          SubmitOptions: submitunchanged\n\

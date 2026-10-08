@@ -62,10 +62,10 @@ pub struct Options {
     #[arg(long, requires = "force")]
     pub(crate) verify_all: bool,
 
-    /// 范围入口：目录（整棵子树）或文件（单文件；本地不存在也可以，用于 open for
-    /// delete）。`-` 前缀表示排除，一条里可用 `;` 分隔多个。结果与工作区的
-    /// `.p4delta-scope` 配置取交集——配置在上一层目录时也能找到；不给路径时
-    /// 直接用配置的范围。
+    /// 范围目标：每个参数就是**一条**目标，不按 `;` 拆分、不认 `-` 前缀排除（排除项走
+    /// `--exclude-dir` / `--exclude-file`）。目录用显式递归后缀 `<dir>/...`，文件用精确路径；
+    /// 本地存在的路径按本地类型判。相对路径以启动目录为基准，结果与
+    /// **client root 下的** `.p4delta-scope` 取交集。
     pub(crate) paths: Vec<String>,
 
     /// 关闭忽略目录剪枝，回退到完整扫描（默认自动判断）。仅在结果异常时用来对比。
@@ -82,15 +82,29 @@ pub struct Options {
     #[arg(long)]
     pub(crate) json: bool,
 
-    /// clientspec 的根目录。**只**用来把本地路径拼成 client 语法（记录里的 `clientFile`），
-    /// 不参与任何范围判断。不给时自己去问一次 `p4 info`——窄查询正是靠这个开关省掉那趟往返。
+    /// client 根目录。**必须是该 client 的固定 Root**（client spec 里那一个；对不上就
+    /// 报错，不是换一份范围配置的入口——`p4 info` 的 `clientRoot` 随 cwd 变，不作数）。
+    /// 它同时是 `.p4delta-scope` 的归属、相对路径的基准，以及拼 client 语法（记录里的
+    /// `clientFile`）用的根。
     #[arg(long, value_name = "PATH")]
     pub(crate) client_root: Option<String>,
 
-    /// 忽略工作区里的 `.p4delta-scope`，范围只认命令行。给编辑器用的：范围由它自己持有
-    /// （聚焦目录 + 排除项），不该在别人的配置上再叠一层。
+    /// 忽略 client root 下的 `.p4delta-scope`，范围只认命令行给的目标与排除项（普通同步的
+    /// 范围本来就是 client view，不受这个开关影响）。给编辑器用的——它按自己的模型给出范围，
+    /// 不该在别人的配置上再叠一层。
     #[arg(long)]
     pub(crate) no_scope_file: bool,
+
+    /// 排除一个目录子树（可重复）。相对路径以 client root 为基准，编辑器传绝对路径；
+    /// 类型由这个参数自己声明，不去 stat 猜——「本地还不存在的输出目录」正是常见的一条。
+    /// 普通同步（`--sync` 不带 `--force`）不接受它：那条路的范围是 client view，一次性的
+    /// 排除会换掉要问原生的问题；要持久边界就写进范围配置。
+    #[arg(long, value_name = "PATH")]
+    pub(crate) exclude_dir: Vec<String>,
+
+    /// 排除一个文件（可重复，精确匹配，不递归）。同 `--exclude-dir`，路径基准是 client root。
+    #[arg(long, value_name = "PATH")]
+    pub(crate) exclude_file: Vec<String>,
 
     /// 让 open 模式的三组 revert 让位给 `p4 reconcile -a -e -d` 的语义：`revert_add` /
     /// `revert_edit` 消失，`revert_delete` 并进 `reopen_edit`（原生 `-e` 对「文件还在、
@@ -207,8 +221,9 @@ mod tests {
         assert!(!without_flag.no_prune_ignored_dirs);
     }
 
-    /// 编辑器的四个开关：三个布尔 + 一个取值的路径。取值那个要能缺省（缺省时自己去问
-    /// `p4 info`），不能因为没给就变成用法错误。
+    /// 编辑器的开关：布尔、取值的路径，以及两个**可重复**的排除项。可重复是关键——
+    /// 一条参数一条路径，不是把多条拼回 `;` 那套文本语法。取值那个要能缺省
+    /// （缺省时自己去问 `p4 info`），不能因为没给就变成用法错误。
     #[test]
     fn the_programmatic_flags_are_wired_up() {
         let parsed = Options::parse_from([
@@ -220,17 +235,47 @@ mod tests {
             "/ws",
             "--no-scope-file",
             "--no-revert-groups",
+            "--exclude-dir",
+            "/ws/gen",
+            "--exclude-dir",
+            "/ws/build",
+            "--exclude-file",
+            "/ws/local.txt",
         ]);
         assert!(parsed.json);
         assert_eq!(parsed.client_root.as_deref(), Some("/ws"));
         assert!(parsed.no_scope_file);
         assert!(parsed.no_revert_groups);
+        assert_eq!(parsed.exclude_dir, ["/ws/gen", "/ws/build"]);
+        assert_eq!(parsed.exclude_file, ["/ws/local.txt"]);
 
         let bare = Options::parse_from(["p4delta", "-w", "ws"]);
         assert!(!bare.json);
         assert_eq!(bare.client_root, None);
         assert!(!bare.no_scope_file);
         assert!(!bare.no_revert_groups);
+        assert!(bare.exclude_dir.is_empty());
+        assert!(bare.exclude_file.is_empty());
+    }
+
+    /// 被撤掉的那套「机器可读范围」开关不该悄悄回来：它们现在是未知选项（用法错误），
+    /// 而不是被容忍的空操作。
+    #[test]
+    fn the_removed_scope_flags_are_usage_errors() {
+        for flag in [
+            "--scope-report",
+            "--scope-from",
+            "--scope-request",
+            "--scope-snapshot",
+        ] {
+            let error = Options::try_parse_from(["p4delta", "-w", "ws", flag, "x"])
+                .expect_err("已删除的开关必须是用法错误");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+        }
     }
 
     /// `--no-revert-groups` 是 open 模式的措辞。clean / sync 下没有那三组，但也不该是

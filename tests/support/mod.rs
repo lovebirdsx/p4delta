@@ -152,11 +152,34 @@ impl Sandbox {
 
     /// 被测程序的命令行，已注入沙箱环境，工作目录是 client Root。
     pub fn cli(&self) -> assert_cmd::Command {
+        self.cli_in(&self.client_root)
+    }
+
+    /// 同 [`Sandbox::cli`]，但从 `cwd` 启动。多根布局用例要从 AltRoot 里发起：
+    /// `p4 info` 按 cwd 认根，启动目录会决定它报哪一个。
+    pub fn cli_in(&self, cwd: &Path) -> assert_cmd::Command {
         let mut command = assert_cmd::Command::cargo_bin("p4delta").expect("binary must build");
         command.env_clear();
         command.envs(self.env());
-        command.current_dir(&self.client_root);
+        command.current_dir(cwd);
         command
+    }
+
+    /// 多根布局：本实例的 AltRoots 目录（尚未创建）。测试自己建它、往里写内容。
+    pub fn alt_root(&self, name: &str) -> PathBuf {
+        self.paths.ws_root.join(name)
+    }
+
+    /// 给当前 client 装上 AltRoots（空切片即改回单根）。
+    pub fn set_client_alt_roots(&self, alt_roots: &[&Path]) {
+        let form = seed::client_form_with_alt_roots(
+            &self.client,
+            &self.client_root,
+            &seed::default_view(&self.client),
+            alt_roots,
+        );
+        seed::put_client(&self.tools.p4, self.server.port(), &self.client_root, &form)
+            .expect("update the client spec");
     }
 
     // ---- 独立取证 ----
@@ -378,6 +401,11 @@ impl Sandbox {
     }
 
     /// 把一个新文件加进 depot 并提交，改掉基线。
+    ///
+    /// 提交完再 [`Sandbox::write`] 改它**不一定**能让它成为摘要候选：`p4 submit` 把 have 的
+    /// syncTime 记成提交那一刻的文件 mtime，而回拨是相对 now 的——两次回拨之间只差毫秒，
+    /// 仍落在 ±1 秒的「自 sync 起未改动」窗口里，快筛会把改动跳过。要拿这种文件当摘要候选，
+    /// 得自己把 mtime 拨远，或改用模板里就入库、由实例 sync 下来的文件。
     pub fn commit(&self, relative: &str, contents: &str) {
         self.write(relative, contents);
         self.p4_ok(&["add", relative]);
