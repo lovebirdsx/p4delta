@@ -1,6 +1,6 @@
 [package]
 name = "p4delta"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 # 代码里用了 let-chains（if let ... && let ...），Rust 1.88 起稳定，
 # 高于 edition 2024 自身的 1.85 下限。
