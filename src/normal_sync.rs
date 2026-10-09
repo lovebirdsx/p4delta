@@ -314,8 +314,8 @@ pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<
 /// 三条实测原文见测试 `the_measured_refusal_notices_are_recognized`）。
 ///
 /// 它区别于「已打开的文件」那句提示：这里指的文件原生一个都不会动，把路径交给 [`opened_candidates`]
-/// 补查就是在拿一份错的答案去写。判据要求消息结构完整（`//` depot 规格 + 数字修订号 + ` - can't `
-/// + 已知动词 + 非空本地路径），任何一条对不上都返回 `false`，交给调用方 fail-closed——「认不出」
+/// 补查就是在拿一份错的答案去写。判据要求消息结构完整（`//` depot 规格 + 数字修订号 + ` - can't ` +
+/// 已知动词 + 非空本地路径），任何一条对不上都返回 `false`，交给调用方 fail-closed——「认不出」
 /// 绝不能读成「没事」。
 fn refusal_notice(message: &str) -> bool {
     let Some((spec, rest)) = message.split_once(" - can't ") else {
