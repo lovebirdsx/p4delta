@@ -417,6 +417,181 @@ fn a_writable_unopened_file_fails_the_same_way_native_does() {
     );
 }
 
+/// `allwrite noclobber` 下原生对「本地改了、又没打开」的文件**逐文件拒绝**：`info` 提示、
+/// 退出码 0、正文一条记录都没有。p4delta 曾把这些 info 全当成「需要已打开文件解释」的提示，
+/// 补查解释不了就整轮失败——这条回归钉的就是它。
+///
+/// update 与 delete 两条腿都要在：`can't delete modified file` 指向的文件在目标处是删除
+/// 状态，与 update 共用同一段文本结构，漏掉它就等于漏掉一半现场。
+#[test]
+fn a_refused_local_change_is_reported_as_a_refusal_not_an_incomplete_answer() {
+    let Some(sandbox) = sandbox_with_allwrite_noclobber() else {
+        return;
+    };
+
+    behind_then_modified(&sandbox, "readme.txt", "local update\n");
+    // 删除腿：目标处已删除，本地未打开地改了。
+    sandbox.commit("going.txt", "will go\n");
+    sandbox.p4_ok(&["delete", "going.txt"]);
+    sandbox.p4_ok(&["submit", "-d", "delete it"]);
+    sandbox.p4_ok(&["sync", "//depot/main/going.txt#1"]);
+    sandbox.write("going.txt", "local delete\n");
+
+    let have_before = sandbox.p4_ok(&["fstat", "-T", "haveRev", "//depot/main/readme.txt"]);
+    let opened_before = sandbox.opened();
+
+    // 人类文案不能说「已是最新」：拒绝意味着工作区与目标不同，只是这一轮不去覆盖它。
+    sandbox
+        .cli()
+        .args(["--sync", "-a", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("everything up to date").not())
+        .stdout(predicate::str::contains("refused"))
+        .stderr(predicate::str::contains("can't update modified file"))
+        // delete 那条的修订号（have 停在第 1 版）是消费方定位文件用的，必须原样在。
+        .stderr(predicate::str::contains(
+            "//depot/main/going.txt#1 - can't delete modified file",
+        ));
+
+    assert_eq!(sandbox.read("readme.txt"), "local update\n");
+    assert_eq!(sandbox.read("going.txt"), "local delete\n");
+    assert_eq!(
+        sandbox.p4_ok(&["fstat", "-T", "haveRev", "//depot/main/readme.txt"]),
+        have_before,
+        "拒绝的文件连 have 都不该被推"
+    );
+    assert_eq!(sandbox.opened(), opened_before);
+
+    // 机器可读一侧：拒绝不是逐文件动作，一条记录都不发；这一轮仍有结论（ok），
+    // 消费方靠 stderr 上的拒绝原文判断「不是最新」。
+    let records = run_json(&sandbox, &["--json", "--sync", "-a", "."]);
+    assert!(files_in(&records).is_empty(), "拒绝的文件不该进记录流");
+    let summary = summary_in(&records);
+    assert_eq!(summary["ok"], true, "{summary}");
+    assert_eq!(summary["total"], 0, "拒绝不产生逐文件动作：{summary}");
+}
+
+/// 同一轮里既有被拒的文件、也有原生真会传的文件：安全的那批照原生同步，被拒的原样留着。
+///
+/// 与原生 `p4 sync` 对拍（磁盘、have、opened 三处），因为「与原生一致」是这条路唯一的
+/// 正确性主张——不该因为有一批被拒就把整轮停下，也不该顺手把被拒的文件也写了。
+#[test]
+fn a_refusal_does_not_stop_the_files_native_would_transfer() {
+    let (Some(ours), Some(theirs)) = (
+        sandbox_with_allwrite_noclobber(),
+        sandbox_with_allwrite_noclobber(),
+    ) else {
+        return;
+    };
+
+    for sandbox in [&ours, &theirs] {
+        // 被拒：落后一版、本地改了（未打开）。先做：`behind_then_modified` 里那次 submit
+        // 会带上默认 changelist 里所有打开的文件。
+        behind_then_modified(sandbox, "readme.txt", "local\n");
+        // 安全：落后一版、本地未改。
+        sandbox.commit("safe.txt", "v1\n");
+        sandbox.p4_ok(&["edit", "safe.txt"]);
+        sandbox.write("safe.txt", "v2\n");
+        sandbox.p4_ok(&["submit", "-d", "v2"]);
+        sandbox.p4_ok(&["sync", "//depot/main/safe.txt#1"]);
+    }
+
+    ours.cli().args(["--sync", "-a", "."]).assert().success();
+    theirs.p4_ok(&["sync"]);
+
+    assert_eq!(ours.read("safe.txt"), theirs.read("safe.txt"));
+    assert_eq!(ours.read("readme.txt"), theirs.read("readme.txt"));
+    assert_eq!(
+        ours.p4_ok(&["fstat", "-T", "haveRev", "safe.txt"]),
+        theirs.p4_ok(&["fstat", "-T", "haveRev", "safe.txt"])
+    );
+    assert_eq!(ours.opened(), theirs.opened());
+
+    // 前提取证：安全文件确实被拉到了目标版本，被拒那份一个字节没动。
+    assert_eq!(ours.read("safe.txt"), "v2\n");
+    assert_eq!(ours.read("readme.txt"), "local\n");
+}
+
+/// 被拒的文件落在排除项里：那句 `info` 仍然是**拒绝**，不是「要补查的已打开文件」。
+///
+/// 只读预演覆盖整棵目录（排除是工具侧的硬边界，原生不认），所以排除目录里的拒绝照样会
+/// 出现在预演里；把它当成待解释的提示，整轮就会在写入前失败，而这轮本来一个字都不该写。
+#[test]
+fn a_refusal_inside_an_excluded_entry_is_never_written_to() {
+    let Some(sandbox) = sandbox_with_allwrite_noclobber() else {
+        return;
+    };
+
+    sandbox.write(".p4delta-scope", r#"{"exclude": [{"dir": "generated"}]}"#);
+    sandbox.commit("generated/tracked.txt", "v1\n");
+    sandbox.p4_ok(&["edit", "generated/tracked.txt"]);
+    sandbox.write("generated/tracked.txt", "v2\n");
+    sandbox.p4_ok(&["submit", "-d", "v2"]);
+    sandbox.p4_ok(&["sync", "//depot/main/generated/tracked.txt#1"]);
+    sandbox.write("generated/tracked.txt", "local\n");
+
+    let have_before = sandbox.p4_ok(&[
+        "fstat",
+        "-T",
+        "haveRev",
+        "//depot/main/generated/tracked.txt",
+    ]);
+
+    sandbox.cli().args(["--sync", "-a", "."]).assert().success();
+
+    assert_eq!(sandbox.read("generated/tracked.txt"), "local\n");
+    assert_eq!(
+        sandbox.p4_ok(&[
+            "fstat",
+            "-T",
+            "haveRev",
+            "//depot/main/generated/tracked.txt"
+        ]),
+        have_before,
+        "排除项里的文件连 have 都不该被推"
+    );
+}
+
+/// 被拒的文件与「已打开、have 落后」的文件在同一轮：拒绝被滤掉，已打开那条照旧走补查。
+///
+/// 这条防的是把「滤掉拒绝」写成「滤掉所有 `info`」——那样已打开的文件会被静默漏掉，
+/// 而原生会动它们。
+#[test]
+fn a_refusal_next_to_an_opened_file_leaves_the_opened_one_to_native() {
+    let (Some(ours), Some(theirs)) = (
+        sandbox_with_allwrite_noclobber(),
+        sandbox_with_allwrite_noclobber(),
+    ) else {
+        return;
+    };
+
+    for sandbox in [&ours, &theirs] {
+        // 被拒：落后一版、本地改了、未打开。先做：它那次 `p4 submit` 会带上默认
+        // changelist 里所有打开的文件。
+        behind_then_modified(sandbox, "src/lib.txt", "local lib\n");
+        // 已打开、have 落后：原生只给 info 提示，工具靠补查 `p4 opened` 才认得出来。
+        sandbox.p4_ok(&["edit", "readme.txt"]);
+        sandbox.write("readme.txt", "first local\n");
+        sandbox.p4_ok(&["submit", "-d", "first local"]);
+        sandbox.p4_ok(&["sync", "//depot/main/readme.txt#1"]);
+        sandbox.p4_ok(&["edit", "readme.txt"]);
+        sandbox.write("readme.txt", "second local\n");
+    }
+
+    ours.cli().args(["--sync", "-a", "."]).assert().success();
+    theirs.p4_ok(&["sync"]);
+
+    assert_eq!(ours.read("readme.txt"), theirs.read("readme.txt"));
+    assert_eq!(ours.opened(), theirs.opened());
+    assert_eq!(resolve_state(&ours), resolve_state(&theirs));
+    assert_eq!(
+        ours.read("src/lib.txt"),
+        "local lib\n",
+        "被拒的文件不该被动"
+    );
+}
+
 /// `--to <CL>`：往回退到目标那一版，而不是停在 head 上。
 #[test]
 fn to_a_changelist_walks_back_to_that_state_not_to_head() {
@@ -879,6 +1054,28 @@ fn sandbox_with_an_opened_file_behind_head() -> Option<support::Sandbox> {
     sandbox.write("readme.txt", "second local\n");
 
     Some(sandbox)
+}
+
+/// 起一个 `allwrite noclobber` 的沙箱——用户现场那一份客户端配置。
+///
+/// 同一份「本地改了、又没打开」的现场在两种配置下是**两种形态**：`noallwrite` 靠只读位
+/// 判定，原生直接报 `Can't clobber writable file`（severity 3、exit 1）整轮中止；`allwrite`
+/// 只能靠内容/时间戳判定，拒绝变成逐文件的 `info`（exit 0），正是这条路要处理的形态。
+fn sandbox_with_allwrite_noclobber() -> Option<support::Sandbox> {
+    let sandbox = support::sandbox_or_skip()?;
+    sandbox.set_client_options("allwrite noclobber nocompress unlocked nomodtime normdir");
+    // 让工作区形状与 allwrite 客户端一致：文件可写、have 在 head。
+    sandbox.sync();
+    Some(sandbox)
+}
+
+/// 让 `file` 落后一版（have 停在第 1 版），再本地改掉它——原生 noclobber 要拦的正是这种。
+fn behind_then_modified(sandbox: &support::Sandbox, file: &str, local: &str) {
+    sandbox.p4_ok(&["edit", file]);
+    sandbox.write(file, "second revision\n");
+    sandbox.p4_ok(&["submit", "-d", "second revision"]);
+    sandbox.p4_ok(&["sync", &format!("//depot/main/{file}#1")]);
+    sandbox.write(file, local);
 }
 
 /// 探针风格的场景：造一个含 Perforce 转义字符的文件并让它落后于 head。

@@ -182,6 +182,23 @@ impl Sandbox {
             .expect("update the client spec");
     }
 
+    /// 重写 client 表单的 `Options` 行（view 仍是默认那份）。
+    ///
+    /// `allwrite` 与 `noallwrite` 对同一份现场给出**两种不同的失败形态**（逐文件 info 拒绝
+    /// vs 整轮 severity-3 中止），要分别测就得能换这一行；用例一般在实例刚起好、还没动过
+    /// 工作区时调用它。
+    pub fn set_client_options(&self, options: &str) {
+        let form = seed::client_form_with_options(
+            &self.client,
+            &self.client_root,
+            &seed::default_view(&self.client),
+            &[],
+            options,
+        );
+        seed::put_client(&self.tools.p4, self.server.port(), &self.client_root, &form)
+            .expect("update the client spec");
+    }
+
     // ---- 独立取证 ----
 
     /// 命令前那一段：`-p`/`-u`/`-c` 是全局选项，必须排在命令之前。

@@ -253,11 +253,24 @@ pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<
 
     emit_progress("filter", None);
     let mut candidates = candidates_from(&preview.records)?;
-    if !preview.notices.is_empty() {
+    // 预演的 `info` 有两类，必须分开：除了「已打开的文件」那句提示，原生对**逐文件拒绝**
+    // 也写 `info`（`allwrite noclobber` 客户端下的唯一形态，见 [`refusal_notice`]）。拒绝
+    // 不是待解释的待办，拿补查去解释它只会整轮失败；它也不该成为写入候选。原文已由
+    // process 层原样转出（stderr），这里不再重复打印。
+    let mut refusals = 0;
+    let mut notices = Vec::new();
+    for notice in preview.notices {
+        if refusal_notice(&notice) {
+            refusals += 1;
+        } else {
+            notices.push(notice);
+        }
+    }
+    if !notices.is_empty() {
         // 预演报了没进正文记录的事（实测只有已打开文件那一类）：身份得补查，
         // 否则这些文件会被悄悄跳过，而原生会动它们。
         sayln!("   Asking p4 which of them are opened (its preview does not name them).");
-        candidates.extend(opened_candidates(options, work_dir, scope, &preview.notices).await?);
+        candidates.extend(opened_candidates(options, work_dir, scope, &notices).await?);
     }
     let candidates = dedupe(candidates)?;
     let (candidates, excluded) = filter_by_scope(candidates, scope)?;
@@ -266,7 +279,16 @@ pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<
     }
 
     if candidates.is_empty() {
-        sayln!("No files to sync, everything up to date.");
+        if refusals == 0 {
+            sayln!("No files to sync, everything up to date.");
+        } else {
+            // 被拒的文件一条都没动（原生不覆盖本地修改/同名文件）。这句**不能**说
+            // 「已是最新」：拒绝意味着工作区与目标不同，只是这一轮不去覆盖它。
+            sayln!(
+                "      p4 refused to overwrite {refusals} file(s) (locally modified or untracked); \
+                 nothing was synced for them."
+            );
+        }
         return Ok(());
     }
 
@@ -284,6 +306,40 @@ pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<
     apply(options, work_dir, &candidates, scope).await?;
 
     Ok(())
+}
+
+/// 原生逐文件拒绝的 `info` 提示（`allwrite noclobber` 客户端，实测 2024.2）：本地改了又没打开的
+/// 文件原生一律不覆盖，但**不写正文记录**，只印一行 `info`，形如
+/// `//depot/main/x.txt#2 - can't update modified file E:\ws\x.txt`（`delete` / `overwrite` 同族，
+/// 三条实测原文见测试 `the_measured_refusal_notices_are_recognized`）。
+///
+/// 它区别于「已打开的文件」那句提示：这里指的文件原生一个都不会动，把路径交给 [`opened_candidates`]
+/// 补查就是在拿一份错的答案去写。判据要求消息结构完整（`//` depot 规格 + 数字修订号 + ` - can't `
+/// + 已知动词 + 非空本地路径），任何一条对不上都返回 `false`，交给调用方 fail-closed——「认不出」
+/// 绝不能读成「没事」。
+fn refusal_notice(message: &str) -> bool {
+    let Some((spec, rest)) = message.split_once(" - can't ") else {
+        return false;
+    };
+    let Some((depot_file, rev)) = spec.rsplit_once('#') else {
+        return false;
+    };
+    if !depot_file.starts_with("//") || rev.is_empty() || !rev.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+
+    // 动词与本地路径之间必须有一个空格，且路径非空：`... modified files ...` 这类拼写差别
+    // 会在这里落空，而不是被当成同一条消息。
+    [
+        "update modified file",
+        "delete modified file",
+        "overwrite existing file",
+    ]
+    .iter()
+    .any(|phrase| {
+        rest.strip_prefix(phrase)
+            .is_some_and(|path| path.starts_with(' ') && !path.trim().is_empty())
+    })
 }
 
 /// 补查已打开文件的身份。
@@ -918,6 +974,53 @@ mod tests {
         assert!(scope.includes_key(&local_path_key(&platform_path(r"C:\ws\a.txt"))));
         assert!(!scope.includes_key(&local_path_key(&platform_path(r"C:\ws\a.txt.bak"))));
         assert!(!scope.includes_key(&local_path_key(&platform_path(r"C:\ws\sub\a.txt"))));
+    }
+
+    // ---- 已知拒绝的识别 ----
+
+    /// 实测原文（2024.2，`allwrite noclobber` 客户端，`p4 -G sync -n` 的 `info` 记录）。
+    /// 三条同属一个已知族：`update` / `delete` / 同名文件挡路。
+    #[test]
+    fn the_measured_refusal_notices_are_recognized() {
+        for message in [
+            r"//depot/main/readme.txt#2 - can't update modified file E:\ws\readme.txt",
+            r"//depot/main/going.txt#1 - can't delete modified file E:\ws\going.txt",
+            r"//depot/main/blocked.txt#1 - can't overwrite existing file E:\ws\blocked.txt",
+        ] {
+            assert!(refusal_notice(message), "{message}");
+        }
+    }
+
+    /// 本地路径里的空格与 Perforce 元字符不影响识别（`#` 在 depot 一侧是转义成 `%23` 的，
+    /// 所以能从最后一个 `#` 切出修订号的那个判据不会踩到本地名）。
+    #[test]
+    fn a_refusal_with_an_awkward_local_path_is_recognized() {
+        assert!(refusal_notice(
+            r"//depot/main/weird%231.txt#3 - can't update modified file E:\my ws\weird#1.txt"
+        ));
+    }
+
+    /// 认不出的一律不是拒绝，由调用方 fail-closed。**已打开文件那句提示尤其不能被吞掉**：
+    /// 它是唯一需要补查的身份来源，误判成拒绝就会把那些文件静默漏掉。
+    #[test]
+    fn notices_that_are_not_refusals_are_left_to_the_caller() {
+        for message in [
+            // 已打开文件的原生提示：没有本地路径，也不是拒绝。
+            "//depot/main/readme.txt#2 - is opened and not being changed",
+            "//depot/main/readme.txt#2 - is opened and can't be replaced",
+            // 动词对但没有本地路径。
+            "//depot/main/readme.txt#2 - can't update modified file",
+            // depot 规格不完整（缺 `//` 前缀或缺数字修订号）。
+            r"readme.txt#2 - can't update modified file E:\ws\readme.txt",
+            r"//depot/main/readme.txt - can't update modified file E:\ws\readme.txt",
+            r"//depot/main/readme.txt#head - can't update modified file E:\ws\readme.txt",
+            // 未知动词，或只差一个字母的拼写。
+            r"//depot/main/readme.txt#2 - can't revert modified file E:\ws\readme.txt",
+            r"//depot/main/readme.txt#2 - can't update modified files E:\ws\readme.txt",
+            "",
+        ] {
+            assert!(!refusal_notice(message), "{message}");
+        }
     }
 
     // ---- 报告与命令 ----

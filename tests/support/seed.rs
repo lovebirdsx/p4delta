@@ -16,6 +16,10 @@ pub const CLIENT: &str = "sandbox_main";
 /// depot 里所有内容的根。
 pub const DEPOT_ROOT: &str = "//depot/main";
 
+/// 种子与多数用例用的 client 选项。写在这里是为了让 [`client_form_with_options`] 的
+/// 调用方（切 `allwrite` 的那些）能照抄其余字段，而不是手抄一份会漂的字符串。
+pub const DEFAULT_OPTIONS: &str = "noallwrite noclobber nocompress unlocked nomodtime normdir";
+
 /// 默认的 client view：整个 depot 子树都映射进工作区。
 pub fn default_view(client: &str) -> Vec<String> {
     vec![format!("{DEPOT_ROOT}/... //{client}/...")]
@@ -27,7 +31,7 @@ pub fn default_view(client: &str) -> Vec<String> {
 /// 只写必要字段，其余交给 p4 补默认值；`Options` 显式写出来是为了不受
 /// 服务器默认值变化的影响。
 pub fn client_form(client: &str, root: &Path, view: &[String]) -> String {
-    client_form_with_alt_roots(client, root, view, &[])
+    client_form_with_options(client, root, view, &[], DEFAULT_OPTIONS)
 }
 
 /// 同 [`client_form`]，另附 `AltRoots`：同一个 client 的其它工作区根。
@@ -39,6 +43,22 @@ pub fn client_form_with_alt_roots(
     root: &Path,
     view: &[String],
     alt_roots: &[&Path],
+) -> String {
+    client_form_with_options(client, root, view, alt_roots, DEFAULT_OPTIONS)
+}
+
+/// 同 [`client_form_with_alt_roots`]，`Options` 由调用方给。
+///
+/// 存在的理由只有一个：`allwrite noclobber` 是原生**逐文件拒绝**（`- can't update/delete
+/// modified file`，info + exit 0）唯一出现的客户端配置，而 `noallwrite` 下同一份现场是
+/// 整轮 `Can't clobber writable file`（severity 3 + exit 1）。两种形态要分开测，就得能换
+/// 这一行。
+pub fn client_form_with_options(
+    client: &str,
+    root: &Path,
+    view: &[String],
+    alt_roots: &[&Path],
+    options: &str,
 ) -> String {
     let view: String = view.iter().map(|line| format!("\t{line}\n")).collect();
     let alt_roots: String = if alt_roots.is_empty() {
@@ -59,7 +79,7 @@ pub fn client_form_with_alt_roots(
          Root: {root}\n\
          \n\
          {alt_roots}\
-         Options: noallwrite noclobber nocompress unlocked nomodtime normdir\n\
+         Options: {options}\n\
          \n\
          SubmitOptions: submitunchanged\n\
          \n\

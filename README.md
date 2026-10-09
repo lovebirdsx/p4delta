@@ -398,7 +398,13 @@ depot，而是把工作区修正到与 depot 一致。它对三类**未打开**�
 - **先问 p4**：工具让原生预演一遍（`p4 sync -n`），只做三件事——按范围过滤出候选、让每个候选
   精确到 `//depot/file#rev`、把规格交回原生 `p4 sync` 执行。覆盖保护、已打开的文件、have 更新
   全由 p4 判定，工具不替它做决定。
-- **未打开文件上的本地改动不会被覆盖**（p4 的 noclobber 保护），可写文件挡下来时报的是同一个错。
+- **未打开文件上的本地改动不会被覆盖**（p4 的 noclobber 保护）。挡下来的形态随 client 的
+  `allwrite` / `noallwrite` 分两种：`noallwrite` 靠只读位判定，可写文件整轮报
+  `Can't clobber writable file` 并以非零退出停下；`allwrite noclobber` 只能靠内容/时间戳判定，
+  原生对每个这样的文件印一行 `#rev - can't update modified file <本地路径>`（删除腿是
+  `can't delete modified file`，同名未跟踪文件挡路是 `can't overwrite existing file`），退出码
+  仍是 0、整轮继续。后一种原样转给用户，被拒的文件不进记录流、一个字节都不动，同一轮里其余文件
+  照常同步。
 - **不删 depot 里没有的本地文件**——那是用户自己的东西（这与 `--clean` 的分水岭）。
 - **不做自动 resolve**：已打开、have 又落后于目标的文件，原生会把 have 推到目标版本并挂上
   待 resolve，合并留给用户。
@@ -421,6 +427,10 @@ depot，而是把工作区修正到与 depot 一致。它对三类**未打开**�
 being changed`），路径埋在文本里、正文记录一条都没有，工具于是补跑两条只读查询（`p4 opened`
 与 `p4 fstat`）去认这些文件。判据是 have **不在目标版本上**——have 已经在目标版本上的已打开
 文件，原生连一句都不说，工具也不把它们报出来。
+
+被 p4 拒绝覆盖的文件不属于这四组：原生没给它们动作，工具也就一条记录都不发。一个文件都没得做、
+只剩拒绝时，输出是 `p4 refused to overwrite N file(s)…`，不是「everything up to date」——
+拒绝意味着工作区与目标不同，只是这一轮不去覆盖它。
 
 不带 `-a` 仍是预演：报出要做的四组，一个字节都不写（磁盘、have、opened、摘要缓存都不动）。
 
