@@ -253,15 +253,23 @@ pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<
 
     emit_progress("filter", None);
     let mut candidates = candidates_from(&preview.records)?;
-    // 预演的 `info` 有两类，必须分开：除了「已打开的文件」那句提示，原生对**逐文件拒绝**
-    // 也写 `info`（`allwrite noclobber` 客户端下的唯一形态，见 [`refusal_notice`]）。拒绝
-    // 不是待解释的待办，拿补查去解释它只会整轮失败；它也不该成为写入候选。原文已由
-    // process 层原样转出（stderr），这里不再重复打印。
+    // 预演的 `info` 有三类，必须分开：「已打开的文件」那句要补查身份；**逐文件拒绝**
+    // （`allwrite noclobber` 客户端下的唯一形态，见 [`refusal_notice`]）不是待解释的待办，
+    // 拿补查去解释它只会整轮失败，它也不该成为写入候选；**删除落地**（见 [`deleted_notice`]）
+    // 反过来是候选——原生这一轮会把这个路径的删除落下去。三者的原文都已由 process 层
+    // 原样转出（stderr），这里不再重复打印。
     let mut refusals = 0;
     let mut notices = Vec::new();
     for notice in preview.notices {
         if refusal_notice(&notice) {
             refusals += 1;
+        } else if let Some((depot_file, client_file)) = deleted_notice(&notice) {
+            candidates.push(Candidate {
+                depot_file: depot_file.to_owned(),
+                client_file: client_file.to_owned(),
+                rev: None,
+                action: NativeAction::Deleted,
+            });
         } else {
             notices.push(notice);
         }
@@ -340,6 +348,35 @@ fn refusal_notice(message: &str) -> bool {
         rest.strip_prefix(phrase)
             .is_some_and(|path| path.starts_with(' ') && !path.trim().is_empty())
     })
+}
+
+/// 「删除落地」的 `info` 提示（实测 2024.2）：目标处该路径处于删除状态、本地那份已经不在
+/// （have 记录还在），预演只印这一行、正文一条记录都没有，形如
+/// `//depot/main/gone.txt#1 - deleted as E:\ws\gone.txt`（实测原文见测试
+/// `the_measured_deleted_notice_is_recognized`）。
+///
+/// 它不是待解释的待办（这种现场常见于本地整棵子树被删过、工作区里一个 opened 文件都没有，
+/// 拿补查去解释只会整轮失败），也不是拒绝：原生这一轮会把删除落下去——`#none` 的独家本事
+/// 就是清掉 have 记录（实测：`p4 sync -n //depot/f#none` 对 have=1、本地已删的路径回同一条
+/// `deleted as`、退出码 0、stderr 空）。所以它要成为候选、按 [`NativeAction::Deleted`] 下发
+/// `#none`；本地与 have 都没有时同一行只是描述，`#none` 落下去没有动作（实测：没有 have
+/// 记录的路径 `#none` 是 no-op，见 [`crate::reconcile::sync`] 的 `delete_specs`），而记录流
+/// 取自 apply 自己的回答，不会多报。
+///
+/// 识别要求结构完整（`//` depot 规格 + 数字修订号 + ` - deleted as ` + 非空本地路径），
+/// 任何一条对不上都返回 `None`，交给调用方 fail-closed。消息里的 `#rev` 是 have 版本，
+/// 不进候选——删除的规格一律是 `#none`。
+fn deleted_notice(message: &str) -> Option<(&str, &str)> {
+    let (spec, client_file) = message.split_once(" - deleted as ")?;
+    let (depot_file, rev) = spec.rsplit_once('#')?;
+    if !depot_file.starts_with("//") || rev.is_empty() || !rev.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let client_file = client_file.trim_end();
+    if client_file.is_empty() {
+        return None;
+    }
+    Some((depot_file, client_file))
 }
 
 /// 补查已打开文件的身份。
@@ -1017,9 +1054,62 @@ mod tests {
             // 未知动词，或只差一个字母的拼写。
             r"//depot/main/readme.txt#2 - can't revert modified file E:\ws\readme.txt",
             r"//depot/main/readme.txt#2 - can't update modified files E:\ws\readme.txt",
+            // 删除落地那句：不是拒绝（它是候选，见 [`deleted_notice`]）。
+            r"//depot/main/gone.txt#1 - deleted as E:\ws\gone.txt",
             "",
         ] {
             assert!(!refusal_notice(message), "{message}");
+        }
+    }
+
+    // ---- 删除落地的识别 ----
+
+    /// 实测原文（2024.2）：本地已删、have 仍停在删除之前的文件，`p4 -G sync -n` 只给这一行，
+    /// 正文记录一条都没有。两个路径都要原样取出来：depot 一侧拼 `#none` 规格，本地一侧进
+    /// 报告与范围判断。
+    #[test]
+    fn the_measured_deleted_notice_is_recognized() {
+        let (depot_file, client_file) =
+            deleted_notice(r"//aki/branch_3.8/Content/x.js#1 - deleted as E:\ws\Content\x.js")
+                .unwrap();
+
+        assert_eq!(depot_file, "//aki/branch_3.8/Content/x.js");
+        assert_eq!(client_file, r"E:\ws\Content\x.js");
+    }
+
+    /// 本地路径里的空格与 p4 元字符不影响识别（`#` 在 depot 一侧是 `%23`，所以从最后一个
+    /// `#` 切修订号不会踩到本地名）；行尾换行被裁掉——取出来的本地路径要能直接用于范围判断。
+    #[test]
+    fn a_deleted_notice_with_an_awkward_local_path_is_recognized() {
+        let (depot_file, client_file) =
+            deleted_notice("//depot/main/weird%231.txt#3 - deleted as E:\\my ws\\weird#1.txt\n")
+                .unwrap();
+
+        assert_eq!(depot_file, "//depot/main/weird%231.txt");
+        assert_eq!(client_file, r"E:\my ws\weird#1.txt");
+    }
+
+    /// 认不出的一律返回 `None`，交给调用方 fail-closed。**拒绝族尤其不能被当成删除**：
+    /// 两者的处置完全相反——拒绝是计数后放着不动，删除是下发给 p4。
+    #[test]
+    fn notices_that_are_not_deletions_are_left_to_the_caller() {
+        for message in [
+            // 拒绝族：本地有改动，原生一个字节都不会动。
+            r"//depot/main/readme.txt#2 - can't delete modified file E:\ws\readme.txt",
+            // 已打开文件的原生提示：没有本地路径。
+            "//depot/main/readme.txt#2 - is opened and not being changed",
+            // 缺本地路径（空或只有空白）。
+            r"//depot/main/readme.txt#1 - deleted as ",
+            r"//depot/main/readme.txt#1 - deleted as   ",
+            // depot 规格不完整（缺 `//` 前缀或缺数字修订号）。
+            "readme.txt#1 - deleted as E:\\ws\\readme.txt",
+            r"//depot/main/readme.txt - deleted as E:\ws\readme.txt",
+            r"//depot/main/readme.txt#head - deleted as E:\ws\readme.txt",
+            // 只差一个字母的拼写。
+            r"//depot/main/readme.txt#1 - delete as E:\ws\readme.txt",
+            "",
+        ] {
+            assert!(deleted_notice(message).is_none(), "{message}");
         }
     }
 

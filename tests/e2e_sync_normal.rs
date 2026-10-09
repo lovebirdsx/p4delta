@@ -592,6 +592,108 @@ fn a_refusal_next_to_an_opened_file_leaves_the_opened_one_to_native() {
     );
 }
 
+/// 「本地已删、have 还停在删除之前」：预演只给一句 `deleted as`，正文一条记录都没有。
+///
+/// 这是外部工具删掉文件、本 client 的 have 记录还在时的工作区（编辑器里图谱 Get This
+/// Revision 之后的典型现场），也是普通同步曾经整轮失败的地方：notice 分流不认识这句，
+/// 把它当成「要有已打开文件解释的待办」，而现场一个 opened 都没有——工具拒绝给出一个
+/// 不完整的答案，一个字都不写。
+///
+/// 这条回归钉两件事：整轮必须收尾（不再 bail），且结果与另起沙箱的原生 `p4 sync` 逐处
+/// 一致。同一轮里还放了逐文件拒绝腿（用户现场的另一半）：两族 info 必须各走各的路。
+#[test]
+fn a_deleted_as_notice_is_answered_like_native_p4() {
+    let (Some(ours), Some(theirs)) = (
+        sandbox_with_allwrite_noclobber(),
+        sandbox_with_allwrite_noclobber(),
+    ) else {
+        return;
+    };
+
+    for sandbox in [&ours, &theirs] {
+        // 删除落地：have 停在第 1 版、head 是删除版本、本地已删。
+        sandbox.commit("gone.txt", "will go\n");
+        sandbox.p4_ok(&["delete", "gone.txt"]);
+        sandbox.p4_ok(&["submit", "-d", "delete it"]);
+        sandbox.p4_ok(&["sync", "//depot/main/gone.txt#1"]);
+        sandbox.remove("gone.txt");
+
+        // 逐文件拒绝：同一轮里的第二种 info，被拒的文件一个字节都不该动。
+        behind_then_modified(sandbox, "readme.txt", "local\n");
+    }
+
+    // 前提：这一轮一个 opened 都没有——「拿补查解释 notice」在这份现场必然落空。
+    assert!(ours.opened().is_empty());
+
+    let ours_run = ours
+        .cli()
+        .args(["--sync", "-a", "."])
+        .output()
+        .expect("run the tool");
+    let theirs_run = theirs.p4(&["sync"]);
+
+    assert!(ours_run.status.success(), "{ours_run:?}");
+    let stderr = String::from_utf8_lossy(&ours_run.stderr);
+    // 两族原文都要在：`deleted as` 是候选，拒绝照旧只是计数。
+    assert!(stderr.contains("deleted as"), "{ours_run:?}");
+    assert!(
+        stderr.contains("can't update modified file"),
+        "{ours_run:?}"
+    );
+    // 前提：原生这一轮对这条腿也只给同一句话，没有别的动作。
+    assert!(
+        String::from_utf8_lossy(&theirs_run.stdout).contains("deleted as"),
+        "{theirs_run:?}"
+    );
+
+    assert_eq!(ours.read("readme.txt"), "local\n", "被拒的文件不该被动");
+    assert_eq!(ours.read("readme.txt"), theirs.read("readme.txt"));
+    assert_eq!(ours.opened(), theirs.opened());
+
+    // 删除落地的硬证据：have 记录被清掉——原生也这么做，这正是要对上的那一半。
+    assert!(
+        theirs.p4_lines(&["have", "gone.txt"]).is_empty(),
+        "前提：原生这一轮会把这条 have 记录清掉"
+    );
+    assert!(ours.p4_lines(&["have", "gone.txt"]).is_empty());
+    assert!(!ours.exists("gone.txt"));
+}
+
+/// 同一个删除状态，但本 client 从没同步过它（没有 have 记录）：普通同步是真 no-op。
+///
+/// 与上一条配对：有没有 have 记录决定预演说不说话——没有记录就没有可摘的修订，p4 只回
+/// 一句 `file(s) up-to-date.`，本地那份同名文件也要原样留着（普通同步不删没有 have 记录的
+/// 本地文件；强制修复那一路才删，见 `e2e_sync.rs` 的 `a_never_synced_local_file_is_deleted_without_asking_p4`）。
+#[test]
+fn a_deleted_target_without_a_have_record_is_a_normal_sync_no_op() {
+    let (Some(ours), Some(theirs)) = (support::sandbox_or_skip(), support::sandbox_or_skip())
+    else {
+        return;
+    };
+
+    for sandbox in [&ours, &theirs] {
+        sandbox.commit("mine.txt", "never synced\n");
+        sandbox.p4_ok(&["delete", "mine.txt"]);
+        sandbox.p4_ok(&["submit", "-d", "delete mine"]);
+        // 本 client 从没同步过它：have 为空，本地却有一份同名文件。
+        sandbox.write("mine.txt", "my own copy\n");
+        assert!(sandbox.p4_lines(&["have", "mine.txt"]).is_empty());
+    }
+
+    ours.cli()
+        .args(["--sync", "-a", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No files to sync, everything up to date.",
+        ));
+    theirs.p4_ok(&["sync"]);
+
+    assert_eq!(ours.read("mine.txt"), "my own copy\n");
+    assert_eq!(ours.read("mine.txt"), theirs.read("mine.txt"));
+    assert_eq!(ours.opened(), theirs.opened());
+}
+
 /// `--to <CL>`：往回退到目标那一版，而不是停在 head 上。
 #[test]
 fn to_a_changelist_walks_back_to_that_state_not_to_head() {
