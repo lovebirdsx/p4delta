@@ -628,7 +628,6 @@ mod tests {
             client_file: client_file.to_owned(),
             client_file_lower: local_path_key(client_file),
             depot_file: depot_file.to_owned(),
-            depot_file_lower: depot_file.to_ascii_lowercase(),
             ..Default::default()
         }
     }

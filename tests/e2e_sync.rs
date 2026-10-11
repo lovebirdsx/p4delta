@@ -320,6 +320,167 @@ fn to_a_changelist_pulls_forward_to_that_revision_not_to_head() {
     assert!(sandbox.opened().is_empty());
 }
 
+/// head 已是删除版本、have 停在目标那一版、本地文件还在，而 `--to` 指向更早的 CL——
+/// 在那个 CL 上这个路径还有内容。分析层这时没有别的依据，只能比摘要，所以要的 have 版
+/// 字段（类型 / 大小 / 摘要）必须真的来自补查：旧代码在这里会把 head 版本的记录原样
+/// 拿去比对，或者干脆报「Cannot handle ...」（现场报错的那一版）。
+///
+/// 顺带钉住补查的范围：`--to` 下只有「have 恰好停在目标版本」的记录需要内容基线；
+/// 落后于目标的记录直接拉，一个字节的内容都不查（`BaselineScope::AtTarget`）。
+#[test]
+fn a_historical_target_keeps_the_deleted_head_record_untouched() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // 落后者（head rev2、have rev1，目标是 rev2）与要比内容的（head rev2 = 删除、
+    // have rev1，目标是 rev1）各一个。
+    sandbox.commit("behind.txt", "behind one\n");
+    sandbox.commit("compare.txt", "compare one\n");
+    sandbox.p4_ok(&["edit", "behind.txt"]);
+    sandbox.write("behind.txt", "behind two\n");
+    sandbox.p4_ok(&["submit", "-d", "behind two"]);
+    let target = latest_submitted(&sandbox);
+
+    sandbox.p4_ok(&["delete", "compare.txt"]);
+    sandbox.p4_ok(&["submit", "-d", "delete compare"]);
+    // 提交删除会把 have 记录一并清掉，手工拉回第一版才造得出「head 是删除版本、
+    // have 停在旧版、本地文件还在」这个状态（普通同步到旧 CL 之后的样子）。
+    sandbox.p4_ok(&["sync", "-f", "//depot/main/behind.txt#1"]);
+    sandbox.p4_ok(&["sync", "-f", "//depot/main/compare.txt#1"]);
+
+    // 前提，独立取证。
+    let before = sandbox.p4_ok(&["fstat", "-T", "headRev haveRev headAction", "compare.txt"]);
+    assert!(
+        before.contains("headRev 2") && before.contains("haveRev 1"),
+        "unexpected depot state: {before}"
+    );
+    assert!(before.contains("headAction delete"), "{before}");
+
+    sandbox
+        .cli()
+        .args([
+            "--sync",
+            "--force",
+            "--verify-all",
+            "--to",
+            &target.to_string(),
+            "-a",
+            "-l",
+        ])
+        .arg(".")
+        .assert()
+        .success()
+        // 摘要候选只有一个：落后于目标的那条不进补查。
+        .stdout(predicate::str::contains(
+            "Requesting depot state for 1 file(s) whose content needs comparing.",
+        ))
+        .stdout(predicate::str::contains("Updating 1 files"))
+        // 目标时刻 compare.txt 还在库里，本地那一份也没变：不许进删除组。
+        .stdout(predicate::str::contains("Deleting").not());
+
+    // 独立取证：落后的那个拉到目标版本，比内容的那个原样不动。
+    assert_eq!(sandbox.read("behind.txt"), "behind two\n");
+    assert!(
+        sandbox
+            .p4_ok(&["fstat", "-T", "headRev", "behind.txt"])
+            .contains("headRev 2"),
+        "behind.txt 的 head 不该被动过"
+    );
+    assert!(sandbox.exists("compare.txt"), "本地文件不该被删掉");
+    assert_eq!(sandbox.read("compare.txt"), "compare one\n");
+    let after = sandbox.p4_ok(&["fstat", "-T", "haveRev headAction", "compare.txt"]);
+    assert!(
+        after.contains("haveRev 1") && after.contains("headAction delete"),
+        "have 与 head 都不该被动过：{after}"
+    );
+    assert!(sandbox.opened().is_empty(), "sync never opens files");
+}
+
+/// 两条记录同时落后于 head、have 都停在目标版本——补查要**一次批量**取回它们的内容
+/// 字段（≥2 条才走 `p4 fstat -L` 的批量表，单条退回普通查询，这条路径此前没有 e2e）。
+///
+/// 顺带把补查的用途钉死：`--verify-all` 下本地那份同尺寸的脏内容必须被摘要认出来（Revert），
+/// 本地缺失的那份要从目标版本写回（Restore）。基线若回填错了（拿 head 版本的摘要比 have
+/// 版本），同尺寸脏内容会算成「没变」而漏掉，缺失那份则会拿错版本写回。
+#[test]
+fn a_historical_target_refreshes_every_baseline_in_one_batch() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // 目标时刻：a.txt / b.txt 都在库（各 rev1）。
+    sandbox.commit("a.txt", "a one\n");
+    sandbox.commit("b.txt", "b one\n");
+    let target = latest_submitted(&sandbox);
+
+    // 目标之后各改一版：head 到 rev2，have 仍停在 rev1。
+    sandbox.p4_ok(&["edit", "a.txt"]);
+    sandbox.write("a.txt", "a two\n");
+    sandbox.p4_ok(&["submit", "-d", "a second"]);
+    sandbox.p4_ok(&["edit", "b.txt"]);
+    sandbox.write("b.txt", "b two\n");
+    sandbox.p4_ok(&["submit", "-d", "b second"]);
+
+    // 把 have 与本地都退回目标那一版（rev1）：两条记录的 have 都停在目标上。
+    sandbox.p4_ok(&["sync", "-f", "//depot/main/a.txt#1"]);
+    sandbox.p4_ok(&["sync", "-f", "//depot/main/b.txt#1"]);
+
+    // a：同尺寸的脏内容（`a one` → `a two`，六字节不变）；b：本地缺失。
+    sandbox.write("a.txt", "a two\n");
+    sandbox.remove("b.txt");
+
+    // 前提，独立取证：两条都是 head rev2 / have rev1。
+    let before = sandbox.p4_ok(&["fstat", "-T", "headRev haveRev", "a.txt", "b.txt"]);
+    assert!(
+        before.contains("headRev 2") && before.contains("haveRev 1"),
+        "unexpected depot state: {before}"
+    );
+
+    sandbox
+        .cli()
+        .args([
+            "--sync",
+            "--force",
+            "--verify-all",
+            "--to",
+            &target.to_string(),
+            "-a",
+            "-l",
+        ])
+        .arg(".")
+        .assert()
+        .success()
+        // 两条都要内容基线——这就是走 `-L` 批量表的那一档。
+        .stdout(predicate::str::contains(
+            "Requesting depot state for 2 file(s) whose content needs comparing.",
+        ))
+        .stdout(predicate::str::contains("Reverting 1 files"))
+        .stdout(predicate::str::contains("Restoring 1 files"))
+        .stdout(predicate::str::contains("Updating").not())
+        .stdout(predicate::str::contains("Deleting").not());
+
+    // 独立取证：两条都回到目标版本 rev1，head 没动，have 停在 rev1。
+    assert_eq!(
+        sandbox.read("a.txt"),
+        "a one\n",
+        "同尺寸脏内容该还原到目标版本"
+    );
+    assert_eq!(
+        sandbox.read("b.txt"),
+        "b one\n",
+        "缺失的那份该从目标版本写回"
+    );
+    for name in ["a.txt", "b.txt"] {
+        let after = sandbox.p4_ok(&["fstat", "-T", "headRev haveRev", name]);
+        assert!(
+            after.contains("headRev 2") && after.contains("haveRev 1"),
+            "{name} 的 head / have 都不该被动过：{after}"
+        );
+    }
+    assert!(sandbox.opened().is_empty(), "sync never opens files");
+}
+
 /// 空目标护栏：限定的目录里有跟踪文件，而选定的 CL 早于这个目录的出现——那个时刻目录里
 /// 一件东西都没有，分析层的结论会是「把本地每一个被跟踪的文件都删掉」。
 ///

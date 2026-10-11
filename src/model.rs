@@ -130,10 +130,11 @@ impl std::str::FromStr for FileType {
 #[derive(Default, Debug)]
 pub(crate) struct DepotFileRecord {
     /// depot 语法路径，保留原始大小写，如 "//Depot/Stream/File.ext"。
+    ///
+    /// **没有折叠形式**：depot 里可以同时存在只差大小写的两个路径，把它们折成同一个键
+    /// 会把两条独立的历史混成一条。分析层与目标表一律按原样路径比较（见 [`DepotState`]
+    /// 与 [`TargetMap`] 的文档），所以这里不保留 `depot_file_lower`。
     pub(crate) depot_file: String,
-
-    /// depot 语法路径的小写形式，用作匹配键。
-    pub(crate) depot_file_lower: String,
 
     /// 工作区语法路径，保留原始大小写，如 Windows 上的 "C:\Workspace\File.ext"。
     pub(crate) client_file: String,
@@ -190,21 +191,19 @@ pub(crate) struct DepotState {
     /// depot 里的全部文件记录。
     pub(crate) file_records: Vec<DepotFileRecord>,
 
-    /// 按 `depot_file_lower` 给 `file_records` 建索引。
-    depot_map: HashMap<String, usize>,
-
     /// 按 `client_file_lower` 给 `file_records` 建索引。
+    ///
+    /// 只有这一份索引：depot 路径一侧不需要索引。旧的那份按 `depot_file_lower` 建的索引
+    /// 唯一的读取方是 fstat 的补查回填，而折叠键定位正是它填错记录的原因（见
+    /// `p4/fstat.rs` 的 `BaselineRequest`）——回填改按记录下标之后，它整个是多余的。
     client_map: HashMap<String, usize>,
 }
 
 impl DepotState {
     pub(crate) fn build_mapping(&mut self) {
-        self.depot_map.reserve(self.file_records.len());
         self.client_map.reserve(self.file_records.len());
 
         for (i, record) in self.file_records.iter().enumerate() {
-            self.depot_map.insert(record.depot_file_lower.clone(), i);
-
             // Windows 上的大小写冲突（如 Snow_Normal.uasset 与 Snow_normal.uasset）：
             // 键已被占用时靠下面两条规则决胜，否则后插入的记录直接顶掉先来的。
             if let Some(&existing_idx) = self.client_map.get(&record.client_file_lower) {
@@ -237,13 +236,8 @@ impl DepotState {
     /// 不能沿用 [`Self::build_mapping`] 的累加式插入。
     pub(crate) fn retain_records(&mut self, mut keep: impl FnMut(&DepotFileRecord) -> bool) {
         self.file_records.retain(|record| keep(record));
-        self.depot_map.clear();
         self.client_map.clear();
         self.build_mapping();
-    }
-
-    pub(crate) fn get_depot_record_mut(&mut self, file: &str) -> Option<&mut DepotFileRecord> {
-        self.depot_map.get(file).map(|&i| &mut self.file_records[i])
     }
 
     pub(crate) fn get_client_record(&self, file: &str) -> Option<&DepotFileRecord> {
@@ -268,7 +262,11 @@ pub(crate) struct TargetRecord {
     pub(crate) action: FileAction,
 }
 
-/// 目标版本的全部记录，键是 `depot_file_lower`（与 [`DepotState`] 的 depot 索引同口径）。
+/// 目标版本的全部记录，键是**原样大小写的 depot 路径**（`DepotFileRecord::depot_file`）。
+///
+/// 不折成小写：depot 里可以同时存在只差大小写的两个路径（`Snow.uasset` / `snow.uasset`），
+/// 它们在本地折叠成同一个文件，却在目标时刻可以有相反的状态（一头在库、一头是删除版本）。
+/// 折叠成一个键会让后插入的那条盖掉先来的，分析层随即把本地文件误判成「目标处不在库」而删掉。
 pub(crate) type TargetMap = HashMap<String, TargetRecord>;
 
 /// 工作区里单个文件的信息。
@@ -511,7 +509,6 @@ mod tests {
     ) -> DepotFileRecord {
         DepotFileRecord {
             depot_file: tag.to_owned(),
-            depot_file_lower: tag.to_ascii_lowercase(),
             client_file: client_file.to_owned(),
             client_file_lower: local_path_key(client_file),
             head_action,
@@ -680,40 +677,15 @@ mod tests {
         );
     }
 
-    // ---- 两套索引的查询语义 ----
+    // ---- 索引的查询语义 ----
 
+    /// 客户端路径一侧按折叠键查：调用方必须自己传 `client_file_lower` 形式的键，
+    /// 查询本身不折叠。
     #[test]
-    fn depot_records_are_indexed_by_the_folded_depot_path() {
+    fn client_records_are_indexed_by_the_folded_client_path() {
         let mut state = DepotState {
             file_records: vec![DepotFileRecord {
-                depot_file: "//Depot/Stream/File.ext".to_owned(),
-                depot_file_lower: "//depot/stream/file.ext".to_owned(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        state.build_mapping();
-
-        assert!(
-            state
-                .get_depot_record_mut("//depot/stream/file.ext")
-                .is_some()
-        );
-        assert!(state.get_depot_record_mut("//depot/other.ext").is_none());
-        // 查询本身不折叠：调用方必须自己传 depot_file_lower 形式的键（见 p4/fstat.rs 的补查回填）。
-        assert!(
-            state
-                .get_depot_record_mut("//DEPOT/STREAM/FILE.EXT")
-                .is_none()
-        );
-    }
-
-    /// fstat 补查把 have 版本的字段回填到原记录上，改动必须能被后续查询看到。
-    #[test]
-    fn mutating_a_record_through_the_depot_map_is_visible() {
-        let mut state = DepotState {
-            file_records: vec![DepotFileRecord {
-                depot_file_lower: "//depot/a.txt".to_owned(),
+                depot_file: "//depot/a.txt".to_owned(),
                 client_file: r"C:\ws\a.txt".to_owned(),
                 client_file_lower: local_path_key(r"C:\ws\a.txt"),
                 ..Default::default()
@@ -722,15 +694,36 @@ mod tests {
         };
         state.build_mapping();
 
-        let record = state
-            .get_depot_record_mut("//depot/a.txt")
-            .expect("indexed");
+        let key = local_path_key(r"C:\ws\a.txt");
+        assert!(state.get_client_record(&key).is_some());
+        assert!(
+            state
+                .get_client_record(&local_path_key(r"C:\ws\b.txt"))
+                .is_none()
+        );
+        assert!(state.get_client_record(r"C:\WS\A.TXT").is_none());
+    }
+
+    /// fstat 补查把 have 版本的字段回填到原记录上，改动必须能被后续查询看到。
+    #[test]
+    fn mutating_a_record_in_place_is_visible_through_the_client_map() {
+        let mut state = DepotState {
+            file_records: vec![DepotFileRecord {
+                client_file: r"C:\ws\a.txt".to_owned(),
+                client_file_lower: local_path_key(r"C:\ws\a.txt"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        state.build_mapping();
+
+        let record = &mut state.file_records[0];
         record.head_type = Some(FileType::Text);
         record.file_size = Some(42);
 
         let record = state
             .get_client_record(&local_path_key(r"C:\ws\a.txt"))
-            .expect("indexed by the client path too");
+            .expect("indexed by the client path");
         assert_eq!(record.head_type, Some(FileType::Text));
         assert_eq!(record.file_size, Some(42));
     }

@@ -30,15 +30,18 @@ use crate::json::{
 use crate::model::{
     DepotState, DigestType, HaveRecord, TargetMap, WorkspaceCache, WorkspaceFile, WorkspaceState,
 };
-use crate::p4::fstat::{run_p4_fstat_all, run_p4_fstat_at_revision};
+use crate::p4::fstat::{
+    BaselineScope, query_depot_state, refresh_baselines, run_p4_fstat_at_revision,
+    select_baseline_requests,
+};
 use crate::p4::process::{FailureMode, run_p4_command_batched, run_p4_have};
 use crate::path::path_is_under_key;
 use crate::prune::PrunePlan;
 use crate::scope::{EntryKind, ExcludeSet, Scope};
 use crate::workspace::{gather_workspace, map_new_paths, rescan_tracked_pruned_dirs};
 
-/// 一轮 reconcile 的编排：拉齐 fstat / 工作区 / have 三路数据，分析、算摘要，
-/// 最后把变更下发给 p4。多个范围入口合并成这一轮——一次操作、一个视图。
+/// 一轮 reconcile 的编排：拉齐 fstat / 工作区 / have 三路数据（`--to` 的目标快照另查一次）、
+/// 分析、算摘要，最后把变更下发给 p4。多个范围入口合并成这一轮——一次操作、一个视图。
 pub(crate) async fn reconcile_scope(
     options: &Options,
     scope: &Scope,
@@ -66,17 +69,46 @@ pub(crate) async fn reconcile_scope(
 
     let specs = scope.query_specs(None);
 
+    // 三路并发：depot 状态、本地扫描、have 时间戳。
     let (maybe_depot, maybe_workspace, maybe_have) = futures::join!(
-        run_p4_fstat_all(options, work_dir, &specs),
+        query_depot_state(options, work_dir, &specs),
         gather_workspace(options, scope),
         run_p4_have(options, work_dir, &specs)
     );
 
-    // 第二项是 head 目标快照，只有 sync 模式才建（`head_action` 会被 fstat 的补查覆盖，
-    // 只能在补查之前取）。
+    // 第二项是 head 目标快照，只有 sync 且没有 `--to` 时才建（`head_action` 会被 fstat 的
+    // 补查覆盖，只能在补查之前取）。
     let (mut depot, head_target): (DepotState, Option<TargetMap>) = maybe_depot?;
     let (mut workspace, prune_plan): (WorkspaceState, PrunePlan) = maybe_workspace?;
     let have_records: HashMap<String, HaveRecord> = maybe_have?;
+
+    // `--to <CL>` 的目标快照。只依赖范围与 CL，但刻意**串行**排在三路之后：它自己会发起
+    // 一批 fstat，叠进那三路就是把范围查询的并发整体抬高一层（取舍见 docs/why-faster.md）。
+    // 放在这里（补查之前）是必需的——它决定哪些记录真的要内容基线（`BaselineScope::AtTarget`）。
+    let at_target = match (options.sync, options.to) {
+        (true, Some(changelist)) => {
+            Some(run_p4_fstat_at_revision(options, work_dir, changelist, &specs).await?)
+        }
+        _ => None,
+    };
+
+    // 历史基线补查：把 `head_rev != have_rev` 的记录的内容字段换成 have 版本的，分析层
+    // 拿它们当与本地文件比对的基线。sync 只为「摘要当真要比对的那批」发查询（目标表此刻
+    // 已经在手上），open / clean 保持全量——这条路径一个字节都不改。
+    let baseline_scope = if options.sync {
+        match at_target.as_ref().or(head_target.as_ref()) {
+            Some(target) => BaselineScope::AtTarget {
+                target,
+                excludes: &scope.excludes,
+            },
+            // 没有目标表说明 sync 的入口没把目标取回来，是 bug 而不是用户输入问题。
+            None => return Err(anyhow!("Missing the head revision snapshot for sync mode")),
+        }
+    } else {
+        BaselineScope::Outdated
+    };
+    let requests = select_baseline_requests(&depot.file_records, &baseline_scope);
+    refresh_baselines(options, work_dir, &mut depot.file_records, &requests).await?;
 
     // 范围排除：depot 记录与目标快照用同一份名单、同时过滤，且都在分析之前。
     // 只过滤扫盘一侧的话，排除目录里已跟踪的文件会因为「本地扫不到」被误判成待删除。
@@ -114,8 +146,9 @@ pub(crate) async fn reconcile_scope(
     if options.sync {
         let target = match options.to {
             Some(changelist) => {
-                let mut target =
-                    run_p4_fstat_at_revision(options, work_dir, changelist, &specs).await?;
+                // 目标快照在补查之前那一段取好，这里只做排除与空结果护栏。
+                let mut target: TargetMap = at_target
+                    .ok_or_else(|| anyhow!("Missing the changelist snapshot for sync mode"))?;
                 // 目标快照与 depot 记录用同一份排除名单，否则范围外文件会被当成
                 // 「目标时刻不在库」而遭删除。
                 target.retain(|key, _| !excluded_depot_keys.contains(key));
@@ -133,8 +166,8 @@ pub(crate) async fn reconcile_scope(
                 }
                 target
             }
-            // 目标是 head：快照在取 depot 状态时顺手取好了。拿不到说明 fstat 那一步没按
-            // sync 模式跑，是 bug 而不是用户输入问题。
+            // 目标是 head：快照在取 depot 状态时顺手取好了。这里拿不到说明上面那道
+            // 补查范围没走 sync 分支，是 bug 而不是用户输入问题。
             None => head_target
                 .ok_or_else(|| anyhow!("Missing the head revision snapshot for sync mode"))?,
         };
@@ -541,7 +574,8 @@ fn warn_unmatched_entries(scope: &Scope, depot: &DepotState) -> Result<()> {
     Ok(())
 }
 
-/// 按范围排除过滤 depot 记录，返回被剔除的 depot 键（目标快照要用同一份名单过滤）。
+/// 按范围排除过滤 depot 记录，返回被剔除的 **depot 路径**（目标快照要用同一份名单过滤，
+/// 而目标表是按原样 depot 路径建的键，见 `model::TargetMap`）。
 ///
 /// 这一步与扫盘侧对 exclude 的处理是一对，缺一不可：少了它，排除目录里已跟踪的
 /// 文件会因为「本地扫不到」被误判成待删除。
@@ -553,7 +587,7 @@ fn exclude_from_depot(depot: &mut DepotState, excludes: &ExcludeSet) -> HashSet<
     let mut excluded = HashSet::new();
     depot.retain_records(|record| {
         if excludes.excludes_key(&record.client_file_lower) {
-            excluded.insert(record.depot_file_lower.clone());
+            excluded.insert(record.depot_file.clone());
             false
         } else {
             true

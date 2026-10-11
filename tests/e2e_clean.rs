@@ -61,6 +61,63 @@ fn the_three_clean_actions_are_counted_then_applied() {
     assert!(sandbox.opened().is_empty(), "clean never opens files");
 }
 
+/// 本地内容停在 have 版本上、head 已经往前走了一段——clean 的比对基线必须是 **have 版本**
+/// 的摘要，而不是 head 版本的。两条记录一次批量补查（≥2 条才走 `p4 fstat -L`），dirty 的
+/// 判定因此不再依赖「尺寸不同」这条捷径：文本即使逐字节等于 have 内容也不许被判成改动。
+///
+/// 基线若回填错了（拿 head 版本的摘要比 have 版本），这里会数出 `Reverting 2 files`；
+/// 回填正确则一个动作都没有。
+#[test]
+fn clean_compares_against_the_have_revision_after_a_batch_refresh() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // 两个文本文件，rev1 与 rev2 逐字节等长——逼着判定走摘要而不是尺寸。
+    sandbox.commit("c1.txt", "alpha one\n");
+    sandbox.commit("c2.txt", "beta one\n");
+    sandbox.p4_ok(&["edit", "c1.txt"]);
+    sandbox.write("c1.txt", "alpha two\n");
+    sandbox.p4_ok(&["submit", "-d", "c1 second"]);
+    sandbox.p4_ok(&["edit", "c2.txt"]);
+    sandbox.write("c2.txt", "beta two\n");
+    sandbox.p4_ok(&["submit", "-d", "c2 second"]);
+
+    // 把 have 与本地都拉回 rev1，再把本地内容按 rev1 重写一遍并顶走 mtime——时间戳捷径
+    // 会让「自 sync 起未改动」直接跳过摘要，那样两条路径都验不到基线。
+    sandbox.p4_ok(&["sync", "-f", "//depot/main/c1.txt#1"]);
+    sandbox.p4_ok(&["sync", "-f", "//depot/main/c2.txt#1"]);
+    sandbox.write("c1.txt", "alpha one\n");
+    sandbox.write("c2.txt", "beta one\n");
+
+    // 前提，独立取证：head rev2 / have rev1，且本地就是 rev1 的内容。
+    let before = sandbox.p4_ok(&["fstat", "-T", "headRev haveRev", "c1.txt", "c2.txt"]);
+    assert!(
+        before.contains("headRev 2") && before.contains("haveRev 1"),
+        "unexpected depot state: {before}"
+    );
+
+    sandbox
+        .cli()
+        .args(["--clean", "-l"])
+        .arg(".")
+        .assert()
+        .success()
+        // 两条都要内容基线——走 `-L` 批量表的那一档。
+        .stdout(predicate::str::contains(
+            "Requesting depot state for 2 file(s) whose content needs comparing.",
+        ))
+        // 本地逐字节等于 have 版本，没有改动可还原。
+        .stdout(predicate::str::contains("Reverting").not())
+        .stdout(predicate::str::contains(
+            "No files to clean, everything up to date.",
+        ));
+
+    assert_eq!(sandbox.read("c1.txt"), "alpha one\n");
+    assert_eq!(sandbox.read("c2.txt"), "beta one\n");
+    assert!(sandbox.opened().is_empty(), "clean never opens files");
+}
+
 /// 已打开的文件不归 clean 管，`p4 clean` 的官方口径也是如此
 /// （"files that are opened ... are not impacted by p4 clean"）。
 ///

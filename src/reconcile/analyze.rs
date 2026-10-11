@@ -1,8 +1,9 @@
 //! 两阶段差异分析：把 depot 记录与工作区文件互相印证，决定每个文件落在哪一类变更里。
 //!
 //! 这里是纯逻辑——不碰文件系统、不起 p4 子进程、不读时钟。`reconcile_dir` 负责把
-//! fstat / 工作区扫描 / have 三路结果凑齐，再把工作区补齐（已剪目录里 depot 已跟踪
-//! 的文件必须回到 `workspace` 里，否则会被当成被删除），然后才交给 [`analyze`]。
+//! fstat / 工作区扫描 / have 三路结果凑齐（`--to` 的目标快照另查一次），再把工作区补齐
+//! （已剪目录里 depot 已跟踪的文件必须回到 `workspace` 里，否则会被当成被删除），然后才交给
+//! [`analyze`]。
 
 use std::collections::HashSet;
 
@@ -475,10 +476,15 @@ pub(crate) fn analyze_at_target<'a>(
         }
 
         // 大小写冲突下同一个 client 路径可能对上多条记录，只处理 build_mapping 选出的
-        // 胜者。否则同一个本地文件会被两条 depot 路径各下发一次（`p4 sync -f` 来两遍）。
+        // 胜者。否则同一个本地文件会被两条 depot 路径各下发一次（`p4 sync -f` 来两遍），
+        // 而两条命令钉的 `#rev` 还可能来自各自的历史。
+        //
+        // 比较按**原样 depot 路径**：只差大小写的两个路径（`Snow.uasset` /
+        // `snow.uasset`）折叠成同一个键，用折叠键比会把这一对全判成胜者——而这一对正是
+        // build_mapping 那条决胜规则要选一个出来的场合。
         let is_winner = depot
             .get_client_record(&record.client_file_lower)
-            .is_some_and(|winner| winner.depot_file_lower == record.depot_file_lower);
+            .is_some_and(|winner| winner.depot_file == record.depot_file);
         if !is_winner {
             continue;
         }
@@ -489,8 +495,9 @@ pub(crate) fn analyze_at_target<'a>(
             continue;
         }
 
-        // 目标时刻该路径不在库：本地不该留着它。
-        let Some(target_record) = target.get(&record.depot_file_lower) else {
+        // 目标时刻该路径不在库：本地不该留着它。按**原样 depot 路径**查目标表：折成小写
+        // 会让只差大小写的另一条路径的状态顶上来（见 `model::TargetMap`）。
+        let Some(target_record) = target.get(&record.depot_file) else {
             push_deleted(&mut analysis, record, workspace);
             continue;
         };
@@ -605,9 +612,11 @@ fn guard_case_conflicts(
             continue;
         }
 
-        // 同一条本地路径上，只要还有另一条记录在目标处留着内容，就不能删。
+        // 同一条本地路径上，只要还有另一条记录在目标处留着内容，就不能删。查的是
+        // **每条记录自己的原样 depot 路径**——折成小写会让这一对又撞回同一个键，
+        // guard 就看不到「另一条在目标处活着」这件事了。
         let alive_at_target = target
-            .get(&record.depot_file_lower)
+            .get(&record.depot_file)
             .is_some_and(|target_record| !matches!(target_record.action, Delete | MoveDelete));
         if alive_at_target {
             bail!(
@@ -648,7 +657,6 @@ mod tests {
     fn synced_record(client_file: &str) -> DepotFileRecord {
         let depot_file = depot_path_of(client_file);
         DepotFileRecord {
-            depot_file_lower: depot_file.to_ascii_lowercase(),
             depot_file,
             client_file: client_file.to_owned(),
             client_file_lower: local_path_key(client_file),
@@ -673,7 +681,7 @@ mod tests {
     }
 
     fn depot_state(records: Vec<DepotFileRecord>) -> DepotState {
-        // 不能写成结构体更新语法：depot_map / client_map 对 model 之外是私有的。
+        // 不能写成结构体更新语法：client_map 对 model 之外是私有的。
         let mut state = DepotState::default();
         state.file_records = records;
         state.build_mapping();
@@ -1128,12 +1136,10 @@ mod tests {
 
     // ---- analyze_at_target：按目标版本分类 ----
 
-    /// 目标版本快照里的一条记录。
+    /// 目标版本快照里的一条记录。键是原样 depot 路径，与生产实现同口径
+    /// （见 `model::TargetMap`）。
     fn target_entry(depot_file: &str, rev: u32, action: FileAction) -> (String, TargetRecord) {
-        (
-            depot_file.to_ascii_lowercase(),
-            TargetRecord { rev, action },
-        )
+        (depot_file.to_owned(), TargetRecord { rev, action })
     }
 
     /// 目标就是 head 时，快照与 head 记录同源。
@@ -1442,13 +1448,11 @@ mod tests {
     fn a_case_collision_only_processes_the_winning_record() {
         let winner = DepotFileRecord {
             depot_file: "//depot/Snow.uasset".to_owned(),
-            depot_file_lower: "//depot/snow.uasset".to_owned(),
             head_rev: Some(2),
             ..synced_record(PATH)
         };
         let loser = DepotFileRecord {
             depot_file: "//depot/snow_normal.uasset".to_owned(),
-            depot_file_lower: "//depot/snow_normal.uasset".to_owned(),
             ..synced_record(PATH)
         };
         let depot = depot_state(vec![winner, loser]);
@@ -1459,6 +1463,133 @@ mod tests {
 
         assert_eq!(non_empty_sync_groups(&analysis), ["update"]);
         assert_eq!(analysis.update.len(), 1);
+    }
+
+    /// 只差大小写的两个 depot 路径落在同一个本地文件上——它们在 depot 里是两条独立的历史，
+    /// 但在本地折叠成同一份。同一个本地文件只许被处理一次，否则同一个文件
+    /// 会被两条 depot 路径各下发一次命令，而且两条命令钉的 `#rev` 可能来自各自的历史。
+    ///
+    /// 按折叠键比会把这一对都判成胜者（两条记录的折叠键逐字节相同），所以必须按原样路径比。
+    #[test]
+    fn case_variant_siblings_share_one_local_file_and_act_once() {
+        let upper = DepotFileRecord {
+            depot_file: "//depot/Snow.uasset".to_owned(),
+            ..synced_record(PATH)
+        };
+        let lower = DepotFileRecord {
+            depot_file: "//depot/snow.uasset".to_owned(),
+            ..synced_record(PATH)
+        };
+        let depot = depot_state(vec![upper, lower]);
+        let target = head_target(&depot.file_records);
+
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["check"]);
+        assert_eq!(analysis.check.len(), 1, "同一个本地文件只处理一次");
+        assert_eq!(
+            analysis.check[0].source.record.depot_file,
+            "//depot/Snow.uasset"
+        );
+    }
+
+    /// 只差大小写的两条路径落在同一个本地文件上，而它们在**目标时刻**的状态可以一头
+    /// 在库、一头是删除版本。目标表若按折叠键建，两条会合成一条、后插入的那条胜出，
+    /// 分析层拿到的就是「目标处不在库」，本地文件被误收进删除组——这正是现场那次误删。
+    ///
+    /// 两种插入顺序都试：在库的记录先入表时（现场的形状）折叠键留下的是删除版本。
+    #[test]
+    fn case_variant_targets_do_not_collapse_into_a_delete() {
+        let live_record = || DepotFileRecord {
+            depot_file: "//depot/main/Snow.uasset".to_owned(),
+            head_action: Some(FileAction::Edit),
+            head_rev: Some(5),
+            have_rev: Some(5),
+            ..synced_record(PATH)
+        };
+        // 同一本地路径上的另一条：head 已是删除版本。
+        let deleted_record = || DepotFileRecord {
+            depot_file: "//depot/main/snow.uasset".to_owned(),
+            head_action: Some(FileAction::Delete),
+            head_rev: Some(3),
+            have_rev: Some(3),
+            head_type: None,
+            file_size: None,
+            digest: None,
+            ..synced_record(PATH)
+        };
+
+        for records in [
+            vec![live_record(), deleted_record()],
+            vec![deleted_record(), live_record()],
+        ] {
+            let depot = depot_state(records);
+            let target = head_target(&depot.file_records);
+            let workspace = workspace_state(&[(PATH, SIZE, false)]);
+
+            let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+            assert!(
+                analysis.delete.is_empty(),
+                "目标处活着的那条记录才是胜者，本地文件不许被删：{:?}",
+                non_empty_sync_groups(&analysis)
+            );
+            assert_eq!(non_empty_sync_groups(&analysis), ["check"]);
+            // 胜者拿到的是**它自己**在目标处的修订号，不是另一条路径的。
+            assert_eq!(
+                analysis.check[0].source.record.depot_file,
+                "//depot/main/Snow.uasset"
+            );
+            assert_eq!(analysis.check[0].source.target_rev, 5);
+        }
+    }
+
+    /// head 决胜选出的记录，在目标时刻却不在库——因为只改大小写的改名发生在目标之后。
+    /// 同一本地路径上的另一条记录在目标处还有内容，删掉本地文件就是错的，必须拒绝而不是
+    /// 默不作声地删。守卫查的是**每条记录自己的原样 depot 路径**：折成小写会让这一对又撞回
+    /// 同一个键，guard 看不到「另一条在目标处活着」这件事，误删就发生了。
+    #[test]
+    fn a_case_conflict_that_would_delete_a_live_target_is_refused() {
+        // head 上：Snow 已删除、snow 在世界（决胜选出 snow）。
+        let now_deleted = DepotFileRecord {
+            depot_file: "//depot/main/Snow.uasset".to_owned(),
+            head_action: Some(FileAction::Delete),
+            head_rev: Some(2),
+            have_rev: Some(2),
+            head_type: None,
+            file_size: None,
+            digest: None,
+            ..synced_record(PATH)
+        };
+        let now_live = DepotFileRecord {
+            depot_file: "//depot/main/snow.uasset".to_owned(),
+            head_action: Some(FileAction::Edit),
+            head_rev: Some(4),
+            have_rev: Some(4),
+            ..synced_record(PATH)
+        };
+        let depot = depot_state(vec![now_deleted, now_live]);
+
+        // 历史目标落在改名之前：那时只有 Snow.uasset 在库。
+        let target: TargetMap = [(
+            "//depot/main/Snow.uasset".to_owned(),
+            TargetRecord {
+                rev: 3,
+                action: FileAction::Edit,
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let workspace = workspace_state(&[(PATH, SIZE, false)]);
+        let error = analyze_at_target(&depot, &workspace, &target)
+            .err()
+            .expect("误删本地文件前必须拒绝")
+            .to_string();
+
+        assert!(error.contains("Refusing to sync"), "{error}");
+        assert!(error.contains("//depot/main/Snow.uasset"), "{error}");
     }
 
     /// 本地在位、have 与目标一致，但记录缺 head_type：摘要算不了，必须响亮失败。

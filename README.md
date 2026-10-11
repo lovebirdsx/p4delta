@@ -249,7 +249,7 @@ Windows 本地目录参数支持正斜杠、反斜杠和混合分隔符，匹配
 p4delta -w "your-workspace" -l --no-prune-ignored-dirs "E:\project\src"
 ```
 
-旧版本文件的元数据补查使用 `p4 fstat -L`；补查失败或记录不完整时会停止，不会用最新版本的摘要替代本地 have revision 的摘要。
+旧版本文件的元数据补查使用 `p4 fstat -L`，补查结果按**精确的 depot 路径与修订号**回填到对应记录；补查失败或记录不完整时会停止，不会用最新版本的摘要替代本地 have revision 的摘要。`--sync` 只对「摘要要比对的那批」发补查（`--to` 下是 have 恰好停在目标版本的记录，保守起见可能多带上少数几条），并且只按精确路径认结果——depot 里同时存在只差大小写的两个路径时，两条记录各拿各的基线。
 
 client view 里的排除行（例如 `-//depot/....tmp`）会让 p4 完全看不见那些路径：`p4 reconcile`、`p4 clean`、`p4 add` 对它们一律报 `not in client view`。工具是自己扫盘的，所以对判定为新增的文件会再查一次 `p4 where`，把被排除的路径剔除——否则 open 模式会去 add 一个 p4 拒绝的文件，clean 模式更糟：会删掉一个 p4 根本不管的文件。
 
