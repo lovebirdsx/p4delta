@@ -18,7 +18,7 @@ use crate::charset::{
     decode_p4_bytes, p4_command_encoding, p4_encoding, strip_bom, trim_line_ending,
 };
 use crate::cli::Options;
-use crate::json::sayln;
+use crate::json::{count_p4_command, sayln};
 use crate::model::HaveRecord;
 use crate::p4::marshal::{MarshalRecord, MarshalRecordReader, MarshalStreamParser};
 
@@ -142,6 +142,8 @@ pub(crate) async fn run_p4_have(
     }
 
     let mut child = cmd.spawn()?;
+    // 起来了才算一次调用，见 [`count_p4_command`]；上面那个 `?` 失败时早退，不会记账。
+    count_p4_command();
     let P4Pipes {
         arguments,
         stdout,
@@ -537,6 +539,7 @@ pub(crate) async fn run_p4_marshal_slice(
     )?;
 
     let mut child = cmd.spawn()?;
+    count_p4_command();
     let P4Pipes {
         arguments,
         stdout,
@@ -762,6 +765,8 @@ pub(crate) async fn run_p4_command_slice(
         }
         Err(error) => return Err(error.into()),
     };
+    // 只有 `Ok` 那一支会走到这里：起不来的进程不占一次调用（见 [`count_p4_command`]）。
+    count_p4_command();
 
     let P4Pipes {
         arguments,

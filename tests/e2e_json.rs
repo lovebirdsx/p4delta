@@ -57,6 +57,14 @@ impl Run {
             .collect()
     }
 
+    /// 某个 `kind` 的全部记录，按出现顺序。
+    fn of_kind(&self, kind: &str) -> Vec<&Value> {
+        self.records
+            .iter()
+            .filter(|record| record["kind"] == kind)
+            .collect()
+    }
+
     /// 所有文件记录的 `class`，按出现顺序。
     fn classes(&self) -> Vec<&str> {
         self.files()
@@ -198,6 +206,150 @@ fn stdout_carries_only_records_and_the_summary_closes_the_stream() {
     assert!(sandbox.opened().is_empty(), "预演不许在服务器上动任何东西");
 }
 
+/// 每一次**成功启动**的 p4 进程都留一条累计观测事件：初始化先发 `count:0`（它必须坐在
+/// 任何 p4 启动之前——字符集探测那一步就可能起一个 `p4 set`），之后每 spawn 成功一个 +1；
+/// summary 的 `p4Calls` 收尾给出最终累计数。事件只是观测，不是这一轮的操作结论。
+///
+/// 断言落在三件消费方会依赖的事上：头一条是 0、序列严格递增且每次正好加一（计数与上报
+/// 在同一把锁里，乱序或丢一次都会在这里露出来）、summary 的数字与最后一条一致。
+#[test]
+fn every_started_p4_process_is_reported_as_an_increasing_count() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    offline_drift(&sandbox);
+
+    let run = run_json(&sandbox, &["."]);
+    assert!(run.ok, "{}", run.stderr);
+
+    // 初始化那条打头且为 0。
+    assert_eq!(
+        run.records[0]["kind"], "p4CommandCount",
+        "{:?}",
+        run.records
+    );
+    assert_eq!(run.records[0]["count"], 0, "{:?}", run.records);
+
+    let counts: Vec<i64> = run
+        .of_kind("p4CommandCount")
+        .iter()
+        .map(|record| {
+            let count = record["count"].as_i64().expect("count 必须是整数");
+            assert!(count >= 0, "count 必须非负：{record}");
+            count
+        })
+        .collect();
+
+    assert!(
+        counts.len() > 1,
+        "这一轮至少起过一个 p4 进程（fstat / have 都要跑）：{counts:?}"
+    );
+    // 严格递增、每次正好加一：并发（三路查询、批次）下计数与事件上报串行化，
+    // 少发一次或两个线程共用一个编号都会在这里露出来。
+    for pair in counts.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1, "{counts:?}");
+    }
+
+    // summary 的最终数就是最后一条观测事件的值。
+    let summary = run.summary();
+    assert_eq!(
+        summary["p4Calls"].as_i64(),
+        counts.last().copied(),
+        "{summary}"
+    );
+}
+
+/// **外部观测**：把 `P4_EXE` 指向一个转发 shim，它每次被调用先往日志写一行、再把参数原样
+/// 交给真实 p4。跑完之后数日志行数，就是这一轮**真正启动过**的 p4 进程数——它与 p4delta
+/// 自报的 `p4Calls` 相互独立，用的不是同一个计数器，所以：
+///
+/// - 漏掉任何一处计数插桩（charset / process / fstat 任一路），summary 会**小于**实际；
+/// - 任何一处重复记账，summary 会**大于**实际。
+///
+/// 上一条用例只证明「事件与 summary 出自同一个计数器」，无论计数器本身漏记还是多记都照样
+/// 通过；这一条才是拿真实进程数当标尺的对拍。
+///
+/// 刻意**不**设 `P4COMMANDCHARSET`：只有这样 `init_p4_encoding` 才会真的起一个 `p4 set` 去
+/// 探测字符集——那是生产路径里 charset 那一处 spawn，沙箱平时为了少起进程把它跳过了。于是
+/// 这条用例同时盖到 charset / fstat / have 三处，并逐一断言三者都真的现过身。
+#[test]
+fn the_summary_count_matches_the_p4_processes_actually_started() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        eprintln!("skipping: rustc is not available to build the p4 shim");
+        return;
+    };
+    offline_drift(&sandbox);
+
+    // 日志落在实例目录里，随实例一起清掉；先删掉，免得看到上一轮的残留。
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+
+    let mut command = sandbox.cli();
+    // 去掉这一个变量，字符集探测那一步就会起 `p4 set`（理由见用例文档）。
+    command.env_remove("P4COMMANDCHARSET");
+    command.env("P4_EXE", &shim.path);
+    command.env("P4DELTA_SHIM_LOG", &log);
+    command.env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe());
+    command.args(["--json", "--no-scope-file", "."]);
+
+    let output = command.output().expect("run tool");
+    assert!(
+        output.status.success(),
+        "run failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+    let records: Vec<Value> = stdout
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|error| panic!("stdout 里混进了非 JSON 行: {line:?} ({error})"))
+        })
+        .collect();
+
+    let calls: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+
+    // 三条生产路径都得在这儿现过身，否则这条用例证明不了它的覆盖面。
+    for subcommand in ["set", "fstat", "have"] {
+        assert!(
+            calls
+                .iter()
+                .any(|line| line.split_whitespace().any(|token| token == subcommand)),
+            "这一轮没有真的启动过 `p4 {subcommand}`：{calls:?}"
+        );
+    }
+
+    let summary = records.last().expect("记录流里至少有一条 summary");
+    assert_eq!(summary["kind"], "summary", "{summary}");
+
+    // 标尺对拍：自报的最终数 == 真实启动数。
+    assert_eq!(
+        summary["p4Calls"].as_u64(),
+        Some(calls.len() as u64),
+        "p4Calls 与实际启动的 p4 进程数对不上\ncalls: {calls:?}\n{summary}"
+    );
+
+    // 逐次事件（去掉初始化那条 `count:0`）同样该恰好覆盖每一次真实启动。
+    let events = records
+        .iter()
+        .filter(|record| record["kind"] == "p4CommandCount")
+        .count();
+    assert!(events >= 1, "至少该有初始化那条 count:0：{:?}", records);
+    assert_eq!(
+        events - 1,
+        calls.len(),
+        "p4CommandCount 事件数（去掉初始化）与实际启动数对不上\ncalls: {calls:?}"
+    );
+}
+
 /// 三组 `revert_*` 是 `p4 revert -a` 的语义，不在 `p4 reconcile -a -e -d` 里。
 /// 默认档报出来，`--no-revert-groups` 摘掉——摘掉之后必须与原生**逐行**对齐，
 /// 那是这个开关存在的全部理由（编辑器要在两条引擎之间做集合比较）。
@@ -310,14 +462,16 @@ fn entries_that_match_nothing_are_reported_as_unmatched() {
     assert_eq!(summary["counts"], json!({}));
 
     // 落空的入口逐条报出来：消费方要按路径判断哪些被认定为空，而不是只看退出码。
-    assert_eq!(run.records[0]["kind"], "unmatched");
+    // 不按下标取——记录流前面还有 `p4CommandCount` 这类观测事件（见下列用例）。
+    let unmatched = run.of_kind("unmatched");
+    assert_eq!(unmatched.len(), 1, "{:?}", run.records);
     assert!(
-        run.records[0]["path"]
+        unmatched[0]["path"]
             .as_str()
             .expect("path 必须有")
             .ends_with("gone.txt"),
         "{}",
-        run.records[0]
+        unmatched[0]
     );
 }
 

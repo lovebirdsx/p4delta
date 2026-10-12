@@ -6,9 +6,10 @@
 use std::borrow::Cow;
 use std::env;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::OnceLock;
 
-use crate::json::sayln;
+use crate::json::{count_p4_command, sayln};
 use encoding_rs::{Encoding, UTF_8, WINDOWS_1252};
 
 /// p4 写输出用的字符集，启动时解析一次。
@@ -157,6 +158,21 @@ struct P4SetCharsets {
     command_charset: Option<String>,
 }
 
+/// 起一个 p4 进程、收下它的输出，成功启动就记一次 P4 调用（见 [`count_p4_command`]）。
+///
+/// 用 `spawn()` + `wait_with_output()` 而不是 `Command::output()`：后者的 `Err` 分不清
+/// 「进程没起来」与「起来了但收输出时出错」，而账上只该记真正启动过的那一次。三个 stdio
+/// 的接法与 `output()` 保持一致（stdin 关掉、两条输出管道收下来）。
+fn run_p4_capturing(mut command: std::process::Command) -> Option<std::process::Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().ok()?;
+    count_p4_command();
+    child.wait_with_output().ok()
+}
+
 /// 从 `p4 set` 读回字符集。这样配的值在注册表里而不在环境变量里，`env::var` 看不到。
 fn query_p4_set_charsets(cwd: &Path) -> P4SetCharsets {
     // 定位不到 p4 与起不来是同一件事，都退回默认字符集——这里不该打断整轮，
@@ -165,20 +181,18 @@ fn query_p4_set_charsets(cwd: &Path) -> P4SetCharsets {
         return P4SetCharsets::default();
     };
 
-    let output = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .arg("set")
         .current_dir(cwd)
         // p4 会用继承来的 PWD 而不是真实 cwd 找配置文件，必须清掉。
-        .env_remove("PWD")
-        .output();
+        .env_remove("PWD");
 
-    let Ok(output) = output else {
+    let Some(output) = run_p4_capturing(command) else {
         return P4SetCharsets::default();
     };
 
-    let text = String::from_utf8_lossy(&output.stdout);
-
-    parse_p4_set_charsets(&text)
+    parse_p4_set_charsets(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// 从 `p4 set` 输出里取两个字符集变量。
@@ -330,13 +344,14 @@ pub(crate) fn parse_p4_set_value(text: &str, name: &str) -> Option<String> {
 pub(crate) fn query_p4_variable(cwd: &Path, name: &str) -> Option<String> {
     let program = crate::locate::p4_exe().ok()?;
 
-    let output = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .arg("set")
         .current_dir(cwd)
         // p4 会用继承来的 PWD 而不是真实 cwd 找配置文件，必须清掉。
-        .env_remove("PWD")
-        .output()
-        .ok()?;
+        .env_remove("PWD");
+
+    let output = run_p4_capturing(command)?;
 
     // 失败时 stdout 可能只有半截内容，宁可不剪枝也不能拿它做判断。
     if !output.status.success() {

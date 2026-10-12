@@ -62,6 +62,9 @@ pub(crate) const READ_BUFFER_SIZE: usize = 128 * 1024;
 pub fn run(mut options: Options) -> Result<()> {
     json::set_json_mode(options.json);
     json::set_force(options.sync && options.force);
+    // 在 `run_once` 之前清零并上报 `count:0`：`run_once` 的第一步（字符集探测）就可能起一个
+    // `p4 set` 进程，晚一步第一条观测事件就从 1 起算了。
+    json::reset_p4_command_count();
     let start_time = Instant::now();
 
     let result = run_once(&mut options);

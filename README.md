@@ -547,8 +547,9 @@ P4V 那边的 prompt 留空仍然落在 `No path given` 上。范围语法见「
 
 ```console
 $ p4delta --json -l .            # 预演，stdout 只有 JSONL
+{"kind":"p4CommandCount","count":0}
 {"kind":"file","mode":"open","class":"edit","action":"edit","depotFile":"//depot/main/a.txt","clientFile":"//ws/a.txt","rev":"3","applied":false}
-{"kind":"summary","mode":"open","ok":true,"applied":false,"total":1,"counts":{"edit":1},"scopeMatched":1,"unmatched":0,"elapsedMs":12,"reason":null}
+{"kind":"summary","mode":"open","ok":true,"applied":false,"total":1,"counts":{"edit":1},"p4Calls":5,"scopeMatched":1,"unmatched":0,"elapsedMs":12,"reason":null}
 ```
 
 给编辑器 / 脚本用的附加开关：
@@ -563,6 +564,10 @@ $ p4delta --json -l .            # 预演，stdout 只有 JSONL
 两条消费方最该记住的规矩：**`kind:"summary"` 是「这一轮有结论」的唯一凭据**（进程崩溃或被
 `kill` 就没有它），以及 **`ok:false` 的记录流永远是残缺的**——只有 `ok:true` 时才能把记录
 当成全集。
+
+`kind:"p4CommandCount"` 是一份观测：每成功启动一个原生 p4 进程就上报一次累计值（初始化先发
+`count:0`，summary 的 `p4Calls` 收尾给最终数），编辑器据此把「这一次操作实际起了多少次 p4」
+记进同步历史。它**不是**操作结论，`count` 只增；没有 summary 时最后一条只是已观测到的下界。
 
 ## 已知问题
 

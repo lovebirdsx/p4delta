@@ -47,6 +47,10 @@
    不带 `--force`）**不接受**这两个开关：那条路的范围就是 client view、每个动作由原生判定，
    一次性的排除会把"原生会做什么"换成另一个问题（持久边界写进 `.p4delta-scope`，那份排除
    对普通同步照样生效）。
+9. **`kind:"p4CommandCount"` 是观测，不是结论**：`count` 只增，初始化必发 `count:0`（坐在任何
+   p4 启动之前），summary 的 `p4Calls` 是这一轮的最终累计数。消费方别把它当操作成败的判据；
+   进程崩溃 / 被 `kill` 时（没有 summary）最后一条事件只是**已观测到的下界**，真实调用数可能
+   更多（见「`kind:"p4CommandCount"`」）。
 
 ## 记录
 
@@ -193,7 +197,7 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 ### `kind:"summary"`
 
 ```json
-{"kind":"summary","mode":"open","ok":true,"applied":false,"total":340,"counts":{"add":100,"edit":200,"delete":40},"scopeMatched":1,"unmatched":0,"elapsedMs":249,"reason":null}
+{"kind":"summary","mode":"open","ok":true,"applied":false,"total":340,"counts":{"add":100,"edit":200,"delete":40},"p4Calls":12,"scopeMatched":1,"unmatched":0,"elapsedMs":249,"reason":null}
 ```
 
 | 字段 | 说明 |
@@ -204,6 +208,7 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 | `applied` | 是否带 `-a` 真跑了 |
 | `total` | `counts` 各值之和。口径是**「δ 给出逐文件动作的文件数」**：转交出去又没有逐条翻译的那批不进 `counts`，所以 clean / sync 的预演与应用、open 的应用都不含它；open 的预演例外（逐条翻译，见「`class:"handoff"` 变体」），那批进 `counts` |
 | `counts` | `class` → 数量；**只出现非零项**，缺席即 0。`handoff` 永不出现（它没有逐文件动作，`class:"handoff"` 的记录也从来不是「一个动作」） |
+| `p4Calls` | 这一轮**成功启动**的原生 p4 进程数（累计观测，口径见「`kind:"p4CommandCount"`」）。它是观测值，不是成败判据 |
 | `scopeMatched` | 匹配到东西的入口数；**普通同步是 `null`**——判定权在原生手里，「入口匹配了几个」这个结论它拿不到。`null` 是「不知道」，不是 0 |
 | `unmatched` | 落空入口数；普通同步恒为 0，理由同上 |
 | `elapsedMs` | 整轮墙钟毫秒 |
@@ -211,6 +216,31 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 
 不进 `counts` 的还有：落空的入口（走 `unmatched`）、归档版本与从没同步过的文件（见「已知
 差异」，它们只有 stderr 上的汇报）。
+
+### `kind:"p4CommandCount"`
+
+```json
+{"kind":"p4CommandCount","count":7}
+```
+
+每次 p4delta **成功启动**一个原生 p4 进程就上报一次累计值。它是一份**观测**，不是这一轮的
+操作结论——结论只认 summary（硬条款 1）。编辑器把每轮的最终值记进同步历史，就能看出同一次
+操作向服务端压了多少次往返。
+
+| 口径 | 说明 |
+|---|---|
+| 起点 | 任何 p4 启动**之前**先发一条 `count:0`。它一定排在记录流最前面——字符集探测那一步就可能起一个 `p4 set`，晚一步第一条就从 1 起算 |
+| 计什么 | 每一次 `spawn()` 成功算一次。分批 / 重试各算各的：一次调用一个进程，事件粒度与之一一对应 |
+| 不计什么 | 起不来的进程（没装、定位到的文件被删、不可执行）。它一个请求都没发出去 |
+| 失败的命令 | 命令本身跑失败（退出码非零、逐文件报错）**照样算**：进程已经起来了 |
+| p4 内部子请求 | 不算。p4 自己再发的服务端往返、它 fork 的东西从外面数不出来，报一个估出来的数比不报更糟 |
+
+`count` 是非负整数，且**严格递增**：计数更新与事件上报在同一把锁里做完（`src/json.rs` 的
+`record_p4_command`），多路并发（三路查询、批次）下不会出现「先发的 count 比后发的小」。
+消费方取最后一个（等价于取 max）就是当前累计数。
+
+没有 summary（进程崩溃 / 被 `kill`）时，**最后一条事件只是「已经观测到的下界」**——真实调用数
+可能更多。summary 里另有一个最终数（`p4Calls`，见上）正是为此：有它才是完整的。
 
 ### `kind:"progress"`（stderr）
 

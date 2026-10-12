@@ -499,6 +499,66 @@ pub(crate) fn set_reason(reason: &'static str) {
     LEDGER.lock().unwrap().reason = Some(reason);
 }
 
+// ---- P4 调用计数 ----
+
+/// 本轮实际**成功启动**的原生 p4 进程数。summary 的 `p4Calls` 读它，`kind:"p4CommandCount"`
+/// 事件逐次上报它。账目口径（每一条都对消费方承诺过，见 `docs/json-contract.md`）：
+///
+/// - 只在 `spawn()` 成功之后记一次：起不来的进程（没装、定位到的文件被删、不可执行）不占账，
+///   它一个字节的请求都没发出去；
+/// - 命令本身跑失败了照样算：进程已经起来、服务端往返与进程开销都真实发生过；
+/// - 分批 / 重试各算各的：每一次 `spawn` 都是一次调用，事件的粒度与它一一对应；
+/// - **不**统计 p4 内部再发的子请求（服务端往返、p4 自己 fork 的东西）：那些从外面数不出来，
+///   报一个估出来的数比不报更糟。
+///
+/// 它是一份**观测**，不是这一轮的操作结论——结论只认 summary（见 `docs/json-contract.md`）。
+static P4_COMMAND_COUNT: Mutex<usize> = Mutex::new(0);
+
+/// 清零并上报 `count:0`。**必须在任何 p4 启动之前**调用：p4 子进程在字符集探测（`p4 set`）
+/// 那一步就可能起来，晚一步第一条观测事件就从 1 起算了。
+///
+/// 每轮 `run()` 调一次，好让同一个进程里跑多轮时每轮各自从 0 起算——与 [`set_json_mode`] /
+/// [`set_force`] 那几项全局状态是同一套约定。
+pub(crate) fn reset_p4_command_count() {
+    let count = {
+        let mut count = P4_COMMAND_COUNT.lock().unwrap();
+        *count = 0;
+        *count
+    };
+    report_p4_command_count(count);
+}
+
+/// 记一次成功启动的 p4 进程并上报新的累计值。调用点见 [`crate::p4::process`] 与
+/// [`crate::p4::fstat`]，以及 [`crate::charset`] 里那两条阻塞式的 `p4 set`。
+pub(crate) fn count_p4_command() {
+    record_p4_command(&P4_COMMAND_COUNT);
+}
+
+/// 「改计数 + 发事件」的临界区：锁一直持到事件写完。
+///
+/// 多路并发（`futures::join!` 的三路查询、批次并发）下唯一会让消费方读错的方向是「先发的
+/// count 比后发的小」；串行化之后事件流里的 count 严格递增，消费方直接取最后一个（等价于取
+/// max）就是最终数，不必自己去乱序里挑。
+///
+/// 参数是**传进来的那把锁**而不是直接摸全局：单测因此能在一把局部计数器上钉住并发语义
+/// （多线程同时记账不丢更新），不必去动进程级的 [`P4_COMMAND_COUNT`]——同一个测试二进制里
+/// 别处的用例也会 spawn p4，动全局就会互相踩。
+fn record_p4_command(counter: &Mutex<usize>) {
+    // 锁活到函数末尾：`report_p4_command_count` 在锁内执行，编号与事件因此不会错位。
+    let mut count = counter.lock().unwrap();
+    *count += 1;
+    report_p4_command_count(*count);
+}
+
+/// 一条累计观测事件。只在 `--json` 下发：文本模式下没人读它（事件与 [`emit_summary`] 都
+/// 只在 JSON 模式下发）。
+fn report_p4_command_count(count: usize) {
+    if !is_json() {
+        return;
+    }
+    emit(&json!({"kind": "p4CommandCount", "count": count}));
+}
+
 /// 进度提示。只走 stderr，且**只许被当成提示**——结论只认 summary。
 pub(crate) fn emit_progress(phase: &str, message: Option<&str>) {
     if !is_json() {
@@ -529,6 +589,10 @@ pub(crate) fn emit_summary(mode: Mode, ok: bool, applied: bool, elapsed_ms: u128
     if !is_json() {
         return;
     }
+
+    // 先取走累计数再去拿 LEDGER 那把锁：两把锁的获取顺序固定成「先计数、后账目」，别处
+    // （[`record_p4_command`]）只拿计数锁，栈上不会出现反向的等待。
+    let p4_calls = *P4_COMMAND_COUNT.lock().unwrap();
 
     let ledger = LEDGER.lock().unwrap();
     let total: usize = ledger.counts.iter().map(|(_, count)| count).sum();
@@ -564,6 +628,7 @@ pub(crate) fn emit_summary(mode: Mode, ok: bool, applied: bool, elapsed_ms: u128
         "force": FORCE_MODE.load(Ordering::Relaxed),
         "total": total,
         "counts": counts,
+        "p4Calls": p4_calls,
         "scopeMatched": scope_matched,
         "unmatched": ledger.unmatched,
         "elapsedMs": elapsed_ms,
@@ -815,5 +880,31 @@ mod tests {
         assert_eq!(PHASES[PHASES.len() - 1], "done");
         // 表里的顺序就是 step 的顺序：调换表项会静默改掉消费方看到的进度。
         assert_eq!(PHASES, ["start", "analyze", "digest", "report", "done"]);
+    }
+
+    /// 计数与编号在同一把锁里发出：多线程同时记账时既不丢更新，也不会两个线程拿到同一个
+    /// 编号。它是「事件流里的 count 严格递增」的前提——消费方据此直接取最后一个当最终数。
+    ///
+    /// 用一把**局部**计数器而不是进程级的 [`P4_COMMAND_COUNT`]：同一个测试二进制里别处的
+    /// 用例也会 spawn p4（那会去动全局），在全局上断言会和它们互相踩。
+    #[test]
+    fn concurrent_p4_calls_never_lose_or_repeat_a_count() {
+        let counter = Mutex::new(0usize);
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..250 {
+                        record_p4_command(&counter);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            *counter.lock().unwrap(),
+            2000,
+            "丢更新会让累计数偏小；两个线程共用一个编号会让它偏大"
+        );
     }
 }

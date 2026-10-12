@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 mod p4d;
+mod p4shim;
 mod paths;
 mod seed;
 mod template;
@@ -32,6 +33,10 @@ use std::time::{Duration, SystemTime};
 use p4d::P4dServer;
 use paths::InstancePaths;
 use tools::Tools;
+
+// 只有引入它的那个测试 crate 用得上，其余 tests/*.rs 各自编译本模块时会报未使用。
+#[allow(unused_imports)]
+pub use p4shim::P4Shim;
 
 /// 起一个沙箱；找不到 p4d/p4 时返回 `None`，调用方据此打印一行
 /// `skipping:` 后跳过。
@@ -143,6 +148,12 @@ impl Sandbox {
     /// 本实例的 client 名。一实例一份，写进 view 与缓存文件名。
     pub fn client(&self) -> &str {
         &self.client
+    }
+
+    /// 真实 p4 可执行文件的路径。转发 shim 用例把它交给 shim（`P4DELTA_SHIM_REAL_P4`）去转发，
+    /// 也是 `Sandbox::p4*` 这套独立取证用的那一份。
+    pub fn p4_exe(&self) -> &Path {
+        &self.tools.p4
     }
 
     /// 本实例的目录，所有沙箱数据都在它下面。
