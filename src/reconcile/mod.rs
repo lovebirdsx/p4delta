@@ -40,7 +40,7 @@ use crate::prune::PrunePlan;
 use crate::scope::{EntryKind, ExcludeSet, Scope};
 use crate::workspace::{gather_workspace, map_new_paths, rescan_tracked_pruned_dirs};
 
-/// 一轮 reconcile 的编排：拉齐 fstat / 工作区 / have 三路数据（`--to` 的目标快照另查一次）、
+/// 一轮 reconcile 的编排：拉齐 fstat / 工作区 / have / `--to` 目标快照四路数据、
 /// 分析、算摘要，最后把变更下发给 p4。多个范围入口合并成这一轮——一次操作、一个视图。
 pub(crate) async fn reconcile_scope(
     options: &Options,
@@ -69,12 +69,13 @@ pub(crate) async fn reconcile_scope(
 
     let specs = scope.query_specs(None);
 
-    // 三路并发：depot 状态、本地扫描、have 时间戳。
+    // 四路并发：depot 状态、本地扫描、have 时间戳、`--to` 的目标快照。
     let fetch_start = Instant::now();
-    let (maybe_depot, maybe_workspace, maybe_have) = futures::join!(
+    let (maybe_depot, maybe_workspace, maybe_have, maybe_target) = futures::join!(
         query_depot_state(options, work_dir, &specs),
         gather_workspace(options, scope),
-        run_p4_have(options, work_dir, &specs)
+        run_p4_have(options, work_dir, &specs),
+        query_target_snapshot(options, work_dir, &specs)
     );
 
     // 第二项是 head 目标快照，只有 sync 且没有 `--to` 时才建（`head_action` 会被 fstat 的
@@ -82,8 +83,9 @@ pub(crate) async fn reconcile_scope(
     let (mut depot, head_target): (DepotState, Option<TargetMap>) = maybe_depot?;
     let (mut workspace, prune_plan): (WorkspaceState, PrunePlan) = maybe_workspace?;
     let have_records: HashMap<String, HaveRecord> = maybe_have?;
+    let target_snapshot: Option<TargetSnapshot> = maybe_target?;
 
-    // 三路是同一次并发，耗时合起来报一条；head 的目标表就是搭这趟顺风车取回来的，
+    // 四路是同一次并发，耗时合起来报一条；head 的目标表就是搭这趟顺风车取回来的，
     // 所以它的规模也并进这条。
     say_phase(
         "depot-have",
@@ -99,22 +101,16 @@ pub(crate) async fn reconcile_scope(
         Some(fetch_start.elapsed().as_secs_f32()),
     );
 
-    // `--to <CL>` 的目标快照。只依赖范围与 CL，但刻意**串行**排在三路之后：它自己会发起
-    // 一批 fstat，叠进那三路就是把范围查询的并发整体抬高一层（取舍见 docs/why-faster.md）。
-    // 放在这里（补查之前）是必需的——它决定哪些记录真的要内容基线（`BaselineScope::AtTarget`）。
-    let at_target = match (options.sync, options.to) {
-        (true, Some(changelist)) => {
-            let start_time = Instant::now();
-            let target = run_p4_fstat_at_revision(options, work_dir, changelist, &specs).await?;
-            say_phase(
-                "target",
-                &format!("{} file(s) at changelist {changelist}", target.len()),
-                Some(start_time.elapsed().as_secs_f32()),
-            );
-            Some(target)
-        }
-        _ => None,
-    };
+    // `--to <CL>` 的目标快照是并发的第四路，它的 [diag] 行仍排在三路那条之后打印：
+    // 行的顺序是对拍基准的一部分。
+    if let Some((target, changelist, seconds)) = target_snapshot.as_ref() {
+        say_phase(
+            "target",
+            &format!("{} file(s) at changelist {changelist}", target.len()),
+            Some(*seconds),
+        );
+    }
+    let at_target = target_snapshot.map(|(target, _, _)| target);
 
     // 历史基线补查：把 `head_rev != have_rev` 的记录的内容字段换成 have 版本的，分析层
     // 拿它们当与本地文件比对的基线。sync 只为「摘要当真要比对的那批」发查询（目标表此刻
@@ -606,6 +602,42 @@ pub(crate) async fn reconcile_scope(
     }
 
     Ok(())
+}
+
+/// `--to <CL>` 目标快照那一路的结果：目标表、changelist、查询耗时。
+type TargetSnapshot = (TargetMap, u32, f32);
+
+/// `--to <CL>` 的目标快照，连同它的 changelist 与耗时——`[diag] target` 那一行要用。
+///
+/// 它只依赖范围与 CL，与另外三路没有先后关系，所以并进同一轮 `join!`：串行放在三路之后
+/// 会让这 568 万条记录的查询整段暴露在墙钟上（实测 60-62s），并发的服务端礼节取舍见
+/// `docs/why-faster.md`。
+///
+/// 它仍然在**基线补查之前**完成（`join!` 一返回就有结果），这一点是必需的：目标表决定
+/// 哪些记录真的要内容基线（`BaselineScope::AtTarget`）。
+///
+/// 没有 `--to` 时返回 `None`——`--to` 只与 `--sync` 同时出现，由 clap 的 `requires` 保证。
+///
+/// 并发的代价要说清楚：另外三路里任意一路先失败时，这一路照旧会发出去（旧写法是排在其后，
+/// 那种情况下根本不会发），而且 `join!` 要等四路都结束才轮到调用方 `?` 报错——错误可能被
+/// 这条最贵的查询拖到它跑完。只是晚报一会儿，不影响结论，也不再改动任何状态。
+async fn query_target_snapshot(
+    options: &Options,
+    work_dir: &str,
+    specs: &[String],
+) -> Result<Option<TargetSnapshot>> {
+    let Some(changelist) = options.to.filter(|_| options.sync) else {
+        return Ok(None);
+    };
+
+    let start_time = Instant::now();
+    let target = run_p4_fstat_at_revision(options, work_dir, changelist, specs).await?;
+
+    Ok(Some((
+        target,
+        changelist,
+        start_time.elapsed().as_secs_f32(),
+    )))
 }
 
 /// 入口在 depot 与本地都找不到任何东西时提示一句：多半是路径拼错了。

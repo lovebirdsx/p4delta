@@ -37,6 +37,12 @@ pwsh -File scripts/test-benchmark.ps1
 
 1. **先剥离 `^... ` 开头的字段行做多重集比对**：`tr -d '\r' | grep '^\.\.\. ' | LC_ALL=C sort | md5sum`。这一组行的 md5 相同 = p4 返回的数据完全一致。行序会因并发而变（fstat 由多个子进程各写各的），所以先排序。
 2. **再看非 `...` 的结构性输出行**（`grep -v '^\.\.\. '`）：顺序稳定，可以逐行 diff，只允许计时行不同。
+   **例外是两组**：①本地扫描那一组——force 档是 `Collected …` / `[diag] scan` / `Skipping ignore
+   filtering in forced sync mode.` / `[diag] ignore`，非 force 档是 `Filtering workspace files.` /
+   `Filtered out …` / `[diag] ignore`；②`--to` 的目标快照那一组——`Requesting depot state for
+   changelist N.` / `Received … records for changelist N in …`。扫描组与查询行（`Received … fstat
+   records in …`、`Query complete in …`）的先后取决于谁先跑完（扫盘跑在阻塞线程上、查询在并发读流），
+   目标快照组则整组前移到首轮 poll。这两组连同查询行按多重集比，其余结构行照旧逐行 diff。
 3. **计时行归一化**：`sed 's/[0-9.]* seconds/<T> seconds/'` 之后再比。
 
 两个会得出错误结论的陷阱：

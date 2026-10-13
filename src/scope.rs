@@ -96,7 +96,10 @@ fn directory_file_spec(path: &str) -> String {
 ///
 /// 它同时喂给两个消费方（depot 记录过滤与扫盘跳过），两侧口径必须一致——
 /// 只做一侧会让排除目录里的已跟踪文件被误判成「本地删除」。
-#[derive(Debug, Default)]
+///
+/// `Clone` 是给扫盘用的：遍历跑在阻塞线程上，闭包要 `'static`，只能把这份名单复制过去
+/// （见 `workspace::gather_workspace`）。
+#[derive(Debug, Default, Clone)]
 pub(crate) struct ExcludeSet {
     dir_keys: Vec<String>,
     file_keys: HashSet<String>,

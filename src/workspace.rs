@@ -5,6 +5,7 @@ use std::fs;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
+use async_global_executor as task;
 use humansize::{BINARY, format_size};
 use walkdir::WalkDir;
 
@@ -551,6 +552,25 @@ pub(crate) async fn map_new_paths(
     Ok(apply_where(files, &parse_where_lines(&lines)))
 }
 
+/// 把同步扫盘交给阻塞线程池。
+///
+/// 遍历整段没有 await 点（`WalkDir` 是同步迭代器），留在执行器线程上会让同一轮
+/// `futures::join!` 里的 depot 查询一起饿死：那几路只在被 poll 时才读管道，p4 子进程
+/// 填满管道后原地阻塞。冷缓存那一轮实测到的「三路并发退化成串行」就是这样——遍历独占
+/// 执行器的 301s 里，`p4 fstat` 子进程的 CPU 时间纹丝不动、`p4 -G have` 连进程都没起，
+/// 两条查询真正的成本（37s / 13s）全被推到遍历之后才暴露在墙钟上。
+/// `prune::decide_directory_pruning` 的预扫描是同一类遍历，也走 `task::spawn_blocking`。
+/// 取舍与实测见 `docs/why-faster.md`。
+///
+/// 闭包要 `'static`，所以调用方把名单按所有权复制过去（范围入口与排除项都很小）。
+async fn off_executor<T, F>(walk: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    task::spawn_blocking(walk).await
+}
+
 /// 扫描工作区，返回收集到的文件状态与本次实际应用的剪枝计划。
 pub(crate) async fn gather_workspace(
     options: &Options,
@@ -562,8 +582,13 @@ pub(crate) async fn gather_workspace(
     let roots = scope.directory_roots();
     let plan = plan_directory_pruning(options, &scope.work_dir, &roots, &scope.excludes).await?;
 
-    let (files, num_dirs, total_size) =
-        collect_scope_files(&scope.includes, &plan.dirs, &scope.excludes)?;
+    let (files, num_dirs, total_size) = off_executor({
+        let includes = scope.includes.clone();
+        let skip_dirs = plan.dirs.clone();
+        let excludes = scope.excludes.clone();
+        move || collect_scope_files(&includes, &skip_dirs, &excludes)
+    })
+    .await?;
 
     if options.verbose {
         for file in &files {
@@ -716,7 +741,6 @@ mod tests {
     use super::*;
     use crate::test_util::*;
 
-    use async_global_executor as task;
     use clap::Parser;
 
     use crate::model::{DepotFileRecord, FileAction};
@@ -1054,6 +1078,54 @@ mod tests {
         assert!(
             files.iter().any(|file| file.path_lower == link_key),
             "a symlink must be part of the workspace, or phase one reports it as deleted"
+        );
+    }
+
+    /// 全量扫盘整段没有 await 点，必须交给阻塞线程：留在 `block_on` 那条线程上，同一轮
+    /// `futures::join!` 里的 depot 查询会被它整段饿死（那几路只在被 poll 时才读管道），
+    /// 「三路并发」退化成串行。冷缓存那一轮实测：遍历独占执行器 301s，期间 `p4 fstat`
+    /// 子进程的 CPU 时间纹丝不动、`p4 -G have` 连进程都没起，两条查询真正的成本
+    /// （37s / 13s）全被推到遍历之后暴露在墙钟上（见 `docs/why-faster.md`）。
+    ///
+    /// 判据是「第一次 poll 必然 Pending」：poll 就发生在 `spawn_blocking` 的同一次调用里，
+    /// 两千个条目的遍历不可能在那几微秒内跑完；内联实现则会一路跑完并 Ready。
+    #[test]
+    fn the_scan_leaves_the_executor_thread_free() {
+        let tree = TempTree::new("scan-off-executor");
+        for index in 0..2000 {
+            tree.file(&format!("bulk/{index}.txt"), "x");
+        }
+
+        // force 档：剪枝决策直接回退，这一步不碰 p4，用例不需要服务器。
+        let options = Options::parse_from(["p4delta", "--sync", "--force", "-w", "ws"]);
+        let root = tree.root.to_string_lossy().into_owned();
+        let scope = Scope {
+            includes: vec![ScopeEntry::new(root.clone(), EntryKind::Directory)],
+            excludes: ExcludeSet::default(),
+            work_dir: root,
+        };
+
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+
+        // 前提也钉住：剪枝决策在扫盘之前、且首轮就 Ready。它哪天变成会挂起的，下面的
+        // Pending 就不再说明「扫盘离开了线程」——那一步先在这里红，不会被静默带过。
+        let roots = scope.directory_roots();
+        let mut pruning = std::pin::pin!(plan_directory_pruning(
+            &options,
+            &scope.work_dir,
+            &roots,
+            &scope.excludes
+        ));
+        assert!(
+            pruning.as_mut().poll(&mut context).is_ready(),
+            "前提变了：force 档的剪枝决策不该挂起，否则本条判据失去意义"
+        );
+
+        let mut scan = std::pin::pin!(gather_workspace(&options, &scope));
+        assert!(
+            scan.as_mut().poll(&mut context).is_pending(),
+            "全量扫盘必须跑在阻塞线程上：内联跑会把同轮的 depot 查询饿死"
         );
     }
 }

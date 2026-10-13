@@ -9,6 +9,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
+use async_global_executor as task;
 use walkdir::WalkDir;
 
 use crate::charset::query_p4_variable;
@@ -401,7 +402,16 @@ pub(crate) async fn decide_directory_pruning(
     }
 
     // 嵌套的 .p4ignore 只靠 `p4 ignores -v` 是看不出来的，必须自己预扫描。
-    let prescan = prescan_directories(roots, excludes)?;
+    //
+    // 这一趟也是同步全树遍历（百万目录量级），与 `workspace::gather_workspace` 的扫盘同理：
+    // 留在执行器线程上会把同一轮 `futures::join!` 里的 depot / have / 目标快照几路一起饿死
+    // （那几路只在被 poll 时才读管道）。open / clean 走的就是这条路径，与 force 档的扫盘
+    // 是同一次修复的两半，取舍见 `docs/why-faster.md`。
+    let prescan = {
+        let roots = roots.to_vec();
+        let excludes = excludes.clone();
+        task::spawn_blocking(move || prescan_directories(&roots, &excludes)).await?
+    };
     if prescan.nested_ignore {
         return Ok(PrunePlan::fallback("nested .p4ignore found"));
     }
@@ -481,7 +491,6 @@ mod tests {
     use std::env;
     use std::path::{Path, PathBuf};
 
-    use async_global_executor as task;
     use clap::Parser;
 
     use crate::charset::parse_p4_set_value;
