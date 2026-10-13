@@ -5,22 +5,41 @@
 //! `P4DELTA_SHIM_REAL_P4`，三条 stdio 与退出码都透传——这样 p4delta 看起来就像在直接调 p4。
 //!
 //! 日志一行 = 一次真实的 p4 进程启动，是与 p4delta 自报计数相互独立的观测。
+//!
+//! 故障注入：`P4DELTA_SHIM_FAULT_COMMAND` 给一个命令名，命中那次调用就**不转发**，改为按
+//! `P4DELTA_SHIM_FAULT_STDOUT` / `P4DELTA_SHIM_FAULT_STDERR` 输出并以 0 退出。它模拟的是
+//! 「p4 起来了、退出码 0，但输出没有可用裁决」这一类最危险的失败形态——正是删除保护必须
+//! 稳住的那些。
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn main() {
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+
     if let Some(log) = std::env::var_os("P4DELTA_SHIM_LOG") {
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log)
         {
-            let args: Vec<String> = std::env::args_os()
-                .skip(1)
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect();
             let _ = writeln!(file, "{}", args.join(" "));
+        }
+    }
+
+    // 按「任意一个参数等于命令名」命中，与用例读日志时的判据一致：p4 的全局选项
+    // （`-G`、`-Mj -Ztag`、`-x - -b N`）会排在命令名前面。
+    if let Some(fault) = std::env::var_os("P4DELTA_SHIM_FAULT_COMMAND") {
+        let fault = fault.to_string_lossy().into_owned();
+        if args.iter().any(|arg| *arg == fault) {
+            print!("{}", std::env::var("P4DELTA_SHIM_FAULT_STDOUT").unwrap_or_default());
+            eprint!("{}", std::env::var("P4DELTA_SHIM_FAULT_STDERR").unwrap_or_default());
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            std::process::exit(0);
         }
     }
 

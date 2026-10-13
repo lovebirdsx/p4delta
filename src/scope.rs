@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::cli::Options;
-use crate::json::sayln;
+use crate::json::{P4Command, sayln};
 use crate::p4::process::{FailureMode, run_p4_command_slice};
 use crate::path::{
     canonical_local_path, directory_key, escape_file_spec, local_path_key, normalize_local_path,
@@ -389,7 +389,17 @@ pub(crate) async fn resolve_client_root(options: &Options, client: &str) -> Resu
 
 async fn p4_info_client_root(options: &Options, work_dir: &str) -> Option<String> {
     let args: [&str; 3] = ["-Mj", "-Ztag", "info"];
-    match run_p4_command_slice(options, work_dir, &args, &[], false, FailureMode::Warn).await {
+    match run_p4_command_slice(
+        options,
+        work_dir,
+        P4Command::Info,
+        &args,
+        &[],
+        false,
+        FailureMode::Warn,
+    )
+    .await
+    {
         Ok(lines) => lines.iter().find_map(|line| {
             let record: serde_json::Value = serde_json::from_str(line).ok()?;
             record["clientRoot"]
@@ -417,8 +427,16 @@ struct ClientSpecRoots {
 /// 读不出来就没有第二来源。
 async fn read_client_spec_roots(options: &Options, work_dir: &str) -> Result<ClientSpecRoots> {
     let args: [&'static str; 2] = ["client", "-o"];
-    let lines =
-        run_p4_command_slice(options, work_dir, &args, &[], false, FailureMode::ExitCode).await?;
+    let lines = run_p4_command_slice(
+        options,
+        work_dir,
+        P4Command::Client,
+        &args,
+        &[],
+        false,
+        FailureMode::ExitCode,
+    )
+    .await?;
 
     let mut roots = ClientSpecRoots::default();
     let mut in_alt_roots = false;
@@ -646,8 +664,16 @@ async fn translate_depot_path(
 
     // 在哪个目录问 `p4 where` 决定了它认哪个 client：与这一轮其余查询同一处（固定启动 cwd），
     // 不再「命令行参数按调用者 cwd 问」——那会让连接的判据跟着参数走。
-    let result =
-        run_p4_command_slice(options, work_dir, &args, &paths, false, FailureMode::Warn).await?;
+    let result = run_p4_command_slice(
+        options,
+        work_dir,
+        P4Command::Where,
+        &args,
+        &paths,
+        false,
+        FailureMode::Warn,
+    )
+    .await?;
 
     for line in result {
         let record: serde_json::Value = serde_json::from_str(&line)?;

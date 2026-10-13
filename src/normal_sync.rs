@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::cli::Options;
-use crate::json::{FileRecord, Mode, count, emit_file, emit_progress, sayln};
+use crate::json::{FileRecord, Mode, P4Command, count, emit_file, emit_progress, sayln};
 use crate::p4::marshal::MarshalRecord;
 use crate::p4::process::{compute_batches, run_p4_marshal_batched, run_p4_marshal_slice};
 use crate::path::local_path_key;
@@ -242,8 +242,15 @@ pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<
     // 预演失败必须在任何写入之前挡住：p4 的答案不完整时，「要做什么」本身就是错的。
     emit_progress("preview", None);
     sayln!("   Asking p4 which files it would transfer.");
-    let preview =
-        run_p4_marshal_batched(options, work_dir, "sync -n", PREVIEW_ARGS, &specs).await?;
+    let preview = run_p4_marshal_batched(
+        options,
+        work_dir,
+        "sync -n",
+        P4Command::Sync,
+        PREVIEW_ARGS,
+        &specs,
+    )
+    .await?;
     if !preview.failures.is_empty() {
         bail!(
             "Failed to preview the sync:\n  {}",
@@ -406,7 +413,15 @@ async fn opened_candidates(
     let encoding = crate::charset::p4_encoding();
     let specs = scope.query_specs(None);
 
-    let opened = run_p4_marshal_batched(options, work_dir, "opened", OPENED_ARGS, &specs).await?;
+    let opened = run_p4_marshal_batched(
+        options,
+        work_dir,
+        "opened",
+        P4Command::Opened,
+        OPENED_ARGS,
+        &specs,
+    )
+    .await?;
     if !opened.failures.is_empty() {
         bail!(
             "Failed to list the opened files:\n  {}",
@@ -442,8 +457,15 @@ async fn opened_candidates(
         })
         .collect();
 
-    let fstat =
-        run_p4_marshal_batched(options, work_dir, "fstat", FSTAT_ARGS, &target_specs).await?;
+    let fstat = run_p4_marshal_batched(
+        options,
+        work_dir,
+        "fstat",
+        P4Command::Fstat,
+        FSTAT_ARGS,
+        &target_specs,
+    )
+    .await?;
     if !fstat.failures.is_empty() {
         bail!(
             "Failed to read the opened files' target revisions:\n  {}",
@@ -549,8 +571,15 @@ async fn apply(
 
     for range in compute_batches(&specs) {
         // 管道或解析损坏在这里变成 Err：直接向上抛，已经报告过的批次留在输出里。
-        let run =
-            run_p4_marshal_slice(options, work_dir, "sync", APPLY_ARGS, &specs[range]).await?;
+        let run = run_p4_marshal_slice(
+            options,
+            work_dir,
+            "sync",
+            P4Command::Sync,
+            APPLY_ARGS,
+            &specs[range],
+        )
+        .await?;
 
         let records = candidates_from(&run.records)?;
         let records = dedupe(records)?;

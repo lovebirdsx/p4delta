@@ -9,9 +9,10 @@
 //! 报告层最深处（`report_group`）、错误路径（`run` 的返回处）两处被读到，透传会把它们捅穿
 //! 大半个调用图。
 
+use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use serde_json::json;
 
@@ -151,6 +152,18 @@ macro_rules! sayln {
 }
 
 pub(crate) use sayln;
+
+/// 一条关键阶段诊断：耗时 + 数量，**即时**打一行（走 [`say_line`]：`--json` 下到 stderr）。
+///
+/// 前缀固定成 `[diag]`、字段顺序固定，便于 grep 与基准对拍。耗时由调用方给**已经量过的那一次**
+/// （各阶段自己那行「… in N seconds」用的就是它），这里只补那些原来没出现在输出里的数量
+/// （删除候选、忽略查询、跳过全盘过滤的文件……）。没有单独计时的阶段传 `None`。
+pub(crate) fn say_phase(phase: &str, detail: &str, seconds: Option<f32>) {
+    match seconds {
+        Some(seconds) => sayln!("   [diag] {phase}: {detail} ({seconds} seconds)."),
+        None => sayln!("   [diag] {phase}: {detail}."),
+    }
+}
 
 // ---- client 语法 ----
 
@@ -501,8 +514,64 @@ pub(crate) fn set_reason(reason: &'static str) {
 
 // ---- P4 调用计数 ----
 
-/// 本轮实际**成功启动**的原生 p4 进程数。summary 的 `p4Calls` 读它，`kind:"p4CommandCount"`
-/// 事件逐次上报它。账目口径（每一条都对消费方承诺过，见 `docs/json-contract.md`）：
+/// 一次 p4 调用的命令类别。
+///
+/// **固定枚举而不是自由字符串**：它是 `p4CommandCount.command` 与 summary 的
+/// `p4CallsByCommand` 的键，消费方按类目对账；自由字符串拼错一个字母就会凭空多出一个
+/// 类别，而对账的人只会看到两份莫名其妙的数。
+///
+/// 类别由**调用点**显式给出（见 `count_p4_command` 的调用处），不从 argv 反推：`p4 -Mj
+/// -Ztag reconcile -n` 的第一个参数是 `-Mj`，按 argv 归类会把转交路径整批记错。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum P4Command {
+    /// 字符集探测那条阻塞式 `p4 set`。
+    Set,
+    Have,
+    Fstat,
+    /// 普通同步里补查已打开文件的 `p4 opened`。
+    Opened,
+    /// `p4 ignores -i` / `p4 ignores -v`。
+    Ignores,
+    /// `p4 add -n`——非 ASCII 路径的忽略补判。
+    Add,
+    Edit,
+    Delete,
+    Revert,
+    Where,
+    Sync,
+    Reconcile,
+    Clean,
+    Info,
+    Client,
+}
+
+impl P4Command {
+    /// 契约里的类目名。改它就是改 `--json` 契约（见 `docs/json-contract.md`）。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            P4Command::Set => "set",
+            P4Command::Have => "have",
+            P4Command::Fstat => "fstat",
+            P4Command::Opened => "opened",
+            P4Command::Ignores => "ignores",
+            P4Command::Add => "add",
+            P4Command::Edit => "edit",
+            P4Command::Delete => "delete",
+            P4Command::Revert => "revert",
+            P4Command::Where => "where",
+            P4Command::Sync => "sync",
+            P4Command::Reconcile => "reconcile",
+            P4Command::Clean => "clean",
+            P4Command::Info => "info",
+            P4Command::Client => "client",
+        }
+    }
+}
+
+/// 本轮实际**成功启动**的原生 p4 进程数，按命令类别分开记。
+/// summary 的 `p4Calls` / `p4CallsByCommand` 读它，`kind:"p4CommandCount"` 事件逐次上报。
+///
+/// 账目口径（每一条都对消费方承诺过，见 `docs/json-contract.md`）：
 ///
 /// - 只在 `spawn()` 成功之后记一次：起不来的进程（没装、定位到的文件被删、不可执行）不占账，
 ///   它一个字节的请求都没发出去；
@@ -512,7 +581,17 @@ pub(crate) fn set_reason(reason: &'static str) {
 ///   报一个估出来的数比不报更糟。
 ///
 /// 它是一份**观测**，不是这一轮的操作结论——结论只认 summary（见 `docs/json-contract.md`）。
-static P4_COMMAND_COUNT: Mutex<usize> = Mutex::new(0);
+#[derive(Default)]
+struct CommandTally {
+    /// 所有类别之和，等于 `by_command` 各值相加。
+    total: usize,
+
+    /// 类别 → 次数。只出现真的起过进程的类别。
+    by_command: HashMap<&'static str, usize>,
+}
+
+static P4_COMMAND_COUNT: LazyLock<Mutex<CommandTally>> =
+    LazyLock::new(|| Mutex::new(CommandTally::default()));
 
 /// 清零并上报 `count:0`。**必须在任何 p4 启动之前**调用：p4 子进程在字符集探测（`p4 set`）
 /// 那一步就可能起来，晚一步第一条观测事件就从 1 起算了。
@@ -521,17 +600,40 @@ static P4_COMMAND_COUNT: Mutex<usize> = Mutex::new(0);
 /// [`set_force`] 那几项全局状态是同一套约定。
 pub(crate) fn reset_p4_command_count() {
     let count = {
-        let mut count = P4_COMMAND_COUNT.lock().unwrap();
-        *count = 0;
-        *count
+        let mut tally = P4_COMMAND_COUNT.lock().unwrap();
+        *tally = CommandTally::default();
+        tally.total
     };
-    report_p4_command_count(count);
+    report_p4_command_count(count, None);
 }
 
 /// 记一次成功启动的 p4 进程并上报新的累计值。调用点见 [`crate::p4::process`] 与
 /// [`crate::p4::fstat`]，以及 [`crate::charset`] 里那两条阻塞式的 `p4 set`。
-pub(crate) fn count_p4_command() {
-    record_p4_command(&P4_COMMAND_COUNT);
+///
+/// `command` 是**调用点显式给出的固定类别**（[`P4Command`]），不从 argv 反推。
+pub(crate) fn count_p4_command(command: P4Command) {
+    record_p4_command(&P4_COMMAND_COUNT, command);
+}
+
+/// 某类命令在本轮已经成功启动过多少次。读的是同一把锁、同一份账——[`ignore_query_count`]
+/// 拿它凑「忽略查询数」，不另开计数源。
+pub(crate) fn p4_command_calls(command: P4Command) -> usize {
+    P4_COMMAND_COUNT
+        .lock()
+        .unwrap()
+        .by_command
+        .get(command.as_str())
+        .copied()
+        .unwrap_or(0)
+}
+
+/// 本轮为「忽略判定」启动过的 p4 次数：`p4 ignores` 加上 `p4 add -n` 兜底。
+///
+/// 两个类别合起来才是完整答案——兜底那条只在非 ASCII 路径上才会发，单看任何一路都会漏。
+/// 判定口径集中在这里，调用点（[`crate::workspace`] 与 [`crate::reconcile::sync`] 的诊断）
+/// 只取差值，不各自挑类别。
+pub(crate) fn ignore_query_count() -> usize {
+    p4_command_calls(P4Command::Ignores) + p4_command_calls(P4Command::Add)
 }
 
 /// 「改计数 + 发事件」的临界区：锁一直持到事件写完。
@@ -543,20 +645,28 @@ pub(crate) fn count_p4_command() {
 /// 参数是**传进来的那把锁**而不是直接摸全局：单测因此能在一把局部计数器上钉住并发语义
 /// （多线程同时记账不丢更新），不必去动进程级的 [`P4_COMMAND_COUNT`]——同一个测试二进制里
 /// 别处的用例也会 spawn p4，动全局就会互相踩。
-fn record_p4_command(counter: &Mutex<usize>) {
+fn record_p4_command(counter: &Mutex<CommandTally>, command: P4Command) {
     // 锁活到函数末尾：`report_p4_command_count` 在锁内执行，编号与事件因此不会错位。
-    let mut count = counter.lock().unwrap();
-    *count += 1;
-    report_p4_command_count(*count);
+    let mut tally = counter.lock().unwrap();
+    tally.total += 1;
+    *tally.by_command.entry(command.as_str()).or_insert(0) += 1;
+    report_p4_command_count(tally.total, Some(command));
 }
 
 /// 一条累计观测事件。只在 `--json` 下发：文本模式下没人读它（事件与 [`emit_summary`] 都
 /// 只在 JSON 模式下发）。
-fn report_p4_command_count(count: usize) {
+///
+/// `command` 是这一次调用属于哪一类；初始化那条 `count:0` 没有调用可归，发 `null`——固定
+/// 形状胜过省掉一个键。
+fn report_p4_command_count(count: usize, command: Option<P4Command>) {
     if !is_json() {
         return;
     }
-    emit(&json!({"kind": "p4CommandCount", "count": count}));
+    emit(&json!({
+        "kind": "p4CommandCount",
+        "count": count,
+        "command": command.map(P4Command::as_str),
+    }));
 }
 
 /// 进度提示。只走 stderr，且**只许被当成提示**——结论只认 summary。
@@ -592,7 +702,16 @@ pub(crate) fn emit_summary(mode: Mode, ok: bool, applied: bool, elapsed_ms: u128
 
     // 先取走累计数再去拿 LEDGER 那把锁：两把锁的获取顺序固定成「先计数、后账目」，别处
     // （[`record_p4_command`]）只拿计数锁，栈上不会出现反向的等待。
-    let p4_calls = *P4_COMMAND_COUNT.lock().unwrap();
+    let (p4_calls, p4_calls_by_command) = {
+        let tally = P4_COMMAND_COUNT.lock().unwrap();
+        let by_command: serde_json::Map<String, serde_json::Value> = tally
+            .by_command
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(command, count)| ((*command).to_owned(), json!(count)))
+            .collect();
+        (tally.total, by_command)
+    };
 
     let ledger = LEDGER.lock().unwrap();
     let total: usize = ledger.counts.iter().map(|(_, count)| count).sum();
@@ -629,6 +748,7 @@ pub(crate) fn emit_summary(mode: Mode, ok: bool, applied: bool, elapsed_ms: u128
         "total": total,
         "counts": counts,
         "p4Calls": p4_calls,
+        "p4CallsByCommand": p4_calls_by_command,
         "scopeMatched": scope_matched,
         "unmatched": ledger.unmatched,
         "elapsedMs": elapsed_ms,
@@ -889,22 +1009,40 @@ mod tests {
     /// 用例也会 spawn p4（那会去动全局），在全局上断言会和它们互相踩。
     #[test]
     fn concurrent_p4_calls_never_lose_or_repeat_a_count() {
-        let counter = Mutex::new(0usize);
+        let counter = Mutex::new(CommandTally::default());
+        // 借出去而不是搬进去：`move` 闭包会把 `counter` 整个吞掉，循环第二轮就没得用了。
+        // `&Mutex` 是 `Copy`，八个闭包各持一份同一把锁的引用。
+        let counter = &counter;
 
         std::thread::scope(|scope| {
-            for _ in 0..8 {
-                scope.spawn(|| {
+            for index in 0..8 {
+                scope.spawn(move || {
+                    // 两类交错：既钉住总数，也钉住分类计数不会串。
+                    let command = if index % 2 == 0 {
+                        P4Command::Have
+                    } else {
+                        P4Command::Fstat
+                    };
                     for _ in 0..250 {
-                        record_p4_command(&counter);
+                        record_p4_command(counter, command);
                     }
                 });
             }
         });
 
+        let tally = counter.lock().unwrap();
         assert_eq!(
-            *counter.lock().unwrap(),
-            2000,
+            tally.total, 2000,
             "丢更新会让累计数偏小；两个线程共用一个编号会让它偏大"
         );
+        // 分类之和恒等于总数——消费方按 `p4CallsByCommand` 对账，这条不变量不能破。
+        assert_eq!(
+            tally.by_command.values().sum::<usize>(),
+            tally.total,
+            "分类计数之和必须等于总数：{:?}",
+            tally.by_command
+        );
+        assert_eq!(tally.by_command.get("have").copied(), Some(1000));
+        assert_eq!(tally.by_command.get("fstat").copied(), Some(1000));
     }
 }

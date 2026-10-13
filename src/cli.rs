@@ -114,6 +114,16 @@ pub struct Options {
     pub(crate) no_revert_groups: bool,
 }
 
+impl Options {
+    /// 「强制修复」这条路的判据：`--sync --force`。
+    ///
+    /// 必须同时看两个开关：`--clean --force` 是解析层放行的空形状，那里 force 一点作用都
+    /// 不起（见 `force_requires_sync` 与 `lib.rs` 的分流），只看 `force` 会把 clean 也带进去。
+    pub(crate) fn force_sync(&self) -> bool {
+        self.sync && self.force
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

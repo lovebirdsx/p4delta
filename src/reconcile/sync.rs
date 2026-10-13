@@ -14,15 +14,16 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 
-use super::analyze::{SyncAnalysis, SyncSource, analyze_at_target};
+use super::analyze::{SyncAnalysis, SyncSource, analyze_at_target, guard_case_conflicts};
 use super::changes::{GroupReport, GroupRow, render_title, report_group};
 use super::{HashStats, delete_workspace_files};
 use crate::cache::{CacheWriter, save_cache};
 use crate::cli::Options;
 use crate::digest::{CachePolicy, is_unchanged_since_sync, parallel_compute_digests};
-use crate::json::{HandoffFile, Mode, sayln};
+use crate::json::{HandoffFile, Mode, P4Command, ignore_query_count, say_phase, sayln};
 use crate::model::{DepotState, HaveRecord, TargetMap, WorkspaceCache, WorkspaceState};
 use crate::p4::process::{FailureMode, run_p4_command_batched};
+use crate::workspace::{IgnoreQueryMode, query_ignored_paths};
 
 /// 把文件拉到目标版本时下发的 p4 命令。
 ///
@@ -189,7 +190,7 @@ pub(crate) struct SyncChanges {
     /// 目标版本没变、本地内容却不是它了：还原回去。
     revert: Vec<SyncFile>,
 
-    /// 本地没有（或被忽略规则盖着）：写回来。
+    /// 本地没有：写回来。
     restore: Vec<SyncFile>,
 
     /// 目标时刻该路径不在库、本地却有：删掉。
@@ -284,6 +285,7 @@ async fn delete_from_workspace(
         run_p4_command_batched(
             options,
             work_dir,
+            P4Command::Sync,
             SYNC_ARGS,
             &specs,
             false,
@@ -338,6 +340,7 @@ async fn sync_to_target(options: &Options, work_dir: &str, files: &[SyncFile]) -
     run_p4_command_batched(
         options,
         work_dir,
+        P4Command::Sync,
         SYNC_ARGS,
         &specs,
         false,
@@ -367,11 +370,13 @@ pub(crate) async fn apply_sync(
 
     let start_time = Instant::now();
     let mut failures: Vec<String> = Vec::new();
+    let mut acted_groups = 0usize;
 
     for (spec, files) in sync.groups() {
         if files.is_empty() {
             continue;
         }
+        acted_groups += 1;
 
         report_group(
             &GroupReport {
@@ -427,6 +432,11 @@ pub(crate) async fn apply_sync(
             "      Synced {total} files in {} seconds.",
             start_time.elapsed().as_secs_f32()
         );
+        say_phase(
+            "apply",
+            &format!("synced {total} file(s) across {acted_groups} group(s)"),
+            Some(start_time.elapsed().as_secs_f32()),
+        );
         // 只有 --verify-all 才敢说这句话：默认档靠 mtime 捷径与摘要缓存跳过了一部分文件，
         // 那些文件的「没变」是推断出来的，没被验证过。承诺必须与档位匹配。
         if options.verify_all {
@@ -436,6 +446,11 @@ pub(crate) async fn apply_sync(
         sayln!(
             "      Counted {total} files to sync in {} seconds.",
             start_time.elapsed().as_secs_f32()
+        );
+        say_phase(
+            "apply",
+            &format!("dry run: counted {total} file(s) to sync across {acted_groups} group(s)"),
+            Some(start_time.elapsed().as_secs_f32()),
         );
         sayln!("Re-run with -a to sync the workspace.");
     }
@@ -457,9 +472,70 @@ pub(crate) struct SyncPlan {
     pub(crate) unsupported: Vec<HandoffFile>,
 }
 
-/// sync 模式的分析管线：按目标版本分类 → 只对「目标版本没变」的文件算摘要 → 投影成动作。
+/// 删除候选的保护：只对**这一批**候选查一次忽略规则，被规则盖着的从组里摘掉。
+///
+/// 强制修复不对整个工作区做忽略过滤（成本与理由见 [`crate::workspace::gather_workspace`]），
+/// 但删除是唯一不可逆的一步，而 `p4 sync -f` 自己不看 `.p4ignore`：不查这一下，用户特意
+/// 放在那儿、还没入库的东西会跟着目标态一起被删掉。查询范围因此从「工作区有多大」缩到
+/// 「这一轮要删多少」。
+///
+/// 失败/输出不可靠时 [`IgnoreQueryMode::Strict`] 直接失败（fail-closed）：那条路上的空结果
+/// 会被读成「一个都没被忽略」，而它的结论是「删不删」。摘掉的候选连 have 记录都不动
+/// （它们不进删除组，`#none` 那一步自然不会发），用户那份文件从此照旧受工具管理。
+async fn protect_delete_candidates(
+    options: &Options,
+    work_dir: &str,
+    analysis: &mut SyncAnalysis<'_>,
+) -> Result<()> {
+    if analysis.delete.is_empty() {
+        return Ok(());
+    }
+
+    let candidates = analysis.delete.len();
+    let start_time = Instant::now();
+    let queries_before = ignore_query_count();
+    let ignored = query_ignored_paths(
+        options,
+        work_dir,
+        analysis.delete.iter().map(|entry| &entry.file.path),
+        IgnoreQueryMode::Strict,
+    )
+    .await?;
+    let queries = ignore_query_count() - queries_before;
+
+    let before = analysis.delete.len();
+    analysis
+        .delete
+        .retain(|entry| !ignored.contains(&entry.file.path));
+    let kept = before - analysis.delete.len();
+
+    if kept > 0 {
+        sayln!("Kept {kept} file(s) that the ignore rules cover out of the delete group.");
+    }
+    // 这一条的三个数就是「全盘过滤省了什么、又留下了什么风险」的全部答案：候选有多窄、
+    // 为此付了几次 p4 查询、有几份文件靠着答案活下来。
+    say_phase(
+        "delete-protection",
+        &format!(
+            "{candidates} delete candidate(s) checked against the ignore rules \
+             with {queries} p4 query/queries, {kept} kept"
+        ),
+        Some(start_time.elapsed().as_secs_f32()),
+    );
+
+    Ok(())
+}
+
+/// sync 模式的分析管线：按目标版本分类 → 保护删除候选 → 只对「目标版本没变」的文件算摘要
+/// → 投影成动作。
+///
+/// 参数多了 `work_dir`（删除候选的保护要起 p4 子进程，client root 是运行时解析出来的）与
+/// `cache` / `cache_writer` 这一对：后者不是可以合并的重复——一个是摘要表、一个是它的落盘
+/// 句柄，生命周期各自独立，裹进结构体只会把借用关系藏起来。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_sync_changes(
     options: &Options,
+    work_dir: &str,
     depot: &DepotState,
     workspace: &WorkspaceState,
     have_records: &HashMap<String, HaveRecord>,
@@ -474,6 +550,17 @@ pub(crate) async fn build_sync_changes(
         "      Analysis complete in {} seconds.",
         start_time.elapsed().as_secs_f32()
     );
+    say_phase(
+        "analyze",
+        &format!(
+            "{} deletion candidate(s), {} update(s), {} check candidate(s), {} archived",
+            analysis.delete.len(),
+            analysis.update.len(),
+            analysis.check.len(),
+            analysis.archived.len()
+        ),
+        Some(start_time.elapsed().as_secs_f32()),
+    );
 
     if !analysis.archived.is_empty() {
         sayln!(
@@ -481,6 +568,11 @@ pub(crate) async fn build_sync_changes(
             analysis.archived.len()
         );
     }
+
+    // 顺序要紧：先把被忽略规则盖着的删除候选摘掉，再让大小写守卫对着**剩下的**候选判定
+    // （摘掉的不再删，也就构不成误删），最后才是那几句可见度提示——它们数的是真要动的文件。
+    protect_delete_candidates(options, work_dir, &mut analysis).await?;
+    guard_case_conflicts(&analysis, depot, target)?;
 
     // 本地从没同步过、却已经有一份同名文件的那批：会被 depot 内容整份覆盖，而且与
     // 「落后了拉一把」不是一回事——没有旧版本可退回。它落在 Update 组里，光看组标题

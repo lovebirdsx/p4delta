@@ -413,7 +413,7 @@ pub(crate) struct SyncAnalysis<'a> {
     /// 目标版本没变，本地内容要对摘要才知道对不对的。
     pub(crate) check: Vec<DigestCheck<'a>>,
 
-    /// 本地没有（或被忽略规则盖着）：写回来。与 have 是哪一版无关。
+    /// 本地没有：写回来。与 have 是哪一版无关。
     pub(crate) restore: Vec<SyncSource<'a>>,
 
     /// 目标时刻该路径不在库，本地却有的：删掉。
@@ -429,14 +429,15 @@ pub(crate) struct SyncAnalysis<'a> {
 
 /// 目标时刻不在库的路径：本地有一份就收进删除组。
 ///
-/// 被忽略的本地文件视同不存在——与其余各组「filtered 当作本地没有」的口径一致，
-/// 而对这一组来说，那个口径的含义正好是「不去删被忽略的东西」。
+/// 查的是**本地真实状态**（[`WorkspaceState::get_file`]），不看 `filtered` 标记：sync 这条
+/// 路压根不做全盘忽略过滤。删除组另有自己的保护——它只对这一批候选查一次忽略规则，被规则
+/// 盖着的从组里摘掉（见 `reconcile::sync::protect_delete_candidates`）。
 fn push_deleted<'a>(
     analysis: &mut SyncAnalysis<'a>,
     record: &'a DepotFileRecord,
     workspace: &'a WorkspaceState,
 ) {
-    if let Some(file) = workspace.get_filtered(&record.client_file_lower) {
+    if let Some(file) = workspace.get_file(&record.client_file_lower) {
         analysis.delete.push(DeletedAtTarget { record, file });
     }
 }
@@ -450,14 +451,23 @@ fn push_deleted<'a>(
 /// | 已打开 | 不动作、不汇报（`p4 sync -f` 也不碰已打开的文件，这里更彻底） |
 /// | 目标时刻该路径不在库 | `delete`（本地有才落） |
 /// | 目标是归档版本 | `archived` |
-/// | 本地缺失（或被忽略规则盖着） | `restore`——不论 have 是哪一版 |
+/// | 本地缺失 | `restore`——不论 have 是哪一版 |
 /// | `have != target_rev` | `update` |
 /// | 二进制长度不符 | `revert` |
 /// | 其余 | `check`（摘要说了算） |
 ///
+/// 这里的「本地」是**本地真实状态**，不含忽略规则：[`crate::workspace::gather_workspace`] 在
+/// 强制修复下不做全盘过滤（原因见该函数），而 `.p4ignore` 也从不阻止 `p4 sync -f` 更新已入库
+/// 的文件——把这类文件当成缺失，会让它们被无条件重写。
+/// **删除组是例外**：它唯一不可逆，所以单个候选取出来之后还要过一道忽略查询
+/// （[`crate::reconcile::sync::protect_delete_candidates`]，在 [`analyze_at_target`] 之后调用）。
+///
 /// `target` 里查不到即视为目标时刻不在库。两种来源都归此列：目标时刻已是删除版本，
 /// 或（只有 changelist 目标才可能）目标时刻它还没进 depot——实测过 `p4 sync -f ./...@CL`
 /// 对这两种都报 `deleted as`，把本地文件删掉。
+///
+/// 大小写冲突那道守卫（[`guard_case_conflicts`]）**不在这里**：它要对着保护之后的删除组看，
+/// 调用点因此排在 `protect_delete_candidates` 后面。
 pub(crate) fn analyze_at_target<'a>(
     depot: &'a DepotState,
     workspace: &'a WorkspaceState,
@@ -519,14 +529,13 @@ pub(crate) fn analyze_at_target<'a>(
             target_rev: target_record.rev,
         };
 
-        // 本地没有这一份（文件缺失，或被忽略规则盖着、按本模块的口径视同不存在）：
-        // 从 depot 写回。判断放在 have 之前是刻意的——这四组按**本地状态**分，不按 have
-        // 状态分：本地压根没有的文件报成「Updating ... in workspace」既不准确，也丢掉了
-        // 「它不在你本地」这个信息。原生 `p4 sync -f` 那边对应的是 `added as`。
+        // 本地没有这一份：从 depot 写回。判断放在 have 之前是刻意的——这四组按**本地状态**
+        // 分，不按 have 状态分：本地压根没有的文件报成「Updating ... in workspace」既不准确，
+        // 也丢掉了「它不在你本地」这个信息。原生 `p4 sync -f` 那边对应的是 `added as`。
         //
-        // 被忽略的文件也走这里，不另外单列：实测 p4 自己会照常写回这类文件
-        // （`.p4ignore` 拦不住 `p4 sync -f`），交给它做，工具不单方面覆盖。
-        let Some(file) = workspace.get_filtered(&record.client_file_lower) else {
+        // 查的是**本地真实状态**，不看 `filtered` 标记（sync 根本不扫忽略规则，见 `push_deleted`）。
+        // 被忽略规则盖着的文件在这条路上只是普通文件：`p4 sync -f` 自己也不理会 `.p4ignore`。
+        let Some(file) = workspace.get_file(&record.client_file_lower) else {
             analysis.restore.push(source);
             continue;
         };
@@ -573,8 +582,6 @@ pub(crate) fn analyze_at_target<'a>(
         });
     }
 
-    guard_case_conflicts(&analysis, depot, target)?;
-
     Ok(analysis)
 }
 
@@ -589,8 +596,11 @@ pub(crate) fn analyze_at_target<'a>(
 /// 不做自动择一——那要定义一套「按目标态重新决胜」的新语义，而这里只是不想**默不作声**
 /// 地删错东西。罕见组合，所以只在真的出现删除候选时才回头查一遍。
 ///
+/// 调用点在 [`crate::reconcile::sync::build_sync_changes`]，排在删除候选的忽略保护**之后**：
+/// 被忽略规则摘掉的那些不再删，也就不构成误删。判定的是剩下的那批。
+///
 /// [`build_mapping`]: crate::model::DepotState::build_mapping
-fn guard_case_conflicts(
+pub(crate) fn guard_case_conflicts(
     analysis: &SyncAnalysis<'_>,
     depot: &DepotState,
     target: &TargetMap,
@@ -1272,17 +1282,21 @@ mod tests {
         assert_eq!(non_empty_sync_groups(&analysis), ["restore"]);
     }
 
-    /// 被忽略规则覆盖的本地文件视同不存在：实测 p4 自己会照常写回这类文件
-    /// （`.p4ignore` 拦不住 `p4 sync -f`），交给它做，工具不单方面覆盖。
+    /// 被忽略规则盖着的本地文件按**真实状态**参与分析：sync 不做全盘忽略过滤，而 `.p4ignore`
+    /// 也从不阻止 `p4 sync -f` 更新已入库的文件。
+    ///
+    /// 旧实现对这类文件一律当成本地缺失（`get_filtered` 返回 `None`）而归进 Restore——那是
+    /// 一次无条件的重写，也是这个模式唯一会静默覆盖用户内容的地方。标记照旧留着（open/clean
+    /// 那条路要靠它），但这条路径必须视而不见。
     #[test]
-    fn an_ignored_local_copy_is_restored_not_checked() {
+    fn an_ignored_local_copy_is_analyzed_by_its_real_state() {
         let depot = depot_state(vec![synced_record(PATH)]);
         let target = head_target(&depot.file_records);
 
         let workspace = workspace_state(&[(PATH, SIZE, true)]);
         let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
 
-        assert_eq!(non_empty_sync_groups(&analysis), ["restore"]);
+        assert_eq!(non_empty_sync_groups(&analysis), ["check"]);
     }
 
     /// 目标时刻该路径已是删除版本：本地那份要删掉。
@@ -1299,23 +1313,26 @@ mod tests {
         assert_eq!(non_empty_sync_groups(&analysis), ["delete"]);
     }
 
-    /// 同一个「被忽略」标记，在删除组里的方向与 Restore 组**相反**：那里交给 p4 覆盖写回，
-    /// 这里则放过它、不删。
+    /// 分析层不再替删除组挡忽略规则：那一步挪到了删除候选出来**之后**，而且只对候选发问
+    /// （`reconcile::sync::protect_delete_candidates`）——sync 已经不做全盘过滤，`filtered`
+    /// 标记在这条路上没有来源。
     ///
-    /// 这个不对称是刻意的——本地构建产物是用户明确表达过「别管它」的东西，而删除不可逆。
-    /// 口径写反就是删用户的 `build/`，所以它必须有一条用例守着。
+    /// 这里钉住的是**分层**：本地有文件就收进删除组，保护是下一层的事。保护本身由 e2e 拿
+    /// 真实 p4 与 `.p4ignore` 守着（`tests/e2e_sync.rs` 的
+    /// `an_ignored_delete_candidate_is_left_alone`），那一条同时覆盖了这里覆盖不到的查询路径。
     #[test]
-    fn an_ignored_local_file_is_not_deleted_at_the_target() {
+    fn a_present_local_file_is_a_delete_candidate_regardless_of_the_filter_flag() {
         let depot = depot_state(vec![synced_record(PATH)]);
         let target: TargetMap = [target_entry("//depot/a.txt", 1, FileAction::Delete)]
             .into_iter()
             .collect();
 
-        let workspace = workspace_state(&[(PATH, SIZE, true)]);
-        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+        for filtered in [false, true] {
+            let workspace = workspace_state(&[(PATH, SIZE, filtered)]);
+            let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
 
-        assert!(analysis.delete.is_empty(), "被忽略的文件不该进删除组");
-        assert!(non_empty_sync_groups(&analysis).is_empty());
+            assert_eq!(non_empty_sync_groups(&analysis), ["delete"]);
+        }
     }
 
     /// `--to <CL>` 下「目标时刻还没创建」的形态：@CL 的结果里压根没有这条记录，
@@ -1549,6 +1566,10 @@ mod tests {
     /// 同一本地路径上的另一条记录在目标处还有内容，删掉本地文件就是错的，必须拒绝而不是
     /// 默不作声地删。守卫查的是**每条记录自己的原样 depot 路径**：折成小写会让这一对又撞回
     /// 同一个键，guard 看不到「另一条在目标处活着」这件事，误删就发生了。
+    ///
+    /// 守卫要显式调用：它不在 [`analyze_at_target`] 里，而是排在删除候选的忽略保护之后
+    /// （见 `reconcile::sync::build_sync_changes`）——被忽略规则摘掉的候选不再删，也就不构成
+    /// 误删，要判的是剩下的那批。
     #[test]
     fn a_case_conflict_that_would_delete_a_live_target_is_refused() {
         // head 上：Snow 已删除、snow 在世界（决胜选出 snow）。
@@ -1583,10 +1604,12 @@ mod tests {
         .collect();
 
         let workspace = workspace_state(&[(PATH, SIZE, false)]);
-        let error = analyze_at_target(&depot, &workspace, &target)
-            .err()
-            .expect("误删本地文件前必须拒绝")
-            .to_string();
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+        // 不写成 `.err().expect(...)`：`SyncAnalysis` 没有 Debug，`expect_err` 用不了。
+        let error = match guard_case_conflicts(&analysis, &depot, &target) {
+            Err(error) => error.to_string(),
+            Ok(()) => panic!("误删本地文件前必须拒绝"),
+        };
 
         assert!(error.contains("Refusing to sync"), "{error}");
         assert!(error.contains("//depot/main/Snow.uasset"), "{error}");

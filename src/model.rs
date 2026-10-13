@@ -369,8 +369,14 @@ impl WorkspaceState {
         }
     }
 
-    /// 只被测试使用：生产路径一律走 [`Self::get_filtered`] 或 [`Self::has_filtered`]。
-    #[cfg(test)]
+    /// 文件存在就返回它，**不看 `filtered` 标记**。
+    ///
+    /// 与 [`Self::get_filtered`] 的分工是「本地这一份算不算存在」：[`Self::get_filtered`] 的
+    /// 口径是「被忽略规则盖着的视同不存在」，这是 open / clean 需要的（那里的忽略规则决定
+    /// 文件该不该被 p4 看见）；而 sync 的目标版本分析要按本地**真实**状态分类——`.p4ignore`
+    /// 拦不住 `p4 sync -f`，把这类文件当成缺失会让它们被无条件重写（见
+    /// `reconcile::analyze::analyze_at_target`）。删除保护另有一套：它只对删除候选查忽略规则，
+    /// 见 `reconcile::sync::protect_delete_candidates`。
     pub(crate) fn get_file(&self, file: &str) -> Option<&WorkspaceFile> {
         self.file_map.get(file).map(|&i| &self.files[i])
     }

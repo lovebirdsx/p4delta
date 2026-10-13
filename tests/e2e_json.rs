@@ -348,6 +348,46 @@ fn the_summary_count_matches_the_p4_processes_actually_started() {
         calls.len(),
         "p4CommandCount 事件数（去掉初始化）与实际启动数对不上\ncalls: {calls:?}"
     );
+
+    // 初始化那条没有可归的类别，其余每条都得写上「这是哪一类命令」。
+    for record in records
+        .iter()
+        .filter(|record| record["kind"] == "p4CommandCount" && record["count"].as_u64() != Some(0))
+    {
+        assert!(
+            record["command"].is_string(),
+            "每次调用都得带类别：{record}"
+        );
+    }
+    assert_eq!(records[0]["kind"], "p4CommandCount");
+    assert_eq!(records[0]["count"], 0);
+    assert!(
+        records[0].get("command").is_some_and(Value::is_null),
+        "初始化那条还没有调用可归类：{:?}",
+        records[0]
+    );
+
+    // 分类账：和恒等于总数（消费方按它对账），且这一轮真起过的三类都得有非零计数。
+    let by_command = summary["p4CallsByCommand"]
+        .as_object()
+        .expect("p4CallsByCommand 必须是对象");
+    assert_eq!(
+        by_command
+            .values()
+            .map(|value| value.as_u64().expect("分类计数必须是整数"))
+            .sum::<u64>(),
+        summary["p4Calls"].as_u64().expect("p4Calls 必须是整数"),
+        "分类计数之和必须等于 p4Calls：{summary}"
+    );
+    for subcommand in ["set", "fstat", "have"] {
+        assert!(
+            by_command
+                .get(subcommand)
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0),
+            "日志里起过 `p4 {subcommand}`，分类账里却看不见：{summary}"
+        );
+    }
 }
 
 /// 三组 `revert_*` 是 `p4 revert -a` 的语义，不在 `p4 reconcile -a -e -d` 里。

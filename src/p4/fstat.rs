@@ -12,7 +12,7 @@ use hex::FromHex;
 use crate::READ_BUFFER_SIZE;
 use crate::charset::{decode_p4_bytes, p4_encoding, strip_bom, trim_line_ending};
 use crate::cli::Options;
-use crate::json::{count_p4_command, sayln};
+use crate::json::{P4Command, count_p4_command, sayln};
 use crate::model::{DepotFileRecord, DepotState, FileAction, TargetMap, TargetRecord};
 use crate::p4::process::{
     MAX_PARALLEL_P4_COMMANDS, P4Pipes, build_p4_command, compute_batches, read_p4_stderr,
@@ -134,7 +134,7 @@ pub(crate) async fn run_p4_fstat_slice(
 
     let mut child = cmd.spawn()?;
     // 起来了才算一次调用，见 [`count_p4_command`]；上面那个 `?` 失败时早退，不记账。
-    count_p4_command();
+    count_p4_command(P4Command::Fstat);
     let P4Pipes {
         arguments,
         stdout,

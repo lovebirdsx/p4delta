@@ -197,7 +197,7 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 ### `kind:"summary"`
 
 ```json
-{"kind":"summary","mode":"open","ok":true,"applied":false,"total":340,"counts":{"add":100,"edit":200,"delete":40},"p4Calls":12,"scopeMatched":1,"unmatched":0,"elapsedMs":249,"reason":null}
+{"kind":"summary","mode":"open","ok":true,"applied":false,"total":340,"counts":{"add":100,"edit":200,"delete":40},"p4Calls":12,"p4CallsByCommand":{"have":2,"fstat":6,"opened":4},"scopeMatched":1,"unmatched":0,"elapsedMs":249,"reason":null}
 ```
 
 | 字段 | 说明 |
@@ -209,6 +209,7 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 | `total` | `counts` 各值之和。口径是**「δ 给出逐文件动作的文件数」**：转交出去又没有逐条翻译的那批不进 `counts`，所以 clean / sync 的预演与应用、open 的应用都不含它；open 的预演例外（逐条翻译，见「`class:"handoff"` 变体」），那批进 `counts` |
 | `counts` | `class` → 数量；**只出现非零项**，缺席即 0。`handoff` 永不出现（它没有逐文件动作，`class:"handoff"` 的记录也从来不是「一个动作」） |
 | `p4Calls` | 这一轮**成功启动**的原生 p4 进程数（累计观测，口径见「`kind:"p4CommandCount"`」）。它是观测值，不是成败判据 |
+| `p4CallsByCommand` | `command` 类别 → 次数，取值同「`kind:"p4CommandCount"`」那张表；**只出现非零项**，各项之和恒等于 `p4Calls`。它回答的是「这 12 次调用花在哪」，与 `p4Calls` 出自同一把锁、同一份账 |
 | `scopeMatched` | 匹配到东西的入口数；**普通同步是 `null`**——判定权在原生手里，「入口匹配了几个」这个结论它拿不到。`null` 是「不知道」，不是 0 |
 | `unmatched` | 落空入口数；普通同步恒为 0，理由同上 |
 | `elapsedMs` | 整轮墙钟毫秒 |
@@ -220,16 +221,41 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 ### `kind:"p4CommandCount"`
 
 ```json
-{"kind":"p4CommandCount","count":7}
+{"kind":"p4CommandCount","count":7,"command":"fstat"}
 ```
 
 每次 p4delta **成功启动**一个原生 p4 进程就上报一次累计值。它是一份**观测**，不是这一轮的
 操作结论——结论只认 summary（硬条款 1）。编辑器把每轮的最终值记进同步历史，就能看出同一次
 操作向服务端压了多少次往返。
 
+| 字段 | 说明 |
+|---|---|
+| `count` | 累计值 |
+| `command` | 这一次调用属于哪一类命令，取值见下表；初始化那条 `count:0` 是 `null`（还没有调用可归类） |
+
+`command` 是**调用点显式给出的固定类别**，不从参数反推——转交路径的参数以 `-Mj` / `-x -`
+这类全局选项打头，按 argv 猜会把整批记错。已知取值：
+
+| 取值 | 对应命令 |
+|---|---|
+| `set` | `p4 set`（字符集探测） |
+| `info` | `p4 info` |
+| `client` | `p4 client -o` |
+| `where` | `p4 where` |
+| `have` | `p4 have` |
+| `fstat` | `p4 fstat`（含分批与按修订号补查） |
+| `opened` | `p4 opened` |
+| `ignores` | `p4 ignores`（`-i` 与 `-v` 都算） |
+| `add` | `p4 add -n`（非 ASCII 路径的忽略兜底） |
+| `edit` / `delete` / `revert` | 改状态的三组命令 |
+| `sync` | `p4 sync`（含转交原生的那一批） |
+| `reconcile` / `clean` | 转交原生的 reconcile / clean |
+
+新类别可以直接加进来：消费方按未知值处理（忽略即可），不必更新解析器。
+
 | 口径 | 说明 |
 |---|---|
-| 起点 | 任何 p4 启动**之前**先发一条 `count:0`。它一定排在记录流最前面——字符集探测那一步就可能起一个 `p4 set`，晚一步第一条就从 1 起算 |
+| 起点 | 任何 p4 启动**之前**先发一条 `count:0`（`command` 为 `null`）。它一定排在记录流最前面——字符集探测那一步就可能起一个 `p4 set`，晚一步第一条就从 1 起算 |
 | 计什么 | 每一次 `spawn()` 成功算一次。分批 / 重试各算各的：一次调用一个进程，事件粒度与之一一对应 |
 | 不计什么 | 起不来的进程（没装、定位到的文件被删、不可执行）。它一个请求都没发出去 |
 | 失败的命令 | 命令本身跑失败（退出码非零、逐文件报错）**照样算**：进程已经起来了 |

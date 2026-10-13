@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 use crate::charset::query_p4_variable;
 use crate::cli::Options;
-use crate::json::sayln;
+use crate::json::{P4Command, sayln};
 use crate::p4::process::{
     FailureMode, compute_batches, run_p4_command_batched, run_p4_command_slice,
     split_command_line_paths,
@@ -212,6 +212,7 @@ pub(crate) async fn query_ignored_dirs(
     let lines = run_p4_command_batched(
         options,
         work_dir,
+        P4Command::Ignores,
         &IGNORES_ARGS,
         &arguments,
         false,
@@ -367,6 +368,15 @@ pub(crate) async fn decide_directory_pruning(
         return Ok(PrunePlan::fallback("--no-prune-ignored-dirs"));
     }
 
+    // 强制修复不做忽略过滤（见 `workspace::gather_workspace`），而目录剪枝是为它服务的：
+    // 剪枝省下的是文件级过滤的查询量，没有过滤就没有要省的东西，跟着一起不做也就不必再多
+    // 起一个 `p4 ignores -v`。
+    if options.force_sync() {
+        return Ok(PrunePlan::fallback(
+            "forced sync does not filter by ignore rules",
+        ));
+    }
+
     // 纯文件入口没有目录可剪，连 p4 都不必问。
     if roots.is_empty() {
         return Ok(PrunePlan::default());
@@ -453,6 +463,7 @@ pub(crate) async fn run_p4_ignores_verbose(
     run_p4_command_slice(
         options,
         work_dir,
+        P4Command::Ignores,
         &["ignores", "-v"],
         &[],
         false,

@@ -4,12 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use humansize::{BINARY, format_size};
 use walkdir::WalkDir;
 
 use crate::cli::Options;
-use crate::json::sayln;
+use crate::json::{P4Command, ignore_query_count, say_phase, sayln};
 use crate::model::{DepotState, WorkspaceFile, WorkspaceState};
 use crate::p4::process::{FailureMode, run_p4_command_batched, split_command_line_paths};
 use crate::path::{
@@ -158,92 +158,147 @@ fn collect_single_file(path: &str, excludes: &ExcludeSet) -> Result<Option<Works
     }))
 }
 
+/// 忽略查询的口径。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IgnoreQueryMode {
+    /// 全盘过滤（open / clean）用的老口径：p4 报错只告警，已有结论照用——一次查询失败
+    /// 不该让整轮停下来。
+    Lenient,
+
+    /// 删除保护用：p4 报错、p4 起不来、输出认不出来，一律失败；`p4 add -n` 这条兜底还要
+    /// 求**每个候选都拿到肯定的「被忽略」裁决**，拿不到就整轮停下。
+    ///
+    /// 这个方向的结论是「这份本地文件删不删」，而失败会退化成空结果，也就是「一个都没被
+    /// 忽略」——那正好是把用户的文件删掉的那一边。所以这里宁可整轮不做。
+    Strict,
+}
+
 /// 用 `p4 ignores -i` 标记被忽略的文件，返回被忽略的数量。
-/// 返回的路径必须与请求完全一致，异常输出只提示、不参与过滤。
 pub(crate) async fn apply_file_ignores(
     options: &Options,
     work_dir: &str,
     files: &mut [WorkspaceFile],
 ) -> Result<usize> {
-    if files.is_empty() {
-        return Ok(0);
-    }
-
-    // p4 在命令行上认不出的名字整个不进主查询：一条这样的路径就足以让**整批**失败，
-    // 同批里 ASCII 文件的忽略判断会被一起带走（见 [`command_line_safe`]）。
-    // 它们改走下面的补充判据，不是被放弃。
-    //
-    // 直接借出每个 `WorkspaceFile` 的路径给 split，不必先克隆出一个中间 `Vec`：
-    // 每个路径只被克隆一次，就在 split 交出的两半里。
-    let (ignores_paths, unreadable_paths) =
-        split_command_line_paths(files.iter().map(|file| &file.path));
-
-    // 交不出去的那些不是被放弃，下面有补充判据接手。只在 `-v` 下说一声：它们现在有解，
-    // 不该在正常输出里冒充告警——那会让人以为出了事。
-    if options.verbose && !unreadable_paths.is_empty() {
-        sayln!(
-            "         {} of {} path(s) cannot go on the p4 command line; \
-             their ignored state comes from a \"p4 add -n\" query instead.",
-            unreadable_paths.len(),
-            files.len()
-        );
-    }
-
-    let queried = query_ignores(options, work_dir, files, &ignores_paths).await?;
-    let refused = query_ignored_refusals(options, work_dir, files, &unreadable_paths).await?;
-
-    Ok(queried + refused)
-}
-
-/// 主查询：`p4 ignores -i`，路径挂在命令行上。
-async fn query_ignores(
-    options: &Options,
-    work_dir: &str,
-    files: &mut [WorkspaceFile],
-    ignores_paths: &[String],
-) -> Result<usize> {
-    if ignores_paths.is_empty() {
-        return Ok(0);
-    }
-
-    // 只借用 `ignores_paths` 里的字符串，不克隆：这个集合只用来判断输出行是不是本批
-    // 请求过的路径。
-    let requested: HashSet<&str> = ignores_paths.iter().map(String::as_str).collect();
-
-    // 文件级过滤沿用旧行为：p4 报错只告警，不改变已有结果。
-    let ignored_files = run_p4_command_batched(
+    let ignored = query_ignored_paths(
         options,
         work_dir,
-        &IGNORES_ARGS,
-        ignores_paths,
-        false,
-        FailureMode::Warn,
+        files.iter().map(|file| &file.path),
+        IgnoreQueryMode::Lenient,
     )
     .await?;
 
-    if options.verbose {
-        for ignored_file in &ignored_files {
-            sayln!("         Ignored file \"{}\" by ignores", ignored_file);
-        }
-    }
-
-    let (ignored_files_hash, unrecognized) = parse_ignores_output(&ignored_files, &requested);
-    if unrecognized > 0 {
-        eprintln!(
-            "Warning: {} line(s) of p4 ignores output did not match a requested file.",
-            unrecognized
-        );
-    }
-
     let mut ignored_count = 0;
     for file in files.iter_mut() {
-        if ignored_files_hash.contains(&file.path) {
+        if ignored.contains(&file.path) {
             ignored_count += 1;
             file.filtered = true;
         }
     }
 
     Ok(ignored_count)
+}
+
+/// 对**指定的**一批路径查一次忽略规则，返回其中被正面判定的那些（原样返回请求里的字符串）。
+///
+/// 这就是原先对**整个工作区**做的那次查询，区别只在于「问哪一批」由调用方决定，它的成本
+/// 因此从「工作区有多大」变成「这个调用方关心多少文件」（两笔账的实测数字见
+/// `docs/why-faster.md`）。
+///
+/// 判据两条：`p4 ignores -i` 打头（路径只能挂在命令行上），非 ASCII 的名字（Windows 上
+/// 交不出去，见 [`command_line_safe`]）由 `p4 add -n` 走 stdin 补判。只采纳肯定结论——
+/// 认不出的输出不算命中，宁可少过滤也不误过滤。
+///
+/// [`command_line_safe`]: crate::p4::process::command_line_safe
+pub(crate) async fn query_ignored_paths<'a>(
+    options: &Options,
+    work_dir: &str,
+    paths: impl IntoIterator<Item = &'a String>,
+    mode: IgnoreQueryMode,
+) -> Result<HashSet<String>> {
+    // 直接借出每个路径给 split，不必先克隆出一个中间 `Vec`：每个路径只被克隆一次，
+    // 就在 split 交出的两半里。
+    let (ignores_paths, unreadable_paths) = split_command_line_paths(paths);
+
+    // 交不出去的那些不是被放弃，下面有补充判据接手。只在 `-v` 下说一声：它们现在有解，
+    // 不该在正常输出里冒充告警——那会让人以为出了事。
+    if options.verbose && !unreadable_paths.is_empty() {
+        sayln!(
+            "         {} path(s) cannot go on the p4 command line; \
+             their ignored state comes from a \"p4 add -n\" query instead.",
+            unreadable_paths.len()
+        );
+    }
+
+    let mut ignored = query_ignores(options, work_dir, &ignores_paths, mode).await?;
+    let refused = query_ignored_refusals(options, work_dir, &unreadable_paths, mode).await?;
+    // 补充判据按 [`local_path_key`] 归并（p4 回显的盘符大小写未必与请求一致），这里翻回
+    // 请求里那一个字符串：两个调用方都在自己的路径上比较，不该关心键的口径。
+    ignored.extend(
+        unreadable_paths
+            .iter()
+            .filter(|path| refused.contains(&local_path_key(path)))
+            .cloned(),
+    );
+
+    Ok(ignored)
+}
+
+/// 主查询：`p4 ignores -i`，路径挂在命令行上。返回命中的**请求字符串**（`parse_ignores_output`
+/// 只认路径逐字出现在请求里的那些行，所以这就是请求里的一份）。
+async fn query_ignores(
+    options: &Options,
+    work_dir: &str,
+    ignores_paths: &[String],
+    mode: IgnoreQueryMode,
+) -> Result<HashSet<String>> {
+    if ignores_paths.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    // 只借用 `ignores_paths` 里的字符串，不克隆：这个集合只用来判断输出行是不是本批
+    // 请求过的路径。
+    let requested: HashSet<&str> = ignores_paths.iter().map(String::as_str).collect();
+
+    // 全盘过滤沿用旧行为：p4 报错只告警，不改变已有结果——那条路的结论是「这些文件该不该
+    // 被 p4 看见」，少过滤只会多干活。删除保护拿的是同一个空结果，含义却是「一个都没被
+    // 忽略」：既要退出码非零失败，也要「退出码 0 却往 stderr 写了东西」失败——后者是 p4
+    // 把规则文件读不出来之类的问题说出口的形态，而它的 stdout 会是空的（见 [`IgnoreQueryMode`]）。
+    let failure = match mode {
+        IgnoreQueryMode::Lenient => FailureMode::Warn,
+        IgnoreQueryMode::Strict => FailureMode::ExitCodeOrStderr,
+    };
+    let ignored_lines = run_p4_command_batched(
+        options,
+        work_dir,
+        P4Command::Ignores,
+        &IGNORES_ARGS,
+        ignores_paths,
+        false,
+        failure,
+    )
+    .await?;
+
+    if options.verbose {
+        for ignored_file in &ignored_lines {
+            sayln!("         Ignored file \"{}\" by ignores", ignored_file);
+        }
+    }
+
+    let (ignored, unrecognized) = parse_ignores_output(&ignored_lines, &requested);
+    if unrecognized > 0 {
+        if mode == IgnoreQueryMode::Strict {
+            bail!(
+                "Refusing to continue: {unrecognized} line(s) of the \"p4 ignores\" output could \
+                 not be recognized, so which files the ignore rules cover is unknown."
+            );
+        }
+        eprintln!(
+            "Warning: {} line(s) of p4 ignores output did not match a requested file.",
+            unrecognized
+        );
+    }
+
+    Ok(ignored)
 }
 
 /// 补充判据的命令参数。`p4 add` 认 stdin，`p4 ignores` 不认——这正是这条判据成立的原因。
@@ -252,23 +307,24 @@ const ADD_PREVIEW_ARGS: [&str; 2] = ["add", "-n"];
 /// p4 拒绝添加被忽略文件时给的行尾，前面是它回显的本地路径。
 const IGNORED_REFUSAL_SUFFIX: &str = " - ignored file can't be added.";
 
-/// 给交不到命令行上的路径补一次 `p4 add -n`，返回新标记的数量。
+/// 给交不到命令行上的路径补一次 `p4 add -n`，返回被拒绝添加的那些的 [`local_path_key`] 集合。
 ///
 /// 这些路径只能走 stdin（`p4 ignores` 不认 `-x`，`p4 add` 认），而 stdin 是字节无损的
 /// 通道，恰好绕开让它们上不了命令行的代码页转换。问的是「p4 会不会让我 add 它」——
 /// 这正是这些路径最终会撞上的那个操作：被忽略又没入库的文件会被报成 Add，
 /// `-a` 时 `p4 add` 拒绝它并让整轮失败。
 ///
-/// 只采纳肯定结论。已入库的路径 p4 只回 `can't add existing file`，那里面没有忽略信息，
-/// 所以「没被拒绝」不能反推成「未被忽略」——那些文件维持原状，与没有这条判据时一样。
+/// 只采纳肯定结论。已入库的路径 p4 回的是 `//depot/...#N - opened for add` 或
+/// `can't add existing file`，那里面**没有**忽略信息，所以「没被拒绝」不能反推成
+/// 「未被忽略」——宽松口径下这批维持原状，严格口径下整批 `bail!`（见函数体里那段说明）。
 async fn query_ignored_refusals(
     options: &Options,
     work_dir: &str,
-    files: &mut [WorkspaceFile],
     unreadable_paths: &[String],
-) -> Result<usize> {
+    mode: IgnoreQueryMode,
+) -> Result<HashSet<String>> {
     if unreadable_paths.is_empty() {
-        return Ok(0);
+        return Ok(HashSet::new());
     }
 
     let requested: HashSet<String> = unreadable_paths
@@ -276,37 +332,74 @@ async fn query_ignored_refusals(
         .map(|path| local_path_key(path))
         .collect();
 
-    // 被忽略的文件必然让 p4 退出 1，那正是这里的信号，不能当失败上报。
+    // 被忽略的文件必然让 p4 退出 1，那正是这里的信号，不能当失败上报。删除保护多要一条：
+    // p4 **压根没跑起来**时不能交出空结果——那条路会把它读成「一个都没被忽略」。
+    let failure = match mode {
+        IgnoreQueryMode::Lenient => FailureMode::Silent,
+        IgnoreQueryMode::Strict => FailureMode::SilentStrict,
+    };
     let lines = run_p4_command_batched(
         options,
         work_dir,
+        P4Command::Add,
         &ADD_PREVIEW_ARGS,
         unreadable_paths,
         false,
-        FailureMode::Silent,
+        failure,
     )
     .await?;
 
     let (refused, unrecognized) = parse_ignored_refusals(&lines, &requested);
     if unrecognized > 0 {
+        if mode == IgnoreQueryMode::Strict {
+            bail!(
+                "Refusing to continue: {unrecognized} line(s) of the \"p4 add -n\" output could \
+                 not be recognized, so which files the ignore rules cover is unknown."
+            );
+        }
         eprintln!(
             "Warning: {} line(s) of p4 add -n output did not match a requested file.",
             unrecognized
         );
     }
 
-    let mut ignored_count = 0;
-    for file in files.iter_mut() {
-        if !file.filtered && refused.contains(&local_path_key(&file.path)) {
-            if options.verbose {
-                sayln!("         Ignored file \"{}\" by add -n", file.path);
-            }
-            ignored_count += 1;
-            file.filtered = true;
+    // 严格口径只认**逐候选的肯定裁决**。`p4 add -n` 对被忽略的路径一定会吐出
+    // `<本地路径> - ignored file can't be added.`，但对一条 p4 认得的已跟踪路径，它回的是
+    // `//depot/...#N - opened for add` 或 `can't add existing file`——**里面没有忽略信息**，
+    // 「没有拒绝」因此推不出「没被忽略」。空 stdout（p4 起不来、被别的东西截断）同样会落进
+    // 这个坑，而那正是删除保护最不能接受的读法：读成「一个都没被忽略」就会去删用户的文件。
+    //
+    // 所以这里不做逐候选的保守放行，而是把整批卡死：全部命中拒绝才继续，否则整轮停下。
+    // 代价是 Windows 上只要删除候选里有非 ASCII 的名字（p4 命令行送不进去、只能走这条兜底），
+    // 这一轮就不会执行任何删除——比删错东西便宜。
+    if mode == IgnoreQueryMode::Strict {
+        let unresolved: Vec<&str> = unreadable_paths
+            .iter()
+            .filter(|path| !refused.contains(&local_path_key(path)))
+            .map(String::as_str)
+            .collect();
+        if !unresolved.is_empty() {
+            bail!(
+                "Refusing to continue: \"p4 add -n\" did not confirm that {} of {} delete \
+                 candidate(s) are covered by the ignore rules, and a path p4 already tracks \
+                 carries no ignore verdict at all. Whether the rules cover these is unknown, so \
+                 none of them can be deleted safely:\n  {}",
+                unresolved.len(),
+                unreadable_paths.len(),
+                unresolved.join("\n  ")
+            );
         }
     }
 
-    Ok(ignored_count)
+    if options.verbose {
+        for path in unreadable_paths {
+            if refused.contains(&local_path_key(path)) {
+                sayln!("         Ignored file \"{}\" by add -n", path);
+            }
+        }
+    }
+
+    Ok(refused)
 }
 
 /// 解析 `p4 add -n` 输出里「被忽略」的裁决，返回命中路径的 [`local_path_key`] 集合。
@@ -447,6 +540,7 @@ pub(crate) async fn map_new_paths(
     let lines = run_p4_command_batched(
         options,
         work_dir,
+        P4Command::Where,
         &WHERE_ARGS,
         &paths,
         false,
@@ -468,7 +562,7 @@ pub(crate) async fn gather_workspace(
     let roots = scope.directory_roots();
     let plan = plan_directory_pruning(options, &scope.work_dir, &roots, &scope.excludes).await?;
 
-    let (mut files, num_dirs, total_size) =
+    let (files, num_dirs, total_size) =
         collect_scope_files(&scope.includes, &plan.dirs, &scope.excludes)?;
 
     if options.verbose {
@@ -484,25 +578,66 @@ pub(crate) async fn gather_workspace(
         format_size(total_size, BINARY),
         start_time.elapsed().as_secs_f32()
     );
-
-    sayln!("   Filtering workspace files.");
-    let start_time = Instant::now();
-
-    let ignored_count = apply_file_ignores(options, &scope.work_dir, &mut files).await?;
+    say_phase(
+        "scan",
+        &format!(
+            "{} file(s), {} directories, {}",
+            files.len(),
+            num_dirs,
+            format_size(total_size, BINARY)
+        ),
+        Some(start_time.elapsed().as_secs_f32()),
+    );
 
     let mut workspace_state = WorkspaceState {
-        num_files: files.len() - ignored_count,
         files,
         ..Default::default()
     };
-    workspace_state.build_mapping();
 
-    sayln!(
-        "      Filtered out {} files, {} remain, in {} seconds.",
-        ignored_count,
-        workspace_state.num_files,
-        start_time.elapsed().as_secs_f32()
-    );
+    if options.force_sync() {
+        // 强制修复不做全盘忽略过滤：这一步的成本跟着**工作区大小**走，而它的结论在这条路上
+        // 用不上——`.p4ignore` 拦不住 `p4 sync -f`，被规则盖着的文件照旧按真实本地状态参与
+        // 分析。真正还需要它的只剩删除组，那时只对删除候选发问
+        // （见 `reconcile::sync::protect_delete_candidates`）。代价与实测数字见
+        // `docs/why-faster.md`。
+        sayln!("   Skipping ignore filtering in forced sync mode.");
+        say_phase(
+            "ignore",
+            &format!(
+                "skipped whole-workspace filtering; {} file(s) left unfiltered",
+                workspace_state.files.len()
+            ),
+            None,
+        );
+        workspace_state.num_files = workspace_state.files.len();
+    } else {
+        sayln!("   Filtering workspace files.");
+        let start_time = Instant::now();
+
+        let queries_before = ignore_query_count();
+        let ignored_count =
+            apply_file_ignores(options, &scope.work_dir, &mut workspace_state.files).await?;
+        let queries = ignore_query_count() - queries_before;
+        workspace_state.num_files = workspace_state.files.len() - ignored_count;
+
+        sayln!(
+            "      Filtered out {} files, {} remain, in {} seconds.",
+            ignored_count,
+            workspace_state.num_files,
+            start_time.elapsed().as_secs_f32()
+        );
+        say_phase(
+            "ignore",
+            &format!(
+                "filtered {} of {} file(s), {queries} p4 query/queries",
+                ignored_count,
+                workspace_state.files.len()
+            ),
+            Some(start_time.elapsed().as_secs_f32()),
+        );
+    }
+
+    workspace_state.build_mapping();
 
     Ok((workspace_state, plan))
 }

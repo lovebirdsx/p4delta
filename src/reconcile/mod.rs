@@ -24,8 +24,8 @@ use crate::cache::{CacheWriter, save_cache};
 use crate::cli::Options;
 use crate::digest::{CachePolicy, is_unchanged_since_sync, parallel_compute_digests};
 use crate::json::{
-    HandoffFile, Mode, emit_handoff_files, emit_native_reconcile_records, emit_progress,
-    emit_unmatched, sayln, set_reason, set_scope_matched,
+    HandoffFile, Mode, P4Command, emit_handoff_files, emit_native_reconcile_records, emit_progress,
+    emit_unmatched, say_phase, sayln, set_reason, set_scope_matched,
 };
 use crate::model::{
     DepotState, DigestType, HaveRecord, TargetMap, WorkspaceCache, WorkspaceFile, WorkspaceState,
@@ -70,6 +70,7 @@ pub(crate) async fn reconcile_scope(
     let specs = scope.query_specs(None);
 
     // 三路并发：depot 状态、本地扫描、have 时间戳。
+    let fetch_start = Instant::now();
     let (maybe_depot, maybe_workspace, maybe_have) = futures::join!(
         query_depot_state(options, work_dir, &specs),
         gather_workspace(options, scope),
@@ -82,12 +83,35 @@ pub(crate) async fn reconcile_scope(
     let (mut workspace, prune_plan): (WorkspaceState, PrunePlan) = maybe_workspace?;
     let have_records: HashMap<String, HaveRecord> = maybe_have?;
 
+    // 三路是同一次并发，耗时合起来报一条；head 的目标表就是搭这趟顺风车取回来的，
+    // 所以它的规模也并进这条。
+    say_phase(
+        "depot-have",
+        &format!(
+            "{} depot record(s), {} have record(s){}",
+            depot.file_records.len(),
+            have_records.len(),
+            match head_target.as_ref() {
+                Some(target) => format!(", {} file(s) at head", target.len()),
+                None => String::new(),
+            }
+        ),
+        Some(fetch_start.elapsed().as_secs_f32()),
+    );
+
     // `--to <CL>` 的目标快照。只依赖范围与 CL，但刻意**串行**排在三路之后：它自己会发起
     // 一批 fstat，叠进那三路就是把范围查询的并发整体抬高一层（取舍见 docs/why-faster.md）。
     // 放在这里（补查之前）是必需的——它决定哪些记录真的要内容基线（`BaselineScope::AtTarget`）。
     let at_target = match (options.sync, options.to) {
         (true, Some(changelist)) => {
-            Some(run_p4_fstat_at_revision(options, work_dir, changelist, &specs).await?)
+            let start_time = Instant::now();
+            let target = run_p4_fstat_at_revision(options, work_dir, changelist, &specs).await?;
+            say_phase(
+                "target",
+                &format!("{} file(s) at changelist {changelist}", target.len()),
+                Some(start_time.elapsed().as_secs_f32()),
+            );
+            Some(target)
         }
         _ => None,
     };
@@ -174,6 +198,7 @@ pub(crate) async fn reconcile_scope(
 
         let plan = build_sync_changes(
             options,
+            work_dir,
             &depot,
             &workspace,
             &have_records,
@@ -210,7 +235,16 @@ pub(crate) async fn reconcile_scope(
             } else {
                 FailureMode::Warn
             };
-            run_p4_command_batched(options, work_dir, args, &specs, false, mode).await?;
+            run_p4_command_batched(
+                options,
+                work_dir,
+                P4Command::Sync,
+                args,
+                &specs,
+                false,
+                mode,
+            )
+            .await?;
 
             // 转交出去的文件必须出现在记录流里：消费方读到的是「这批我处理不了，
             // 交给原生 p4 了」，而不是「这批不存在」。
@@ -257,6 +291,17 @@ pub(crate) async fn reconcile_scope(
         "      Analysis complete in {} seconds.",
         start_time.elapsed().as_secs_f32()
     );
+    say_phase(
+        "analyze",
+        &format!(
+            "{} change(s) proposed, {} unsupported by p4delta, {} never synced, {} archived",
+            changes.total(),
+            unsupported_files.len(),
+            unsynced_files.len(),
+            archived_files.len()
+        ),
+        Some(start_time.elapsed().as_secs_f32()),
+    );
     emit_progress("analyze", None);
 
     // client view 的排除行会让 p4 完全看不见某些路径（例如 `-//depot/....tmp`），
@@ -294,6 +339,7 @@ pub(crate) async fn reconcile_scope(
     // 但它们是同一段工作，消费方要看的是「还要读多少盘」这个总量。
     let digest_total =
         edit.needs_digest.len() + revert_edit.needs_digest.len() + revert_delete.needs_digest.len();
+    let digest_start = Instant::now();
     if digest_total > 0 {
         emit_progress(
             "digest",
@@ -402,6 +448,16 @@ pub(crate) async fn reconcile_scope(
         hashed.report();
     }
 
+    // 三组候选共用这一条：它是同一段工作（读盘算摘要），消费方要看的是总量而不是分组的
+    // 三次。`digest_total` 为 0 时不发声，与本段其余几行一致。
+    if digest_total > 0 {
+        say_phase(
+            "digest",
+            &format!("hashed {digest_total} file(s) across 3 candidate groups"),
+            Some(digest_start.elapsed().as_secs_f32()),
+        );
+    }
+
     // clean 模式下只有「未打开」的三类要动作，投影之后的数目才是这一轮真正要处理的。
     let clean_changes = if options.clean {
         Some(CleanChanges::project(&changes, &depot)?)
@@ -468,6 +524,11 @@ pub(crate) async fn reconcile_scope(
         let lines = run_p4_command_batched(
             options,
             work_dir,
+            if options.clean {
+                P4Command::Clean
+            } else {
+                P4Command::Reconcile
+            },
             args,
             &unsupported_paths,
             !options.clean,
@@ -508,8 +569,40 @@ pub(crate) async fn reconcile_scope(
     }
 
     match &clean_changes {
-        Some(clean) => apply_clean(options, work_dir, clean).await?,
-        None => apply_changes(options, work_dir, &changes, &depot).await?,
+        Some(clean) => {
+            let start_time = Instant::now();
+            apply_clean(options, work_dir, clean).await?;
+            say_phase(
+                "apply",
+                &format!(
+                    "{} file(s) {}",
+                    clean.total(),
+                    if options.apply {
+                        "cleaned"
+                    } else {
+                        "counted (dry run)"
+                    }
+                ),
+                Some(start_time.elapsed().as_secs_f32()),
+            );
+        }
+        None => {
+            let start_time = Instant::now();
+            apply_changes(options, work_dir, &changes, &depot).await?;
+            say_phase(
+                "apply",
+                &format!(
+                    "{} file(s) {}",
+                    changes.total(),
+                    if options.apply {
+                        "opened/reverted"
+                    } else {
+                        "counted (dry run)"
+                    }
+                ),
+                Some(start_time.elapsed().as_secs_f32()),
+            );
+        }
     }
 
     Ok(())

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::OnceLock;
 
-use crate::json::{count_p4_command, sayln};
+use crate::json::{P4Command, count_p4_command, sayln};
 use encoding_rs::{Encoding, UTF_8, WINDOWS_1252};
 
 /// p4 写输出用的字符集，启动时解析一次。
@@ -169,7 +169,7 @@ fn run_p4_capturing(mut command: std::process::Command) -> Option<std::process::
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = command.spawn().ok()?;
-    count_p4_command();
+    count_p4_command(P4Command::Set);
     child.wait_with_output().ok()
 }
 

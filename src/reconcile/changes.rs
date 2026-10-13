@@ -8,7 +8,7 @@ use std::time::Instant;
 use anyhow::{Result, anyhow, bail};
 
 use crate::cli::Options;
-use crate::json::{FileRecord, Mode, count, emit_file, sayln};
+use crate::json::{FileRecord, Mode, P4Command, count, emit_file, sayln};
 use crate::model::DepotState;
 use crate::p4::process::{FailureMode, run_p4_command_batched};
 use crate::path::{escape_file_spec, local_path_key};
@@ -96,8 +96,11 @@ struct GroupSpec {
     /// 标题模板，`{}` 由文件数量填充。前导空格是输出契约的一部分。
     title: &'static str,
 
-    /// 应用时依次执行的 p4 调用：参数，以及是否带上 changelist。
-    commands: &'static [(&'static [&'static str], bool)],
+    /// 应用时依次执行的 p4 调用：**计数类别**、参数，以及是否带上 changelist。
+    ///
+    /// 类别显式写在表里（而不是从参数反推）：它是 `p4CallsByCommand` 的键，argv 归类
+    /// 只要哪天表里多一个全局选项就会静默记错。
+    commands: &'static [(P4Command, &'static [&'static str], bool)],
 }
 
 /// 八类变更的处理方式。顺序即输出顺序，必须与 [Changes::groups] 一一对应；
@@ -107,49 +110,55 @@ const GROUPS: [GroupSpec; 8] = [
         id: "add",
         label: "Add",
         title: "      Adding {} files in workspace, not in depot or deleted at have revision, but not checked out for add.",
-        commands: &[(&["add"], true)],
+        commands: &[(P4Command::Add, &["add"], true)],
     },
     GroupSpec {
         id: "edit",
         label: "Edit",
         title: "      Editing {} files in workspace, changed from have revision, but not checked out for edit.",
-        commands: &[(&["edit"], true)],
+        commands: &[(P4Command::Edit, &["edit"], true)],
     },
     GroupSpec {
         id: "reopen_edit",
         label: "Reopen Edit",
         title: "      Revert+Editing {} files in workspace, changed from have revision, but checked out for delete.",
-        commands: &[(&["revert", "-k"], false), (&["edit"], true)],
+        commands: &[
+            (P4Command::Revert, &["revert", "-k"], false),
+            (P4Command::Edit, &["edit"], true),
+        ],
     },
     GroupSpec {
         id: "delete",
         label: "Delete",
         title: "      Deleting {} files not in workspace, but not checked out for delete.",
-        commands: &[(&["delete", "-k"], true)],
+        commands: &[(P4Command::Delete, &["delete", "-k"], true)],
     },
     GroupSpec {
         id: "reopen_delete",
         label: "Reopen Delete",
         title: "      Revert+Deleting {} files not in workspace, but checked out for edit.",
-        commands: &[(&["revert", "-k"], false), (&["delete", "-k"], true)],
+        commands: &[
+            (P4Command::Revert, &["revert", "-k"], false),
+            (P4Command::Delete, &["delete", "-k"], true),
+        ],
     },
     GroupSpec {
         id: "revert_add",
         label: "Revert Add",
         title: "      Reverting {} files not in workspace, but checked out for add.",
-        commands: &[(&["revert", "-k"], false)],
+        commands: &[(P4Command::Revert, &["revert", "-k"], false)],
     },
     GroupSpec {
         id: "revert_edit",
         label: "Revert Edit",
         title: "      Reverting {} files in workspace, not changed from have revision, but checked out for edit.",
-        commands: &[(&["revert", "-k"], false)],
+        commands: &[(P4Command::Revert, &["revert", "-k"], false)],
     },
     GroupSpec {
         id: "revert_delete",
         label: "Revert Delete",
         title: "      Reverting {} files in workspace, not changed from have revision, but checked out for delete.",
-        commands: &[(&["revert", "-k"], false)],
+        commands: &[(P4Command::Revert, &["revert", "-k"], false)],
     },
 ];
 
@@ -362,7 +371,7 @@ pub(crate) async fn apply_changes(
             .map(|row| escape_file_spec(row.client_file))
             .collect();
 
-        for (args, use_changelist) in spec.commands {
+        for (command, args, use_changelist) in spec.commands {
             // 这一支只在 -a 时走到，所以永远是「真改状态」：任何一批失败都必须让整轮失败。
             // 以前这里是宽松模式，p4 拒绝开文件时只留一行 stderr 警告，程序照样打印
             // "Inconsistencies fixed." 并退出 0——把失败伪装成了成功。
@@ -373,6 +382,7 @@ pub(crate) async fn apply_changes(
             let result = run_p4_command_batched(
                 options,
                 work_dir,
+                *command,
                 args,
                 &files,
                 *use_changelist,
@@ -655,7 +665,14 @@ mod tests {
     #[test]
     fn revert_commands_never_target_a_changelist() {
         for spec in &GROUPS {
-            for (args, use_changelist) in spec.commands {
+            for (command, args, use_changelist) in spec.commands {
+                // 记的类别必须就是真正跑的那条命令，否则 `p4CallsByCommand` 对不上账。
+                assert_eq!(
+                    Some(command.as_str()),
+                    args.first().copied(),
+                    "{}",
+                    spec.label
+                );
                 let is_revert = args.first() == Some(&"revert");
                 assert_eq!(*use_changelist, !is_revert, "{}: {args:?}", spec.label);
             }
@@ -668,12 +685,12 @@ mod tests {
         {
             assert_eq!(spec.commands.len(), 2, "{}", spec.label);
             assert_eq!(
-                spec.commands[0].0,
+                spec.commands[0].1,
                 ["revert", "-k"].as_slice(),
                 "{}",
                 spec.label
             );
-            assert!(!spec.commands[0].1, "{}", spec.label);
+            assert!(!spec.commands[0].2, "{}", spec.label);
         }
     }
 }

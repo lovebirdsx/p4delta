@@ -899,6 +899,456 @@ fn a_never_synced_local_file_is_deleted_without_asking_p4() {
     );
 }
 
+/// force sync 的成本必须跟着「真要同步的东西」走，而不是跟着工作区大小走。
+///
+/// 抓的是那个把它拖垮的放大源：force 走 reconcile 管线，`gather_workspace` 会对**每一个**
+/// 扫到的文件查一次 `p4 ignores -i`（外加一次 `p4 add -n` 兜底）。两笔账的实测数字见
+/// `docs/why-faster.md`。
+///
+/// 而本地那些被忽略规则盖着的文件**本来就该被分析**：`.p4ignore` 不阻止 `p4 sync -f`
+/// 更新已入库的文件，拿它当「不存在」是错的。这里刻意把嵌套 `.p4ignore`（`bulk/.p4ignore`
+/// 一条 `*.txt`，盖住全部 400 个 bulk 文件）与 `--to <CL>` 一起摆上，就是现场的形状——
+/// 有嵌套规则时目录剪枝会退回全扫，于是旧实现对着满工作区的「被忽略」文件逐批发问。
+///
+/// 判据走**外部观测**：`P4_EXE` 指向转发 shim（见 `tests/support/p4shim.rs`），数日志里
+/// 含 `ignores` / `add -n` 的行。这一轮没有任何删除候选，所以两者都该是 0。
+#[test]
+fn a_force_sync_never_queries_ignores_for_the_whole_workspace() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        eprintln!("skipping: rustc is not available to build the p4 shim");
+        return;
+    };
+
+    sandbox.bulk_text_files(400);
+    let target = latest_submitted(&sandbox);
+    sandbox.write("bulk/.p4ignore", "*.txt\n");
+    // 前提：规则真的盖住这些文件。不钉住的话，将来规则不再匹配时这条用例会「静静地」变成
+    // 一句空话——它要测的是「查不查」，不是「查了发现没被忽略」。
+    let probe = sandbox.p4_ok(&["ignores", "-i", "bulk/d000/f000.txt"]);
+    assert!(
+        probe.contains(" ignored"),
+        "前提不成立：规则没盖住 bulk 下的文件：{probe}"
+    );
+
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+
+    let output = sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "--to", &target.to_string(), "-l"])
+        .arg(".")
+        .output()
+        .expect("run tool");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(output.status.success(), "run failed:\n{stdout}");
+    // 这一轮确实在干活：不是「什么都没扫所以没查」那种空洞的绿。406 = 400 个 bulk 文件
+    // + 那份嵌套 `.p4ignore` + 5 个种子文件——扫的是**整个**工作区，忽略规则不参与筛选。
+    assert!(
+        stdout.contains("Collected 406 files"),
+        "该扫到整个工作区：{stdout}"
+    );
+
+    let calls: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        calls
+            .iter()
+            .any(|line| line.split_whitespace().any(|token| token == "have")),
+        "这一轮没起过 `p4 have`，shim 没接上：{calls:?}"
+    );
+
+    let token_count = |wanted: &str| {
+        calls
+            .iter()
+            .filter(|line| line.split_whitespace().any(|token| token == wanted))
+            .count()
+    };
+    assert_eq!(
+        token_count("ignores"),
+        0,
+        "force sync 不该为全工作区（含目录剪枝）查 ignore：{calls:?}"
+    );
+    assert_eq!(
+        calls.iter().filter(|line| line.contains("add -n")).count(),
+        0,
+        "没有删除候选，就不该起 `p4 add -n`：{calls:?}"
+    );
+    assert!(
+        stdout.contains("No files to sync, everything up to date."),
+        "把忽略规则盖着的文件当成「本地缺失」的话，这里会冒出 400 条 Restore：{stdout}"
+    );
+}
+
+/// 目标处已删除、本地有一份、而这份正被忽略规则盖着：**不删**。
+///
+/// 这是「只对删除候选查 ignore」全部的意义所在——`p4 sync -f` 自己不看 `.p4ignore`，
+/// 真让它按目标删，用户特意放在那儿的东西就没了。删除是唯一不可逆的一步，所以它保留
+/// 原先那道保护，只是把查询范围从「整个工作区」缩到「删除候选」。
+///
+/// 三个候选一起上：两个被规则盖着（其中一个是**含空格**的名字——`p4 ignores` 的路径只能
+/// 挂在命令行上，空格是它最容易被切错的地方），一个没被盖住。判据要能分开这三者：只留下
+/// 前两个，第三个照删。非 ASCII 的候选另有用例（它在 Windows 上走的是另一条判据，见
+/// `an_unreadable_delete_candidate_without_a_verdict_stops_the_run`）。
+#[test]
+fn an_ignored_delete_candidate_is_left_alone() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    // 真正下发那一轮要让 shim 记下 p4 调用（用来钉住查询范围），编不出 shim 就跳过。
+    let Some(shim) = support::P4Shim::build() else {
+        eprintln!("skipping: rustc is not available to build the p4 shim");
+        return;
+    };
+
+    // 造出删除组的形状：have 停在旧版、head 是删除版本、本地有一份。
+    sandbox.commit("protected.tmp", "keep me\n");
+    sandbox.commit("sp ace.tmp", "keep me too\n");
+    sandbox.commit("went.txt", "not covered by the rules\n");
+    sandbox.p4_ok_paths(&["delete"], &["protected.tmp", "sp ace.tmp", "went.txt"]);
+    sandbox.p4_ok(&["submit", "-d", "delete them"]);
+    sandbox.p4_ok_paths(
+        &["sync"],
+        &[
+            "//depot/main/protected.tmp#1",
+            "//depot/main/sp ace.tmp#1",
+            "//depot/main/went.txt#1",
+        ],
+    );
+
+    sandbox.write(".p4ignore", "*.tmp\n");
+    let probe = sandbox.p4_ok(&["ignores", "-i", "protected.tmp"]);
+    assert!(
+        probe.contains(" ignored"),
+        "前提不成立：规则没盖住删除候选：{probe}"
+    );
+
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "-l"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Deleting 1 files"))
+        .stdout(predicate::str::contains("Kept 2 file(s)"))
+        .stdout(predicate::str::contains(
+            "Re-run with -a to sync the workspace.",
+        ));
+
+    assert!(sandbox.exists("protected.tmp"), "预演不该删文件");
+    assert!(sandbox.exists("sp ace.tmp"), "预演不该删文件");
+    assert!(sandbox.exists("went.txt"), "预演不该删文件");
+
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+
+    sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "-a"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Deleting 1 files"))
+        .stdout(predicate::str::contains("Kept 2 file(s)"));
+
+    // 保护的另一半是**范围**：问的就是删除候选那一小撮，工作区里没进删除组的文件一个都不问
+    // ——否则这一步又成了全盘过滤（见 `docs/why-faster.md`）。
+    let calls: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let ignores: Vec<&String> = calls
+        .iter()
+        .filter(|line| line.split_whitespace().any(|token| token == "ignores"))
+        .collect();
+    assert_eq!(ignores.len(), 1, "三个删除候选该合成一批：{calls:?}");
+    assert!(
+        ignores[0].contains("protected.tmp") && ignores[0].contains("sp ace.tmp"),
+        "被忽略的两个候选该在查询里：{:?}",
+        ignores[0]
+    );
+    assert!(
+        !ignores[0].contains("readme.txt"),
+        "没进删除组的文件不该被问：{:?}",
+        ignores[0]
+    );
+    // 三个候选都是 ASCII，全程都交得到命令行上，兜底那条 `p4 add -n` 一次都不该起。
+    assert!(
+        !calls.iter().any(|line| line.contains("add -n")),
+        "没有交不出去的路径，兜底查询不该出场：{calls:?}"
+    );
+
+    assert!(sandbox.exists("protected.tmp"), "被忽略的删除候选不该被删");
+    assert!(sandbox.exists("sp ace.tmp"), "含空格的路径同样要被保护");
+    assert_eq!(sandbox.read("protected.tmp"), "keep me\n", "内容也不该被动");
+    // 保护必须做到「整条路径都不碰」：have 记录被清掉的话，下一轮它就不再是删除候选，
+    // 用户那份文件会从此脱离工具的管理。
+    assert_eq!(
+        sandbox.p4_lines(&["have", "protected.tmp"]).len(),
+        1,
+        "保护要连 have 记录一起留下"
+    );
+
+    assert!(!sandbox.exists("went.txt"), "规则没盖住它，照旧删");
+    assert!(
+        sandbox.p4_lines(&["have", "went.txt"]).is_empty(),
+        "没被保护的路径该连 have 记录一起清掉"
+    );
+    assert!(sandbox.opened().is_empty(), "sync never opens files");
+}
+
+/// 删除保护的 fail-closed 一半：`p4 ignores` **起来了、退出码还是 0**，却把错误写在 stderr
+/// 上、stdout 一个字都没有。
+///
+/// 这就是最危险的形态——空 stdout 单看就是「一个都没被忽略」，照着做等于删用户的文件。判据
+/// 因此不能只看退出码：退出码 0 但 stderr 有话说也算失败（`FailureMode::ExitCodeOrStderr`）。
+/// 故障由转发 shim 注入（见 `tests/support/p4_shim_main.rs`），真实 p4 在正常输入下不会这么回。
+#[test]
+fn an_unusable_ignores_verdict_stops_the_run() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        eprintln!("skipping: rustc is not available to build the p4 shim");
+        return;
+    };
+
+    // 删除组的形状：have 停在旧版、head 是删除版本、本地有一份。
+    sandbox.commit("protected.tmp", "keep me\n");
+    sandbox.p4_ok_paths(&["delete"], &["protected.tmp"]);
+    sandbox.p4_ok(&["submit", "-d", "delete it"]);
+    sandbox.p4_ok_paths(&["sync"], &["//depot/main/protected.tmp#1"]);
+    sandbox.write(".p4ignore", "*.tmp\n");
+
+    let output = sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_FAULT_COMMAND", "ignores")
+        .env(
+            "P4DELTA_SHIM_FAULT_STDERR",
+            "Error: unable to read the ignore file.\n",
+        )
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "-a"])
+        .arg(".")
+        .output()
+        .expect("run the tool");
+
+    assert!(
+        !output.status.success(),
+        "拿不到可靠的忽略裁决就必须停下：{output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Refusing to continue")
+            || stderr.contains("unable to read the ignore file"),
+        "失败得说清是忽略裁决不可用：{stderr}"
+    );
+    assert!(
+        sandbox.exists("protected.tmp"),
+        "失败的一轮一个文件都不许动"
+    );
+    assert_eq!(sandbox.read("protected.tmp"), "keep me\n");
+}
+
+/// Windows 上非 ASCII 的删除候选挂不到 p4 命令行上（见 `command_line_safe`），只能走
+/// `p4 add -n` 兜底。而兜底对一条 p4 已跟踪的路径回的是 `//depot/...#N - opened for add` 或
+/// `can't add existing file`——**里面没有忽略信息**，「没被拒绝」推不出「没被忽略」。
+///
+/// 拿不到肯定裁决就不许删：这一轮直接停下，一个文件都不动。这是有意的取舍——比删错便宜。
+/// Unix 上没有这条兜底（路径都交得到命令行上），用例只在 Windows 有意义。
+#[cfg(windows)]
+#[test]
+fn an_unreadable_delete_candidate_without_a_verdict_stops_the_run() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // 种子里的 `src/使用说明.txt` 已经是入库的第一版：把它删掉、提交，再把 have 拉回 #1，
+    // 就得到「head 说删了、本地还有一份」的形状。删除命令走 stdin（见 `p4_ok_paths`）——
+    // 非 ASCII 的名字挂不到命令行上，这正是生产代码这里要面对的那个限制。
+    sandbox.p4_ok_paths(&["delete"], &["src/使用说明.txt"]);
+    sandbox.p4_ok(&["submit", "-d", "delete the manual"]);
+    sandbox.p4_ok_paths(&["sync"], &["//depot/main/src/使用说明.txt#1"]);
+
+    let output = sandbox
+        .cli()
+        .args(["--sync", "--force", "-a"])
+        .arg(".")
+        .output()
+        .expect("run the tool");
+
+    assert!(
+        !output.status.success(),
+        "兜底给不出裁决时必须停下，而不是拿「没被拒绝」当「没被忽略」：{output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Refusing to continue") && stderr.contains("使用说明.txt"),
+        "失败得点名那个拿不到裁决的候选：{stderr}"
+    );
+    assert!(
+        sandbox.exists("src/使用说明.txt"),
+        "失败的一轮一个文件都不许动"
+    );
+    assert_eq!(sandbox.read("src/使用说明.txt"), "中文内容\n");
+}
+
+/// 兜底那一路**起来了、退出码 0，但 stdout 是空的**——`FailureMode::SilentStrict` 看一眼退出
+/// 码就放它过去，空结果于是被读成「一个都没被忽略」。
+///
+/// 与上一条的区别在故障形态：上一条是真实 p4 的「无裁决输出」，这一条是空输出本身。两条都
+/// 必须停在原地，因为「p4 说了什么」和「p4 什么都没说」在删除这件事上都不能当成「没被忽略」。
+#[cfg(windows)]
+#[test]
+fn an_empty_add_preview_stops_the_run() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        eprintln!("skipping: rustc is not available to build the p4 shim");
+        return;
+    };
+
+    // 同上：种子里的第一版删掉、提交、再把 have 拉回 #1。
+    sandbox.p4_ok_paths(&["delete"], &["src/使用说明.txt"]);
+    sandbox.p4_ok(&["submit", "-d", "delete the manual"]);
+    sandbox.p4_ok_paths(&["sync"], &["//depot/main/src/使用说明.txt#1"]);
+
+    let output = sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_FAULT_COMMAND", "add")
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "-a"])
+        .arg(".")
+        .output()
+        .expect("run the tool");
+
+    assert!(
+        !output.status.success(),
+        "空输出推不出「没被忽略」，这一轮必须停下：{output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Refusing to continue"),
+        "失败得说清是哪一步拿不到裁决：{stderr}"
+    );
+    assert!(
+        sandbox.exists("src/使用说明.txt"),
+        "失败的一轮一个文件都不许动"
+    );
+}
+
+/// 删除候选的另一条来路：目标时刻该路径还没进 depot（只有 `--to <CL>` 才可能）。保护得一样管。
+///
+/// 与上一条用例共用同一段代码（`analyze_at_target` 那句 `target.get(..)` 返回 `None`），但
+/// 判据是两处不同的入口，而这条入口的现场形状更险：目标 CL 之后才创建的本地文件，工具眼里
+/// 「该路径在目标时刻不存在」，照做就是删掉一份用户刚放进去、还没入库的东西。
+#[test]
+fn an_ignored_candidate_absent_from_the_target_is_left_alone() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // 目标时刻只有 kept.tmp；gone.tmp 是目标之后才提交的。
+    sandbox.commit("kept.tmp", "keep me\n");
+    let target = latest_submitted(&sandbox);
+    sandbox.commit("gone.tmp", "created after the target\n");
+
+    sandbox.write(".p4ignore", "*.tmp\n");
+    let probe = sandbox.p4_ok(&["ignores", "-i", "gone.tmp"]);
+    assert!(
+        probe.contains(" ignored"),
+        "前提不成立：规则没盖住这个文件：{probe}"
+    );
+
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "--to", &target.to_string(), "-a"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Kept 1 file(s)"))
+        .stdout(predicate::str::contains("Deleting").not());
+
+    assert!(sandbox.exists("gone.tmp"), "被忽略的候选不该被删");
+    assert_eq!(sandbox.read("gone.tmp"), "created after the target\n");
+    // have 记录跟着一起留下：清掉的话下一轮它就不再是候选，这份文件从此脱离工具的管理。
+    assert_eq!(sandbox.p4_lines(&["have", "gone.tmp"]).len(), 1);
+    assert!(sandbox.exists("kept.tmp"), "目标处活着的文件不该被动");
+}
+
+/// 被忽略规则盖着、但**已入库且在目标版本上**的本地文件，按它的真实状态参与分析。
+///
+/// 旧实现对这类文件一律当作「本地缺失」（`get_filtered` 返回 `None`）而归进 Restore，
+/// 于是一次 `--sync` 会把用户那份文件重写掉——这是这个模式相对 `p4 sync -f` 唯一多出来的
+/// 静默覆盖。`p4 sync -f` 自己不看 `.p4ignore`，它看到的只是一份改动；这里要与它对齐：
+/// 同样的工作区该报 Revert。
+///
+/// 结果内容两边一致，所以判据只能落在**分组**上——那正是这次行为变化本身。
+#[test]
+fn a_live_ignored_file_is_analyzed_by_its_real_state_not_restored() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox.commit("live.tmp", "first\n");
+    // 提交后必须再同步一次：`submit` 把当时那份（被 `write` 回拨过的）mtime 记成 have 的
+    // syncTime，紧接着再回拨一次正好落进 ±1 秒的捷径窗口。同步一下，两个值就都落在现在。
+    sandbox.sync();
+    sandbox.write(".p4ignore", "*.tmp\n");
+    let probe = sandbox.p4_ok(&["ignores", "-i", "live.tmp"]);
+    assert!(
+        probe.contains(" ignored"),
+        "前提不成立：规则没盖住这个文件：{probe}"
+    );
+
+    // 本地改动（`write` 顺手把 mtime 拨出一小时，默认档据此真的去算摘要）。
+    sandbox.write("live.tmp", "locally changed\n");
+
+    // 判据落在**分组**上：这个工作区在旧实现里报的是 Restoring（被忽略 → 当成缺失 → 无条件
+    // 重写），现在按真实状态报 Revert。内容最后两边一致，所以只有分组能区分这两条语义。
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "-l"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Counted 1 files to sync"))
+        .stdout(predicate::str::contains("Reverting 1 files"))
+        .stdout(predicate::str::contains("Restoring").not());
+    assert_eq!(
+        sandbox.read("live.tmp"),
+        "locally changed\n",
+        "预演不该动文件"
+    );
+
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "-a"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Reverting 1 files"))
+        .stdout(predicate::str::contains("Restoring").not());
+
+    assert_eq!(sandbox.read("live.tmp"), "first\n", "目标版本盖回来");
+}
+
 /// 一条腿失败不该让另一条腿不跑——这是删除组那两条腿最要紧的保证。
 ///
 /// 顺序是先让 p4 清 have 记录、再由自己删文件。这里把文件摁住让删除被系统拒绝，

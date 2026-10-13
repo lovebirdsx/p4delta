@@ -18,7 +18,7 @@ use crate::charset::{
     decode_p4_bytes, p4_command_encoding, p4_encoding, strip_bom, trim_line_ending,
 };
 use crate::cli::Options;
-use crate::json::{count_p4_command, sayln};
+use crate::json::{P4Command, count_p4_command, sayln};
 use crate::model::HaveRecord;
 use crate::p4::marshal::{MarshalRecord, MarshalRecordReader, MarshalStreamParser};
 
@@ -143,7 +143,7 @@ pub(crate) async fn run_p4_have(
 
     let mut child = cmd.spawn()?;
     // 起来了才算一次调用，见 [`count_p4_command`]；上面那个 `?` 失败时早退，不会记账。
-    count_p4_command();
+    count_p4_command(P4Command::Have);
     let P4Pipes {
         arguments,
         stdout,
@@ -492,6 +492,7 @@ pub(crate) async fn run_p4_marshal_batched(
     options: &Options,
     work_dir: &str,
     command: &str,
+    category: P4Command,
     always_args: &[&'static str],
     batched_args: &[String],
 ) -> Result<MarshalRun> {
@@ -509,6 +510,7 @@ pub(crate) async fn run_p4_marshal_batched(
             options,
             work_dir,
             command,
+            category,
             always_args,
             &batched_args[range],
         )
@@ -526,6 +528,7 @@ pub(crate) async fn run_p4_marshal_slice(
     options: &Options,
     work_dir: &str,
     command: &str,
+    category: P4Command,
     always_args: &[&'static str],
     batched_args: &[String],
 ) -> Result<MarshalRun> {
@@ -539,7 +542,7 @@ pub(crate) async fn run_p4_marshal_slice(
     )?;
 
     let mut child = cmd.spawn()?;
-    count_p4_command();
+    count_p4_command(category);
     let P4Pipes {
         arguments,
         stdout,
@@ -674,6 +677,13 @@ pub(crate) enum FailureMode {
     Silent,
     /// 只告警，不失败。查询与预演用它。
     Warn,
+    /// 与 [`Self::Silent`] 同一套判据（不看退出码、不看 stderr——裁决写在 stdout 上），
+    /// **但** p4 压根没跑起来时算失败。
+    ///
+    /// 区别在空结果的读法。文件级过滤拿 [`Self::Silent`]：p4 起不来就交出空结果，调用方
+    /// 那边「没过滤掉任何文件」，方向是保守的。删除保护不能这么读——它问的是「哪些文件被
+    /// 忽略规则盖着」，空结果会被读成「一个都没有」，接着就会把用户的文件删掉。
+    SilentStrict,
     /// 退出码非零即失败，stderr 上的提示不算失败。
     ExitCode,
     /// 退出码非零，**或退出码为 0 但 stderr 有输出**，都算失败。
@@ -707,7 +717,8 @@ fn p4_failure_message(
     mode: FailureMode,
 ) -> Option<String> {
     // Silent 连退出码都不看：调用方要的裁决就写在 stdout 上，非零退出正是其中一种结论。
-    if mode == FailureMode::Silent {
+    // SilentStrict 的判据与它一样，区别只在 p4 起不起来（见 `FailureMode::is_lenient`）。
+    if matches!(mode, FailureMode::Silent | FailureMode::SilentStrict) {
         return None;
     }
 
@@ -721,9 +732,13 @@ fn p4_failure_message(
 }
 
 /// 跑一批 p4 调用中的一片（例如 `p4 stuff a100 a101 ... a198 a199`）。
+///
+/// `command` 是**调用点显式给出的固定类别**（[`P4Command`]），只用于计数与分类上报；
+/// 不从 `always_args` 的 argv 反推——转交路径的参数以 `-Mj` 打头，反推会把整批记错。
 pub(crate) async fn run_p4_command_slice(
     options: &Options,
     work_dir: &str,
+    command: P4Command,
     always_args: &[&'static str],
     batched_args_slice: &[String],
     use_changelist: bool,
@@ -766,7 +781,7 @@ pub(crate) async fn run_p4_command_slice(
         Err(error) => return Err(error.into()),
     };
     // 只有 `Ok` 那一支会走到这里：起不来的进程不占一次调用（见 [`count_p4_command`]）。
-    count_p4_command();
+    count_p4_command(command);
 
     let P4Pipes {
         arguments,
@@ -887,6 +902,7 @@ pub(crate) fn compute_batches(batched_args: &[String]) -> Vec<std::ops::Range<us
 pub(crate) async fn run_p4_command_batched(
     options: &Options,
     work_dir: &str,
+    command: P4Command,
     always_args: &[&'static str],
     batched_args: &[String],
     use_changelist: bool,
@@ -908,6 +924,7 @@ pub(crate) async fn run_p4_command_batched(
             run_p4_command_slice(
                 options,
                 work_dir,
+                command,
                 always_args,
                 &batched_args[range],
                 use_changelist,
@@ -1187,6 +1204,7 @@ mod tests {
         let lenient = task::block_on(run_p4_command_slice(
             &options,
             &work_dir,
+            P4Command::Reconcile,
             &unknown,
             &[],
             false,
@@ -1201,6 +1219,7 @@ mod tests {
         let strict = task::block_on(run_p4_command_slice(
             &options,
             &work_dir,
+            P4Command::Reconcile,
             &unknown,
             &[],
             false,
@@ -1272,5 +1291,24 @@ mod tests {
                 .is_some(),
             "Warn 模式仍要给出消息，由调用方决定怎么处置"
         );
+    }
+
+    /// `SilentStrict` 与 `Silent` 共用「裁决写在 stdout 上」这套判据，区别只在 p4 起不起来：
+    /// 前者必须失败。删除保护靠这一条把「p4 没跑起来」与「一个文件都没被忽略」分开。
+    #[test]
+    fn silent_strict_judges_like_silent_but_fails_when_p4_cannot_start() {
+        assert_eq!(
+            p4_failure_message(
+                "add",
+                false,
+                "exit status: 1",
+                "boom",
+                FailureMode::SilentStrict
+            ),
+            None,
+            "非零退出是被忽略文件的正常信号，不是失败"
+        );
+        assert!(FailureMode::Silent.is_lenient());
+        assert!(!FailureMode::SilentStrict.is_lenient());
     }
 }

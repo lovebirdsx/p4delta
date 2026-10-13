@@ -19,7 +19,7 @@ use super::changes::{
 };
 use super::delete_workspace_files;
 use crate::cli::Options;
-use crate::json::{Mode, sayln};
+use crate::json::{Mode, P4Command, sayln};
 use crate::model::DepotState;
 use crate::p4::process::{FailureMode, run_p4_command_batched};
 use crate::path::local_path_key;
@@ -225,6 +225,7 @@ async fn restore_to_have(options: &Options, work_dir: &str, files: &[RestoreFile
     run_p4_command_batched(
         options,
         work_dir,
+        P4Command::Sync,
         RESTORE_ARGS,
         &specs,
         false,
