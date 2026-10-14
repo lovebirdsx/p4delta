@@ -7,7 +7,6 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use async_global_executor as task;
 use humansize::{BINARY, format_size};
-use walkdir::WalkDir;
 
 use crate::cli::Options;
 use crate::json::{P4Command, ignore_query_count, say_phase, sayln};
@@ -16,10 +15,9 @@ use crate::p4::process::{FailureMode, run_p4_command_batched, split_command_line
 use crate::path::{
     escape_file_spec, local_path_key, normalize_local_path_owned, path_is_under_key,
 };
-use crate::prune::{
-    IGNORES_ARGS, PrunePlan, has_pruned_ancestor, parse_ignores_output, plan_directory_pruning,
-};
+use crate::prune::{IGNORES_ARGS, PrunePlan, parse_ignores_output, plan_directory_pruning};
 use crate::reconcile::changes::NewFile;
+use crate::scan;
 use crate::scope::{EntryKind, ExcludeSet, Scope, ScopeEntry};
 
 /// 扫描范围入口：目录入口递归收集；文件入口直接取单个文件（本地不存在就跳过，
@@ -40,9 +38,13 @@ pub(crate) fn collect_scope_files(
     for entry in includes {
         match entry.kind {
             EntryKind::Directory => {
-                let (mut collected, dirs, size) =
-                    collect_directory(&entry.path, &skip_keys, excludes)?;
-                files.append(&mut collected);
+                let (mut collected, dirs, size) = scan::collect(&entry.path, &skip_keys, excludes)?;
+                // 空表直接接管，避免 append 再分配一张完整文件表。
+                if files.is_empty() {
+                    files = collected;
+                } else {
+                    files.append(&mut collected);
+                }
                 num_dirs += dirs;
                 total_size += size;
             }
@@ -68,19 +70,27 @@ pub(crate) fn collect_workspace_files(
     excludes: &ExcludeSet,
 ) -> Result<(Vec<WorkspaceFile>, usize, u64)> {
     let skip_keys: HashSet<String> = skip_dirs.iter().map(|dir| local_path_key(dir)).collect();
-    let (mut files, num_dirs, total_size) = collect_directory(work_dir, &skip_keys, excludes)?;
+    let (mut files, num_dirs, total_size) = scan::collect(work_dir, &skip_keys, excludes)?;
 
     files.sort_by(|a, b| a.path_lower.cmp(&b.path_lower));
 
     Ok((files, num_dirs, total_size))
 }
 
-/// 递归收集一个目录里的文件。
-fn collect_directory(
+/// 串行的目录收集器（`WalkDir`）。
+///
+/// 两个身份：**非 Windows 平台的产品路径**（`scan` 那条并行实现只在 Windows 上启用了，见
+/// `scan::collect`），以及 Windows 上并行实现的语义对拍基准——结果次序、目录计数、字节数、
+/// 错误选择都要能跟它逐项比（见 `scan.rs` 的用例）。所以 Windows 上也只在测试构建里编它。
+#[cfg(any(not(windows), test))]
+pub(crate) fn collect_directory(
     dir: &str,
     skip_keys: &HashSet<String>,
     excludes: &ExcludeSet,
 ) -> Result<(Vec<WorkspaceFile>, usize, u64)> {
+    use crate::prune::has_pruned_ancestor;
+    use walkdir::WalkDir;
+
     let mut files = Vec::new();
     let mut num_dirs = 0;
     let mut total_size = 0;
@@ -554,7 +564,7 @@ pub(crate) async fn map_new_paths(
 
 /// 把同步扫盘交给阻塞线程池。
 ///
-/// 遍历整段没有 await 点（`WalkDir` 是同步迭代器），留在执行器线程上会让同一轮
+/// 遍历整段没有 await 点（`WalkDir` 与 `scan` 的收集器都是同步的），留在执行器线程上会让同一轮
 /// `futures::join!` 里的 depot 查询一起饿死：那几路只在被 poll 时才读管道，p4 子进程
 /// 填满管道后原地阻塞。冷缓存那一轮实测到的「三路并发退化成串行」就是这样——遍历独占
 /// 执行器的 301s 里，`p4 fstat` 子进程的 CPU 时间纹丝不动、`p4 -G have` 连进程都没起，

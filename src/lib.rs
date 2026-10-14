@@ -29,6 +29,7 @@ mod p4;
 mod path;
 mod prune;
 mod reconcile;
+mod scan;
 mod scope;
 mod scope_config;
 mod workspace;
