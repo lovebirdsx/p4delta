@@ -333,6 +333,38 @@ impl Sandbox {
             .collect()
     }
 
+    /// 这台机器的 p4 能不能从命令行**原样**收到一个非 ASCII 的绝对路径。
+    ///
+    /// Windows 上 p4 把命令行解析两遍——宽字符一遍、ANSI 一遍——再比对两遍得到的参数个数，
+    /// 对不上就报 `Argument parsing ambiguity.` 失败（成因与实测见 `src/p4/process.rs` 的
+    /// `command_line_safe`）。ANSI 那一遍走的是系统代码页（ACP），表示不了的名字在那一步变样。
+    ///
+    /// 所以「命令行能不能收下这个名字」是**运行时**的事实，不是平台的属性：ACP 表示得了这些
+    /// 名字的机器（开了 UTF-8 beta 的是 65001）上这条失败复现不了，CI 的 `windows-latest`
+    /// （en-US）上就撞上了（见 [docs/dev/environment.md](../../docs/dev/environment.md) 的 ACP
+    /// 一节）。`command_line_safe` 因此只能按平台做**静态**分组（Windows 上非 ASCII 一律
+    /// 另走一条通道），而删除保护只有命令行这一条路（`p4 ignores` 不认 `-x`），它必须在运行时
+    /// 自己逐字核对回显。
+    ///
+    /// 用例拿它给「正常跑完」的回归分档：通道无损的机器上跑成功路径，有损的机器上由故障注入
+    /// 用例去证明 fail-closed——那里注入的是「成功退出、输出变形」，与本函数探测的是同一件事。
+    pub fn argv_carries_non_ascii(&self, relative: &str) -> bool {
+        let path = self
+            .client_root
+            .join(relative)
+            .display()
+            .to_string()
+            .replace('/', std::path::MAIN_SEPARATOR_STR);
+        let output = self.p4(&["ignores", "-i", "-v", &path]);
+
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                line.strip_prefix(&path).is_some_and(|verdict| {
+                    verdict == " not ignored" || verdict.starts_with(" ignored by ")
+                })
+            })
+    }
+
     /// 同 [`Sandbox::p4`]，但往 stdin 喂一份表单。
     pub fn p4_input(&self, args: &[&str], form: &str) -> String {
         let mut command = Command::new(&self.tools.p4);

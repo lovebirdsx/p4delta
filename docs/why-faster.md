@@ -81,7 +81,10 @@ open 模式与 `--clean` 共用同一份缓存，两个方向互相加速。
   `p4 ignores`（约 161 秒），而真正要传的只有 177 批。目录剪枝随之一并跳过（它是为省过滤查询量而存在
   的）。唯一还需要问一次的是 `Delete` 组的**候选**（`src/reconcile/sync.rs::protect_delete_candidates`）：
   删除不可逆，而 `p4 sync -f` 自己不看 `.p4ignore`，不查这一下就会删掉用户特意放在那儿、还没入库的
-  东西；失败或输出认不出来时整轮停下，不删（fail-closed）。open / clean 不受影响，仍逐文件过滤。
+  东西；失败或输出认不出来时整轮停下，不删（fail-closed）。Windows 上非 ASCII 的候选按静态判定
+  不交给这项查询，那批改走 `p4 ignores -i -v` 并**逐字核对回显**：回显对不上请求（命令行表示不了
+  那个名字时就是这样）同样整轮停下，不退回 `p4 add -n`——那条途径对已跟踪的路径根本给不出裁决。
+  open / clean 不受影响，仍逐文件过滤。
 - **`p4 where` 只对判定为新增的文件查**（`src/workspace.rs::filter_unmapped_paths`），用来剔除被 client view
   排除行覆盖的路径。注释写明了原因：对全部工作区文件做这件事，在几十万文件的目录上会变成灾难。
 - **路径参数走 stdin 批处理**：`p4 -x - -b N`，一批一个进程（`src/p4/process.rs`）。这最初是为绕开

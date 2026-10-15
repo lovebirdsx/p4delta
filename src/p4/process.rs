@@ -205,20 +205,24 @@ async fn run_p4_have_with(
 ///
 /// `p4 ignores` 不接受：`-i` 只数命令行上的参数，`-x` 送来的一个都看不见，直接报
 /// `At least one file path must provided.` 并退出 1（p4 r24.1 实测；同一批路径挂在命令行上
-/// 就正常，`ignores -v` 反倒认 `-x`）。整个 `ignores` 家族一律按不认处理：`-v` 目前只会
-/// 被无参数调用，用不上 stdin，而少记一条「哪个变体认 `-x`」的例外更不容易出错。
+/// 就正常，`ignores -v` 反倒认 `-x`）。整个 `ignores` 家族一律按不认处理，`-i -v` 也一样：
+/// 少记一条「哪个变体认 `-x`」的例外更不容易出错，而这条家族的路径参数本来就该挂在命令行上
+/// ——回显要逐字核对，走哪个通道不是可以随便换的细节（见
+/// `crate::workspace::query_ignores_verbose`）。
 ///
-/// 代价有两条，都指向同一个后果——非 ASCII 的路径名在 Windows 上失配：
+/// 代价有两条，都指向同一个后果——非 ASCII 的路径名在 Windows 上要走命令行：
 ///
 /// - 这些名字只能挂在命令行上，在 ANSI 代码页表达不了它们的机器上会被转换吃掉（p4 侧的硬限制）；
-/// - `p4 ignores` 因此问不出这些名字的忽略状态。文件级过滤有一条回退：改用同样
-///   认 stdin 的 `p4 add -n` 补判（见 `crate::workspace::apply_file_ignores`）。
-///   目录级剪枝没有回退，那些目录照常完整扫描——只损失性能，不改变结论。
+/// - `p4 ignores` 因此问不出这些名字的忽略状态。两条补救各按自己的口径走：文件级过滤改用同样
+///   认 stdin 的 `p4 add -n` 补一个肯定结论（见 `crate::workspace::query_ignored_refusals`），
+///   删除保护改用命令行上的 `p4 ignores -i -v` 并逐字核对回显（见
+///   `crate::workspace::query_ignores_verbose`）。
+///   目录级剪枝没有补救，那些目录照常完整扫描——只损失性能，不改变结论。
 fn takes_paths_from_stdin(always_args: &[&str]) -> bool {
     !always_args.contains(&"ignores")
 }
 
-/// 该路径能不能安全地挂在 p4 命令行上。
+/// 该路径**静态**判定为不能挂在 p4 命令行上。
 ///
 /// 只有 Windows 需要这道限制。p4 在 Windows 上把命令行解析**两遍**——宽字符一遍
 /// （`GetCommandLineW`）、ANSI 一遍（`GetCommandLineA`）——再比对两遍得到的参数**个数**，
@@ -230,17 +234,22 @@ fn takes_paths_from_stdin(always_args: &[&str]) -> bool {
 /// 判断一起失效（CI 的 windows-latest 是 en-US，CP1252 下 `使用说明.txt` 必然变成
 /// `????.txt`，`tests/e2e_prune.rs` 的三个用例因此全红）。
 ///
-/// 代码页里表示得出来的非 ASCII 字符同样不该送进去：p4 拿到的是代码页字节，却按命令
-/// 字符集（P4COMMANDCHARSET，缺省随 P4CHARSET）解释，两边不一致时照样失配——那正是
-/// 路径参数改走 stdin 的原因（见 [`argument_payload`]）。ASCII 是唯一在两处都是同一串
-/// 字节的集合。
+/// 代码页里表示得出来的非 ASCII 字符同样按不安全处理：p4 拿到的是命令行转写后的字节，
+/// 却按命令字符集（P4COMMANDCHARSET，缺省随 P4CHARSET）解释，两边是否一致取决于**跑这
+/// 一轮的机器**的 ACP；ASCII 是唯一在两处都必然同一串字节的集合。
+///
+/// 这是一道**静态**的分组，说的是「按平台与字符集能确定的风险」，不是「Windows 上非 ASCII
+/// 一定不可用」：ACP 能表示这些字符的机器上（中文 Windows 默认 936）命令行其实是无损的，
+/// 但这一点只有运行时才验得出来。唯一必须走命令行、又想要非 ASCII 的调用点是删除保护
+/// （`p4 ignores` 不认 `-x`，见 [`takes_paths_from_stdin`]），它因此在运行时逐字核对回显，
+/// 见 `crate::workspace::query_ignores_verbose`。
 ///
 /// Unix 上没有这道转换，路径照常交给 p4。
 pub(crate) fn command_line_safe(path: &str) -> bool {
     !cfg!(windows) || path.is_ascii()
 }
 
-/// 把一批路径劈成「能交给 p4 命令行的」与「交不出去的」两半，顺序各自保持。
+/// 把一批路径劈成「静态判定能交给 p4 命令行的」与「交不出去的」两半，顺序各自保持。
 ///
 /// 消费路径的迭代器而不是先要一个 `&[String]`：调用方的路径常散在自己的结构体里
 /// （[`crate::workspace::apply_file_ignores`] 就是从 `WorkspaceFile` 里逐个借出），
@@ -250,9 +259,9 @@ pub(crate) fn command_line_safe(path: &str) -> bool {
 /// 后半不是终点，但两个调用点的善后差得很远，一句通用文案说不准，所以这里只划分、
 /// 不报告——报告交给各自的调用方，在 `-v` 下按自己的口径打印：
 ///
-/// - 文件级过滤有回退：`p4 ignores` 不认 stdin，但 `p4 add -n` 认，于是那些名字改走
-///   那条字节无损的通道补判（见 [`crate::workspace::apply_file_ignores`]）。
-/// - 目录级剪枝没有回退：交不出去的目录照常完整扫描，只损失性能。
+/// - 文件级过滤有补救：`p4 ignores` 不认 stdin，但 `p4 add -n` 认，于是那些名字改走
+///   那条字节无损的通道补判（见 [`crate::workspace::query_ignored_refusals`]）。
+/// - 目录级剪枝没有补救：交不出去的目录照常完整扫描，只损失性能。
 pub(crate) fn split_command_line_paths<'a>(
     paths: impl IntoIterator<Item = &'a String>,
 ) -> (Vec<String>, Vec<String>) {
@@ -685,18 +694,11 @@ pub(crate) enum FailureMode {
     /// 退出码与 stderr 都不作判据：调用方自己解析输出来下结论。
     ///
     /// `p4 add -n` 遇到被忽略的文件**必然**退出 1，而那条正是调用方要的信号
-    /// （见 `crate::workspace::apply_file_ignores` 的补充判据），报成警告只会误导。
+    /// （见 `crate::workspace::query_ignored_refusals`），报成警告只会误导。
     /// p4 起不来时仍按 lenient 降级，不中断整轮。
     Silent,
     /// 只告警，不失败。查询与预演用它。
     Warn,
-    /// 与 [`Self::Silent`] 同一套判据（不看退出码、不看 stderr——裁决写在 stdout 上），
-    /// **但** p4 压根没跑起来时算失败。
-    ///
-    /// 区别在空结果的读法。文件级过滤拿 [`Self::Silent`]：p4 起不来就交出空结果，调用方
-    /// 那边「没过滤掉任何文件」，方向是保守的。删除保护不能这么读——它问的是「哪些文件被
-    /// 忽略规则盖着」，空结果会被读成「一个都没有」，接着就会把用户的文件删掉。
-    SilentStrict,
     /// 退出码非零即失败，stderr 上的提示不算失败。
     ExitCode,
     /// 退出码非零，**或退出码为 0 但 stderr 有输出**，都算失败。
@@ -730,8 +732,7 @@ fn p4_failure_message(
     mode: FailureMode,
 ) -> Option<String> {
     // Silent 连退出码都不看：调用方要的裁决就写在 stdout 上，非零退出正是其中一种结论。
-    // SilentStrict 的判据与它一样，区别只在 p4 起不起来（见 `FailureMode::is_lenient`）。
-    if matches!(mode, FailureMode::Silent | FailureMode::SilentStrict) {
+    if matches!(mode, FailureMode::Silent) {
         return None;
     }
 
@@ -1354,7 +1355,7 @@ mod tests {
         assert_eq!(command_line_safe("/ws/使用说明.txt"), !cfg!(windows));
     }
 
-    /// 两半各自保持原顺序。交不出去的那半不是被丢掉，而是留给 `p4 add -n` 的补充判据。
+    /// 两半各自保持原顺序；高风险路径交给调用方选择 add 预演或逐字校验的 ignores 查询。
     #[test]
     fn split_command_line_paths_separates_what_p4_cannot_read() {
         let paths = vec![
@@ -1449,6 +1450,8 @@ mod tests {
 
     /// `p4 ignores` 不认 `-x`（见 [`takes_paths_from_stdin`]）：路径留在命令行上，
     /// 载荷必须是空的——给它开一条没人读的 stdin，p4 会连命令行上的参数一起忽略掉。
+    ///
+    /// 带 `-v` 的变体（删除保护用的那条）同样如此：它只多要一段更明确的输出，不换通道。
     #[test]
     fn build_p4_command_keeps_ignores_paths_on_the_command_line() {
         let paths = vec!["./a.txt".to_owned()];
@@ -1457,6 +1460,18 @@ mod tests {
             build_p4_command(Path::new("p4"), "/ws", &IGNORES_ARGS, &paths, None, None);
 
         assert_eq!(argv_of(&cmd), ["ignores", "-i", "./a.txt"]);
+        assert!(payload.is_none());
+
+        let (cmd, payload) = build_p4_command(
+            Path::new("p4"),
+            "/ws",
+            &crate::workspace::IGNORES_VERBOSE_ARGS,
+            &paths,
+            None,
+            None,
+        );
+
+        assert_eq!(argv_of(&cmd), ["ignores", "-i", "-v", "./a.txt"]);
         assert!(payload.is_none());
     }
 
@@ -1637,25 +1652,6 @@ mod tests {
                 .is_some(),
             "Warn 模式仍要给出消息，由调用方决定怎么处置"
         );
-    }
-
-    /// `SilentStrict` 与 `Silent` 共用「裁决写在 stdout 上」这套判据，区别只在 p4 起不起来：
-    /// 前者必须失败。删除保护靠这一条把「p4 没跑起来」与「一个文件都没被忽略」分开。
-    #[test]
-    fn silent_strict_judges_like_silent_but_fails_when_p4_cannot_start() {
-        assert_eq!(
-            p4_failure_message(
-                "add",
-                false,
-                "exit status: 1",
-                "boom",
-                FailureMode::SilentStrict
-            ),
-            None,
-            "非零退出是被忽略文件的正常信号，不是失败"
-        );
-        assert!(FailureMode::Silent.is_lenient());
-        assert!(!FailureMode::SilentStrict.is_lenient());
     }
 
     /// 假 p4 的源码（现场编译，见 [`crate::test_util::compile_fake_exe`]）：在读 stdin

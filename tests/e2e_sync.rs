@@ -1164,57 +1164,255 @@ fn an_unusable_ignores_verdict_stops_the_run() {
     assert_eq!(sandbox.read("protected.tmp"), "keep me\n");
 }
 
-/// Windows 上非 ASCII 的删除候选挂不到 p4 命令行上（见 `command_line_safe`），只能走
-/// `p4 add -n` 兜底。而兜底对一条 p4 已跟踪的路径回的是 `//depot/...#N - opened for add` 或
-/// `can't add existing file`——**里面没有忽略信息**，「没被拒绝」推不出「没被忽略」。
+// 下面这组 helper 只给非 ASCII 命令行通道那几条用例用，而那些用例都是 `#[cfg(windows)]`——
+// 在别的平台上它们就是死代码，clippy 的 `-D warnings` 会因此变红。
+
+/// 探针用的非 ASCII 名字：只要它能原样回来，这条命令行通道就是无损的。
+#[cfg(windows)]
+const NON_ASCII_PROBE: &str = "中文目录/探针.tmp";
+
+/// 命令行能不能无损收到非 ASCII 路径（见 [`support::Sandbox::argv_carries_non_ascii`]）。
 ///
-/// 拿不到肯定裁决就不许删：这一轮直接停下，一个文件都不动。这是有意的取舍——比删错便宜。
-/// Unix 上没有这条兜底（路径都交得到命令行上），用例只在 Windows 有意义。
+/// 只有「正常跑完」那一类用例需要分档：通道有损的机器上，生产代码的结论就是 fail-closed
+/// 停下，成功路径在那里根本不存在。fail-closed 那半由故障注入用例覆盖，它们在两种机器上
+/// 都跑。
+#[cfg(windows)]
+fn non_ascii_argv_available(sandbox: &support::Sandbox) -> bool {
+    if sandbox.argv_carries_non_ascii(NON_ASCII_PROBE) {
+        return true;
+    }
+
+    eprintln!(
+        "skipping: p4 on this machine cannot carry non-ASCII paths on the command line \
+         (the system ANSI code page cannot represent them); the happy path is not exercisable \
+         here, see the fault-injection cases for the fail-closed half"
+    );
+    false
+}
+
+/// 从 shim 的调用日志读出这一轮起过的 p4 进程（见 `tests/support/p4shim.rs`）。
+#[cfg(windows)]
+fn shim_calls(log: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// 日志里调用了这个命令的那些行。p4 的全局选项会排在命令名前面，所以按 token 比。
+#[cfg(windows)]
+fn shim_call_with<'a>(calls: &'a [String], command: &str) -> Vec<&'a String> {
+    calls
+        .iter()
+        .filter(|line| line.split_whitespace().any(|token| token == command))
+        .collect()
+}
+
+/// 把一批路径从 depot 删掉并提交，再把 have 拉回 #1：得到「head 说删了、本地还有一份」的
+/// 删除组。非 ASCII 的名字挂不到命令行上，入库与删除一律走 stdin。
+#[cfg(windows)]
+fn delete_candidates_after_a_submit(sandbox: &support::Sandbox, paths: &[&str]) {
+    for path in paths {
+        sandbox.write(path, "keep me\n");
+    }
+    sandbox.p4_ok_paths(&["add"], paths);
+    sandbox.p4_ok(&["submit", "-d", "add the unicode set"]);
+    sandbox.p4_ok_paths(&["delete"], paths);
+    sandbox.p4_ok(&["submit", "-d", "delete them"]);
+
+    let specs: Vec<String> = paths
+        .iter()
+        .map(|path| format!("//depot/main/{path}#1"))
+        .collect();
+    let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+    sandbox.p4_ok_paths(&["sync"], &specs);
+}
+
+/// Windows 上非 ASCII 的删除候选挂不到 p4 命令行上（见 `command_line_safe`），旧实现只能走
+/// `p4 add -n` 兜底。而兜底对一条 p4 已跟踪的路径回的是 `//depot/...#N - opened for add` 或
+/// `can't add existing file`——**里面没有忽略信息**，「没被拒绝」推不出「没被忽略」，于是拿不到
+/// 裁决就整轮停下。
+///
+/// 现在这条通道改用 `p4 ignores -i -v`：它同样只认命令行，但对**每条**请求路径都回一行明确的
+/// 裁决（`not ignored` / `ignored by <规则来源>`），并把请求的路径原样回显。同一份现场于是能正常
+/// 跑完——被规则盖着的留下（连 have 记录一起），没被盖着的照删。
+///
+/// 五条候选把非 ASCII 的几种形状都摆上：中文目录、含空格的名字、方括号目录与文件名；裁决两个
+/// 方向都有，少一个方向就证明不了这是「逐路径」的判断。
 #[cfg(windows)]
 #[test]
-fn an_unreadable_delete_candidate_without_a_verdict_stops_the_run() {
+fn a_non_ascii_delete_candidate_is_judged_by_the_verbatim_ignores_query() {
+    const KEPT: [&str; 3] = [
+        "中文目录/被忽略的.tmp",
+        "空 格 名字.tmp",
+        "[方括号]目录/方括号文件.tmp",
+    ];
+    const DELETED: [&str; 2] = ["中文目录/照删的.txt", "[方括号]目录/方括号文件.txt"];
+
     let Some(sandbox) = support::sandbox_or_skip() else {
         return;
     };
+    let Some(shim) = support::P4Shim::build() else {
+        eprintln!("skipping: rustc is not available to build the p4 shim");
+        return;
+    };
+    if !non_ascii_argv_available(&sandbox) {
+        return;
+    }
 
-    // 种子里的 `src/使用说明.txt` 已经是入库的第一版：把它删掉、提交，再把 have 拉回 #1，
-    // 就得到「head 说删了、本地还有一份」的形状。删除命令走 stdin（见 `p4_ok_paths`）——
-    // 非 ASCII 的名字挂不到命令行上，这正是生产代码这里要面对的那个限制。
-    sandbox.p4_ok_paths(&["delete"], &["src/使用说明.txt"]);
-    sandbox.p4_ok(&["submit", "-d", "delete the manual"]);
-    sandbox.p4_ok_paths(&["sync"], &["//depot/main/src/使用说明.txt#1"]);
+    let all: Vec<&str> = KEPT.iter().chain(DELETED.iter()).copied().collect();
+    delete_candidates_after_a_submit(&sandbox, &all);
+    sandbox.write(".p4ignore", "*.tmp\n");
 
-    let output = sandbox
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+
+    sandbox
         .cli()
-        .args(["--sync", "--force", "-a"])
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "-a", "-v"])
         .arg(".")
-        .output()
-        .expect("run the tool");
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "5 path(s) are not statically safe on the p4 command line",
+        ))
+        .stdout(predicate::str::contains("Deleting 2 files"))
+        .stdout(predicate::str::contains("Kept 3 file(s)"));
 
+    // 被规则盖着的原样留着：内容与 have 记录都不许动。have 尤其要紧——清掉的话下一轮它就不再
+    // 是删除候选，用户那份文件从此脱离工具的管理。
+    for path in KEPT {
+        assert!(sandbox.exists(path), "{path} 被规则盖住，不该删");
+        assert_eq!(sandbox.read(path), "keep me\n", "{path} 的内容不该被动");
+        assert_eq!(
+            sandbox.p4_lines(&["have", path]).len(),
+            1,
+            "{path} 的 have 记录要一起留下"
+        );
+    }
+    // 没被盖着的照删，连 have 记录一起清掉。
+    for path in DELETED {
+        assert!(!sandbox.exists(path), "{path} 没被规则盖住，照删");
+        assert!(
+            sandbox.p4_lines(&["have", path]).is_empty(),
+            "{path} 的 have 记录该一起清掉"
+        );
+    }
+    assert!(sandbox.opened().is_empty(), "sync never opens files");
+
+    // 范围与通道两条都要钉住：问的就是这五个删除候选，一次 `ignores -i -v` 收完；旧实现那条
+    // `p4 add -n` 兜底一次都不许出场（它给不出裁决）。
+    let calls = shim_calls(&log);
+    let ignores = shim_call_with(&calls, "ignores");
+    assert_eq!(ignores.len(), 1, "五个删除候选该合成一批：{calls:?}");
     assert!(
-        !output.status.success(),
-        "兜底给不出裁决时必须停下，而不是拿「没被拒绝」当「没被忽略」：{output:?}"
+        ignores[0].contains("-i") && ignores[0].contains("-v"),
+        "非 ASCII 那一路要的是逐路径明说裁决的 -i -v：{:?}",
+        ignores[0]
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    for path in &all {
+        // 日志里记的是 p4 拿到的绝对路径，而用例手里的名字是相对工作区的；分隔符折成与生产
+        // 代码同一口径（`normalize_local_path_owned`）。
+        let absolute = sandbox
+            .client_root()
+            .join(path)
+            .display()
+            .to_string()
+            .replace('/', std::path::MAIN_SEPARATOR_STR);
+        assert!(
+            ignores[0].contains(&absolute),
+            "{absolute} 该在查询里：{:?}",
+            ignores[0]
+        );
+    }
     assert!(
-        stderr.contains("Refusing to continue") && stderr.contains("使用说明.txt"),
-        "失败得点名那个拿不到裁决的候选：{stderr}"
+        !ignores[0].contains("readme.txt"),
+        "没进删除组的文件不该被问：{:?}",
+        ignores[0]
     );
     assert!(
-        sandbox.exists("src/使用说明.txt"),
-        "失败的一轮一个文件都不许动"
+        !calls.iter().any(|line| line.contains("add -n")),
+        "中文候选有裁决可用，兜底查询不该出场：{calls:?}"
     );
-    assert_eq!(sandbox.read("src/使用说明.txt"), "中文内容\n");
 }
 
-/// 兜底那一路**起来了、退出码 0，但 stdout 是空的**——`FailureMode::SilentStrict` 看一眼退出
-/// 码就放它过去，空结果于是被读成「一个都没被忽略」。
+/// 删除候选的另一条来路：目标时刻该路径还没进 depot（只有 `--to <CL>` 才可能）。非 ASCII 的
+/// 候选在这条路上同样要拿到逐字裁决——被规则盖着的留下，没被盖着的照删。
 ///
-/// 与上一条的区别在故障形态：上一条是真实 p4 的「无裁决输出」，这一条是空输出本身。两条都
-/// 必须停在原地，因为「p4 说了什么」和「p4 什么都没说」在删除这件事上都不能当成「没被忽略」。
+/// 与 head 已删除那条共用同一段代码，但现场形状更险：目标 CL 之后才放进去的本地文件，工具眼里
+/// 「该路径在目标时刻不存在」，照做就是删掉一份用户刚放进去、还没入库的东西。
 #[cfg(windows)]
 #[test]
-fn an_empty_add_preview_stops_the_run() {
+fn a_non_ascii_candidate_absent_from_the_target_is_judged_verbatim() {
+    const KEPT: &str = "中文目录/目标后新增的.tmp";
+    const DELETED: &str = "中文目录/目标后新增的.txt";
+
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    if !non_ascii_argv_available(&sandbox) {
+        return;
+    }
+
+    // 目标时刻只有这一份，两份候选是目标之后才提交的。
+    sandbox.write("中文目录/目标时的.txt", "in the depot at the target\n");
+    sandbox.p4_ok_paths(&["add"], &["中文目录/目标时的.txt"]);
+    sandbox.p4_ok(&["submit", "-d", "at the target"]);
+    let target = latest_submitted(&sandbox);
+
+    sandbox.write(KEPT, "created after the target\n");
+    sandbox.write(DELETED, "created after the target\n");
+    sandbox.p4_ok_paths(&["add"], &[KEPT, DELETED]);
+    sandbox.p4_ok(&["submit", "-d", "created after the target"]);
+
+    sandbox.write(".p4ignore", "*.tmp\n");
+
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "--to", &target.to_string(), "-a"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Deleting 1 files"))
+        .stdout(predicate::str::contains("Kept 1 file(s)"));
+
+    assert!(sandbox.exists(KEPT), "被忽略的候选不该被删");
+    assert_eq!(
+        sandbox.read(KEPT),
+        "created after the target\n",
+        "内容不该被动"
+    );
+    assert_eq!(
+        sandbox.p4_lines(&["have", KEPT]).len(),
+        1,
+        "have 记录要一起留下"
+    );
+    assert!(!sandbox.exists(DELETED), "没被规则盖住，照删");
+    assert!(
+        sandbox.p4_lines(&["have", DELETED]).is_empty(),
+        "没被保护的路径该连 have 记录一起清掉"
+    );
+    assert!(
+        sandbox.exists("中文目录/目标时的.txt"),
+        "目标处活着的文件不该被动"
+    );
+}
+
+/// 新通道**起来了、退出码 0，但 stdout 是空的**：一条裁决都没有。
+///
+/// 空输出单看就是「一个都没被忽略」，照着做等于把用户的文件删掉——这正是删除保护最不能接受
+/// 的读法。判据因此不是退出码，而是「每条请求路径都拿到了一条明确裁决」；少一条就整轮停下。
+///
+/// 故障由转发 shim 把 `ignores` 的输出整段换掉来注入（见 `tests/support/p4_shim_main.rs`），
+/// 真实 p4 在正常输入下不会这么回。同一轮里还放了一个**本该被更新**的文件：失败必须发生在应用
+/// 之前，只验证删除候选没动是不够的。
+#[cfg(windows)]
+#[test]
+fn an_empty_verbose_ignores_output_stops_the_run() {
     let Some(sandbox) = support::sandbox_or_skip() else {
         return;
     };
@@ -1223,15 +1421,21 @@ fn an_empty_add_preview_stops_the_run() {
         return;
     };
 
-    // 同上：种子里的第一版删掉、提交、再把 have 拉回 #1。
+    // 删除候选：种子里那份中文说明删掉、提交、have 拉回 #1；另加一个本地改过的 readme.txt，
+    // 它在这一轮本该被 Revert。
     sandbox.p4_ok_paths(&["delete"], &["src/使用说明.txt"]);
     sandbox.p4_ok(&["submit", "-d", "delete the manual"]);
     sandbox.p4_ok_paths(&["sync"], &["//depot/main/src/使用说明.txt#1"]);
+    sandbox.write("readme.txt", "locally changed\n");
+
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
 
     let output = sandbox
         .cli()
         .env("P4_EXE", &shim.path)
-        .env("P4DELTA_SHIM_FAULT_COMMAND", "add")
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_FAULT_COMMAND", "ignores")
         .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
         .args(["--sync", "--force", "-a"])
         .arg(".")
@@ -1244,12 +1448,202 @@ fn an_empty_add_preview_stops_the_run() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Refusing to continue"),
-        "失败得说清是哪一步拿不到裁决：{stderr}"
+        stderr.contains("Refusing to continue") && stderr.contains("使用说明.txt"),
+        "失败得说清是哪一条候选拿不到裁决：{stderr}"
+    );
+    assert_eq!(
+        sandbox.read("readme.txt"),
+        "locally changed\n",
+        "整轮要在应用之前停下，本该被 Revert 的文件一个字节都不许动"
     );
     assert!(
         sandbox.exists("src/使用说明.txt"),
         "失败的一轮一个文件都不许动"
+    );
+
+    // 通道本身也要钉住：这一轮问的是 `ignores -i -v`（旧实现走的是 `p4 add -n` 兜底），
+    // 而且只问删除候选。
+    let calls = shim_calls(&log);
+    let ignores = shim_call_with(&calls, "ignores");
+    assert_eq!(ignores.len(), 1, "只该为删除候选问一次：{calls:?}");
+    assert!(
+        ignores[0].contains("-i") && ignores[0].contains("-v"),
+        "要的是逐路径明说裁决的 -i -v：{:?}",
+        ignores[0]
+    );
+    assert!(
+        !calls.iter().any(|line| line.contains("add -n")),
+        "Strict 那一路不许回退到 add 预演：{calls:?}"
+    );
+}
+
+/// 成功路径的**确定性**覆盖：由 shim 回一条逐字正确的裁决，不依赖这台机器的命令行收不收得下
+/// 非 ASCII 名字。
+///
+/// 上面两条要先过 `non_ascii_argv_available`，通道有损的机器上整段跳过，成功路径在那里就没有
+/// 覆盖。这条用例改注入：先跑一轮**空输出**（那一轮必然 fail-closed），从它的报错里取出生产
+/// 代码真正发出去的那条候选路径——回显必须逐字等于它，所以这条路径只能这么拿，自己拼出来的
+/// 可能差一个字符（盘符大小写、分隔符），而差一个字符正是这条校验要挡的事——再把这条路径原样
+/// 回给它一条 `not ignored`，让这一轮真的删掉那份文件。
+#[cfg(windows)]
+#[test]
+fn an_injected_verbatim_verdict_deletes_the_candidate() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        eprintln!("skipping: rustc is not available to build the p4 shim");
+        return;
+    };
+
+    // 删除候选只有一条：种子里那份中文说明，删掉、提交、have 拉回 #1。
+    sandbox.p4_ok_paths(&["delete"], &["src/使用说明.txt"]);
+    sandbox.p4_ok(&["submit", "-d", "delete the manual"]);
+    sandbox.p4_ok_paths(&["sync"], &["//depot/main/src/使用说明.txt#1"]);
+
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+
+    let refused = sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_FAULT_COMMAND", "ignores")
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "-a"])
+        .arg(".")
+        .output()
+        .expect("run the tool");
+
+    assert!(!refused.status.success(), "空输出必须停下：{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let candidate = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| line.ends_with("使用说明.txt"))
+        .unwrap_or_else(|| panic!("报错该点名拿不到裁决的那条候选：{stderr}"))
+        .to_owned();
+
+    // 第二轮：同一条路径、同一个裁决格式，这一轮该真的删掉。
+    let _ = std::fs::remove_file(&log);
+    sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_FAULT_COMMAND", "ignores")
+        .env(
+            "P4DELTA_SHIM_FAULT_STDOUT",
+            format!("{candidate} not ignored\n"),
+        )
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "-a", "-v"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "Verdict from \"p4 ignores -i -v\": {candidate} not ignored"
+        )))
+        .stdout(predicate::str::contains("Deleting 1 files"));
+
+    assert!(
+        !sandbox.exists("src/使用说明.txt"),
+        "裁决说没被忽略，这一轮就该把它删掉"
+    );
+    assert!(
+        sandbox.p4_lines(&["have", "src/使用说明.txt"]).is_empty(),
+        "have 记录该一起清掉"
+    );
+    assert!(sandbox.opened().is_empty(), "sync never opens files");
+
+    let calls = shim_calls(&log);
+    let ignores = shim_call_with(&calls, "ignores");
+    assert_eq!(ignores.len(), 1, "只该为删除候选问一次：{calls:?}");
+    assert!(
+        ignores[0].contains("-i") && ignores[0].contains("-v"),
+        "要的是逐路径明说裁决的 -i -v：{:?}",
+        ignores[0]
+    );
+    assert!(
+        !calls.iter().any(|line| line.contains("add -n")),
+        "Strict 那一路不许回退到 add 预演：{calls:?}"
+    );
+}
+
+/// 通道**回了话，但回显的路径不是请求的那一条**：命令行表示不了那个名字的机器上就是这样
+/// （成因与实测见 `docs/dev/environment.md` 的 ACP 一节），回显于是成了另一个名字。
+///
+/// 这种输出不能当裁决用：它说的可能压根是另一个文件。判据是逐字前缀——回显必须与请求逐字
+/// 相同，否则整轮停下。
+///
+/// 那些机器上真实 p4 通常连可用输出都交不出来（直接报 `Argument parsing ambiguity.`），
+/// 所以这里由 shim 注入更难挡住的那一半：p4 起来了、退出码 0，回显却是另一个名字。
+#[cfg(windows)]
+#[test]
+fn a_mangled_echo_stops_the_run() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        eprintln!("skipping: rustc is not available to build the p4 shim");
+        return;
+    };
+
+    sandbox.p4_ok_paths(&["delete"], &["src/使用说明.txt"]);
+    sandbox.p4_ok(&["submit", "-d", "delete the manual"]);
+    sandbox.p4_ok_paths(&["sync"], &["//depot/main/src/使用说明.txt#1"]);
+    sandbox.write("readme.txt", "locally changed\n");
+
+    // 表示不了的名字在命令行上被换掉之后长什么样：这里用 `?` 指代那个换出来的名字。
+    let mangled = format!(
+        "{}\\src\\????.txt not ignored\n",
+        sandbox.client_root().display()
+    );
+
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+
+    let output = sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_FAULT_COMMAND", "ignores")
+        .env("P4DELTA_SHIM_FAULT_STDOUT", &mangled)
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "-a"])
+        .arg(".")
+        .output()
+        .expect("run the tool");
+
+    assert!(
+        !output.status.success(),
+        "回显对不上请求就不能当裁决，这一轮必须停下：{output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Refusing to continue"),
+        "失败得说清是裁决不可靠：{stderr}"
+    );
+    assert_eq!(
+        sandbox.read("readme.txt"),
+        "locally changed\n",
+        "整轮要在应用之前停下"
+    );
+    assert!(
+        sandbox.exists("src/使用说明.txt"),
+        "失败的一轮一个文件都不许动"
+    );
+
+    let calls = shim_calls(&log);
+    let ignores = shim_call_with(&calls, "ignores");
+    assert_eq!(ignores.len(), 1, "只该为删除候选问一次：{calls:?}");
+    assert!(
+        ignores[0].contains("-i") && ignores[0].contains("-v"),
+        "要的是逐路径明说裁决的 -i -v：{:?}",
+        ignores[0]
+    );
+    assert!(
+        !calls.iter().any(|line| line.contains("add -n")),
+        "Strict 那一路不许回退到 add 预演：{calls:?}"
     );
 }
 

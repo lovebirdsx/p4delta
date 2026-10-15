@@ -45,3 +45,5 @@ Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' | Select 
 ```
 
 返回值是 65001 就说明本地没有复现条件，别再花时间在本地试非 ASCII 文件名——直接按「非 ASCII 命令行参数」这一假设去读代码（相关实现：`src/p4/process.rs` 的 `command_line_safe`），或推一次 CI 取数据。
+
+这条事实现在有一处**依赖**它：强制修复的删除保护只能走命令行（`p4 ignores` 不认 stdin），它因此不按平台一刀切，而是运行时逐字核对 p4 回显的路径（`src/workspace.rs::query_ignores_verbose`）——能表示这些名字的机器上照常跑完，表示不了的机器上 fail-closed 停下。对应的两条 e2e 成功用例按同一条事实分档（`Sandbox::argv_carries_non_ascii`），第三条成功用例改由 shim 注入逐字裁决、因此不依赖它；见 [e2e.md](e2e.md)。
