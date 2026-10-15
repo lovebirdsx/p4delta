@@ -1526,3 +1526,221 @@ fn a_changelist_is_ignored_with_a_warning() {
         .stdout(predicate::str::contains("Sync mode"))
         .stdout(predicate::str::contains("Using pending changelist 5").not());
 }
+
+/// 旧命令行预算下的贪心批数，照抄 `compute_batches` 的算式（参数字符数 + 1 累计，
+/// 上限 32767 - 2048）。用例拿它给新预算的批数封顶：stdin 载荷变大了，批数不该
+/// 反而变多。
+fn legacy_command_line_batches(specs: &[String]) -> usize {
+    const BUDGET: usize = 32767 - 2048;
+
+    let mut batches = 0;
+    let mut size = 0usize;
+    for spec in specs {
+        if size > 0 && size + spec.len() > BUDGET {
+            batches += 1;
+            size = 0;
+        }
+        size += spec.len() + 1;
+    }
+    if size > 0 {
+        batches += 1;
+    }
+    batches
+}
+
+/// 两组深路径在旧预算下都超过 8 批，逐次对账 shim 启动数与 summary，
+/// 并逐文件核对内容及 have。A/B 每次重新建沙箱；基线另设 P4DELTA_E2E_LEGACY_BATCHES。
+#[test]
+fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
+    use serde_json::Value;
+
+    const TOTAL: usize = 9000;
+    const RESTORED: usize = 3000;
+    // 五层各 17 字节的目录 + 10 字节文件名：相对路径 ~百字节，全路径远离 MAX_PATH。
+    const RELATIVE_DIR: &str =
+        "bulk/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef";
+
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        eprintln!("skipping: rustc is not available to build the p4 shim");
+        return;
+    };
+
+    // 一次 add、一次 submit 入库并同步到工作区（have 就位），内容带序号、每个文件不同。
+    let contents: Vec<String> = (0..TOTAL)
+        .map(|index| format!("base {index:04}\n"))
+        .collect();
+    for (index, content) in contents.iter().enumerate() {
+        sandbox.write(&format!("{RELATIVE_DIR}/f{index:04}.txt"), content);
+    }
+    sandbox.p4_ok(&["add", "bulk/..."]);
+    sandbox.p4_ok(&["submit", "-d", "bulk deep paths"]);
+    sandbox.sync();
+
+    // update 组（head 前进、工作区落后）：在 depot 里提交第二版，再把 have 拉回第一版。
+    // 本地内容回到第一版；仍在磁盘上的文件构成 update 候选。
+    // 直接改本地内容是不行的：内容与 have 不同只会进 revert（还原），那是另一组。
+    let second: Vec<String> = (0..TOTAL)
+        .map(|index| format!("changed {index:04}\n"))
+        .collect();
+    sandbox.p4_ok(&["edit", "bulk/..."]);
+    for (index, content) in second.iter().enumerate() {
+        sandbox.write(&format!("{RELATIVE_DIR}/f{index:04}.txt"), content);
+    }
+    sandbox.p4_ok(&["submit", "-d", "bulk deep paths v2"]);
+    sandbox.p4_ok(&["sync", "//depot/main/bulk/...#1"]);
+
+    // restore 组：前 RESTORED 个本地文件删掉（have 记录还在）。
+    for index in 0..RESTORED {
+        sandbox.remove(&format!("{RELATIVE_DIR}/f{index:04}.txt"));
+    }
+
+    // 下发规格（测试自算上限用）：force 无 --to 时目标就是 head（rev 2）。
+    let depot_prefix = "//depot/main/";
+    let update_specs: Vec<String> = (RESTORED..TOTAL)
+        .map(|index| format!("{depot_prefix}{RELATIVE_DIR}/f{index:04}.txt#2"))
+        .collect();
+    let restore_specs: Vec<String> = (0..RESTORED)
+        .map(|index| format!("{depot_prefix}{RELATIVE_DIR}/f{index:04}.txt#2"))
+        .collect();
+    let legacy_batches =
+        legacy_command_line_batches(&update_specs) + legacy_command_line_batches(&restore_specs);
+    let expected_batches = if std::env::var_os("P4DELTA_E2E_LEGACY_BATCHES").is_some() {
+        legacy_batches
+    } else {
+        legacy_command_line_batches(&update_specs).min(8)
+            + legacy_command_line_batches(&restore_specs).min(8)
+    };
+    assert!(
+        legacy_batches > 16,
+        "夹具必须超过两组各 8 批，才能检验调用数下降"
+    );
+
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+
+    let output = sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "-a", "--json"])
+        .arg(".")
+        .output()
+        .expect("run tool");
+    assert!(
+        output.status.success(),
+        "run failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+    let records: Vec<Value> = stdout
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|error| panic!("stdout 里混进了非 JSON 行: {line:?} ({error})"))
+        })
+        .collect();
+    let summary = records.last().expect("记录流里至少有一条 summary");
+    assert_eq!(summary["kind"], "summary", "{summary}");
+
+    let counts = summary["counts"]
+        .as_object()
+        .expect("summary 必须带 counts");
+    assert_eq!(
+        counts.get("update"),
+        Some(&(TOTAL - RESTORED).into()),
+        "{summary}"
+    );
+    assert_eq!(
+        counts.get("restore"),
+        Some(&(RESTORED as u64).into()),
+        "{summary}"
+    );
+    assert_eq!(
+        counts.get("revert"),
+        None,
+        "内容与 have 一致的文件不该进 revert：{summary}"
+    );
+    assert_eq!(counts.get("delete"), None, "{summary}");
+    assert_eq!(
+        summary["total"],
+        (TOTAL - RESTORED + RESTORED) as u64,
+        "全部候选都落在 update/restore 两组：{summary}"
+    );
+
+    // shim 的逐次启动记录：sync 行数与 summary 对拍，各批 -b 条数之和必须等于
+    // update + restore 的规格总数。
+    let calls: Vec<String> = std::fs::read_to_string(&log)
+        .expect("shim log must exist")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let sync_calls: Vec<&String> = calls
+        .iter()
+        .filter(|line| line.split_whitespace().any(|token| token == "sync"))
+        .collect();
+    let by_command = summary["p4CallsByCommand"].as_object().expect("对象");
+    assert_eq!(
+        sync_calls.len() as u64,
+        by_command["sync"].as_u64().unwrap_or(0),
+        "shim 启动数与自报计数对不上\ncalls: {sync_calls:?}\n{summary}"
+    );
+    assert_eq!(
+        sync_calls.len(),
+        expected_batches,
+        "sync 实际启动数不符合分批策略：{sync_calls:?}"
+    );
+
+    let specs_per_batch: Vec<usize> = sync_calls
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .skip_while(|token| *token != "-b")
+                .nth(1)
+                .and_then(|count| count.parse().ok())
+                .expect("每一批的 -b 后面都是本批条数")
+        })
+        .collect();
+    assert_eq!(
+        specs_per_batch.iter().sum::<usize>(),
+        TOTAL,
+        "各批条数之和必须等于 update + restore 的规格总数：{specs_per_batch:?}"
+    );
+    assert!(
+        specs_per_batch.iter().all(|count| *count <= 8192),
+        "单批条数超过 stdin 的条数上限：{specs_per_batch:?}"
+    );
+
+    // 终态：update 组前进到第二版，restore 组被写回的也是目标（head）版本；
+    // have 全部停在 head（rev 2）。
+    for (index, content) in second.iter().enumerate() {
+        assert_eq!(
+            sandbox.read(&format!("{RELATIVE_DIR}/f{index:04}.txt")),
+            *content,
+            "文件 {index} 的内容不对"
+        );
+    }
+    let have = sandbox.p4_lines(&["have", "//depot/main/bulk/..."]);
+    assert_eq!(
+        have.len(),
+        TOTAL,
+        "have 记录数与入库文件数一致：{:?}",
+        have.first()
+    );
+    for line in &have {
+        assert!(line.contains("#2"), "have 应全部停在 head：{line}");
+    }
+
+    // A/B 汇总：两次跑（基线与工作区构建）各留一行可比对的数字。
+    eprintln!(
+        "p4delta A/B: sync={} fstat={} have={} total={} batches={specs_per_batch:?}",
+        by_command["sync"],
+        by_command["fstat"].as_u64().unwrap_or(0),
+        by_command["have"].as_u64().unwrap_or(0),
+        summary["p4Calls"],
+    );
+}

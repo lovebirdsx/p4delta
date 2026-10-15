@@ -36,7 +36,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::cli::Options;
 use crate::json::{FileRecord, Mode, P4Command, count, emit_file, emit_progress, sayln};
 use crate::p4::marshal::MarshalRecord;
-use crate::p4::process::{compute_batches, run_p4_marshal_batched, run_p4_marshal_slice};
+use crate::p4::process::{plan_stdin_batches, run_p4_marshal_batched, run_p4_marshal_slice};
 use crate::path::local_path_key;
 use crate::scope::Scope;
 
@@ -569,7 +569,9 @@ async fn apply(
     let mut failures: Vec<String> = Vec::new();
     let mut applied: Vec<Candidate> = Vec::new();
 
-    for range in compute_batches(&specs) {
+    // 下发批次按 stdin 的硬上限规划、目标 1 批：串行纪律保持（一批收完再发下一批），
+    // 变的只是不再按旧的命令行长度预算把几万条规格拆成几十个进程。
+    for range in plan_stdin_batches(&specs, 1) {
         // 管道或解析损坏在这里变成 Err：直接向上抛，已经报告过的批次留在输出里。
         let run = run_p4_marshal_slice(
             options,

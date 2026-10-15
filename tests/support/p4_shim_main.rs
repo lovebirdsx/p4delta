@@ -26,7 +26,8 @@ fn main() {
             .append(true)
             .open(&log)
         {
-            let _ = writeln!(file, "{}", args.join(" "));
+            // 整行一次追加，避免并发进程把正文与换行交错写入。
+            let _ = file.write_all(format!("{}\n", args.join(" ")).as_bytes());
         }
     }
 

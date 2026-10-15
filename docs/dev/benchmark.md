@@ -45,6 +45,27 @@ pwsh -File scripts/test-benchmark.ps1
    目标快照组则整组前移到首轮 poll。这两组连同查询行按多重集比，其余结构行照旧逐行 diff。
 3. **计时行归一化**：`sed 's/[0-9.]* seconds/<T> seconds/'` 之后再比。
 
+比较分批策略时，`Running "p4 …" with N batches.` 与 JSON summary 的 `p4Calls` /
+`p4CallsByCommand` 是预期变化，单独对账而非当作行为差异忽略。动作多重集、范围、
+成功状态及文件/have 终态仍须一致。
+
+## 分批策略沙箱 A/B
+
+修改源码前保存基线 release 产物。对同一测试分别指定基线与新构建，每次都会新建独立沙箱，
+不能在已经被第一轮修好的工作区上直接跑第二轮。基线模式只更换预期批数，不放宽终态断言：
+
+```bash
+P4_E2E_REQUIRED=1 P4DELTA_E2E_BIN=<基线exe绝对路径> P4DELTA_E2E_LEGACY_BATCHES=1 \
+  cargo nextest run -E 'test(a_bulk_deep_path_sync)' --no-capture
+P4_E2E_REQUIRED=1 cargo nextest run -E 'test(a_bulk_deep_path_sync)' --no-capture
+```
+
+该场景创建 9000 个合成长路径文件（update 6000、restore 3000），逐文件验证内容与 have #2，
+并把 shim 启动次数、`-b` 参数总量与 summary 对账。2026-10-15 Windows 实测：
+0.1.13 基线 sync 30 / 总调用 34，新策略 sync 16 / 总调用 20；两边终态断言均通过。
+这不是用户真实工作区的加速比例，也不是耗时基准（测试时长包含建库和准备文件）。
+
+
 两个会得出错误结论的陷阱：
 
 - **PowerShell 里 `git diff --no-index a b 2>$null` 会静默失败**：不输出任何内容、看起来像「零差异」，实际是命令没跑成。别用它下「逐字节一致」的结论，改用 `diff`、`Get-FileHash` 或 `fc`。

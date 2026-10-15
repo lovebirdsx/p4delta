@@ -15,8 +15,8 @@ use crate::cli::Options;
 use crate::json::{P4Command, count_p4_command, sayln};
 use crate::model::{DepotFileRecord, DepotState, FileAction, TargetMap, TargetRecord};
 use crate::p4::process::{
-    MAX_PARALLEL_P4_COMMANDS, P4Pipes, build_p4_command, compute_batches, read_p4_stderr,
-    take_p4_pipes, write_p4_arguments,
+    MAX_PARALLEL_P4_COMMANDS, P4Pipes, build_p4_command, compute_batches, plan_stdin_batches,
+    read_p4_stderr, take_p4_pipes, write_p4_arguments,
 };
 use crate::path::{local_path_key, normalize_local_path_owned};
 use crate::scope::ExcludeSet;
@@ -203,6 +203,10 @@ pub(crate) async fn run_p4_fstat_slice(
 }
 
 /// 分批跑 `p4 fstat`（并发有上限），返回解析好的记录。
+///
+/// 批次按 stdin 的硬上限规划，并发度维持该次调用在旧命令行预算下的水平
+/// （`min(旧批数, 8)`）——大工作区的基线补查在旧预算下本来就是九批上下，
+/// 大载荷不该让这个并发掉下去。
 pub(crate) async fn run_p4_fstat_batched(
     options: &Options,
     work_dir: &str,
@@ -210,7 +214,8 @@ pub(crate) async fn run_p4_fstat_batched(
     batched_args: &[String],
     strict: bool,
 ) -> Result<Vec<DepotFileRecord>> {
-    let batches = compute_batches(batched_args);
+    let legacy = compute_batches(batched_args).len();
+    let batches = plan_stdin_batches(batched_args, legacy.min(MAX_PARALLEL_P4_COMMANDS));
 
     sayln!(
         "      Running \"p4 {}\" with {} batches.",

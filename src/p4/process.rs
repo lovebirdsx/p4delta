@@ -22,11 +22,7 @@ use crate::json::{P4Command, count_p4_command, sayln};
 use crate::model::HaveRecord;
 use crate::p4::marshal::{MarshalRecord, MarshalRecordReader, MarshalStreamParser};
 
-// 参数改成从 stdin 交给 p4 之后（见 [`argument_payload`]），这个数字不再是 Win32 命令行
-// 长度上限（32767 字符，https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/command-line-string-limitation）。
-// 保留原值有两个理由：一是让分片粒度不变（片数也就是 [`run_p4_command_batched`] 的并发度），
-// 二是 [`takes_paths_from_stdin`] 说不认 `-x` 的命令（`p4 ignores`）仍把路径挂在命令行上，
-// 它们依旧受那个上限约束。
+// argv 路径（ignores）保留原命令行预算；stdin 仅借它计算原有并发宽度，载荷另设上限。
 pub(crate) const ARGUMENT_LENGTH_MAX: usize = 32767 - 2048;
 
 /// 交给 p4 的参数载荷：一行一个参数，按 `encoding`（p4 的命令字符集）编码。
@@ -125,11 +121,23 @@ pub(crate) async fn run_p4_have(
     work_dir: &str,
     specs: &[String],
 ) -> Result<HashMap<String, HaveRecord>> {
+    run_p4_have_with(crate::locate::p4_exe()?, options, work_dir, specs).await
+}
+
+/// [`run_p4_have`] 的本体，p4 可执行文件由调用方给：生产路径传定位结果，
+/// 测试传受控的假子进程，让「三条管道并发推」的回归不必依赖机器上有没有 p4
+/// （`p4_exe()` 有 OnceLock 缓存，测试进程里也换不掉）。
+async fn run_p4_have_with(
+    program: &Path,
+    options: &Options,
+    work_dir: &str,
+    specs: &[String],
+) -> Result<HashMap<String, HaveRecord>> {
     sayln!("   Querying file sync timestamps.");
     let start_time = Instant::now();
 
     let (mut cmd, payload) = build_p4_command(
-        crate::locate::p4_exe()?,
+        program,
         work_dir,
         HAVE_ARGS,
         specs,
@@ -150,8 +158,10 @@ pub(crate) async fn run_p4_have(
         stderr,
     } = take_p4_pipes(&mut child, payload)?;
 
-    // 参数在 stdin 上：写完关掉管道，p4 才读得到 EOF。
-    write_p4_arguments(arguments).await;
+    // 三条管道必须并发推，理由与 [`run_p4_marshal_slice`] 相同：先写完 stdin 再读输出的话，
+    // 一份塞满 stdout 管道的响应会把子进程堵在写上，于是它不来读 stdin，我们这边
+    // 大载荷的 `write_all` 也到不了头——两条管道互相等，整轮挂死。
+    let write_args = write_p4_arguments(arguments);
 
     // 边读边解析：大工作区的原始响应有好几 GB，整份缓冲下来正是当初把内存撑爆的原因。
     let read_stdout = async move {
@@ -172,7 +182,7 @@ pub(crate) async fn run_p4_have(
 
     let read_stderr = read_p4_stderr(stderr);
 
-    let (records, stderr_bytes) = futures::join!(read_stdout, read_stderr);
+    let (_, records, stderr_bytes) = futures::join!(write_args, read_stdout, read_stderr);
     let records = records?;
 
     let status = child.status().await?;
@@ -488,6 +498,9 @@ enum RecordVerdict {
 ///
 /// **顺序**而不是并发：这条路只服务普通同步，而它的写入动作由 p4 自己判定覆盖保护与
 /// opened 状态，多进程并发下发并没有被验证过；先要正确，再谈快。
+///
+/// 批次按 stdin 的硬上限规划（目标 1 批），不再走旧的命令行长度预算——预演下发的
+/// 同一批规格数量可达几万条，旧预算会把它拆成二十几个串行进程。
 pub(crate) async fn run_p4_marshal_batched(
     options: &Options,
     work_dir: &str,
@@ -496,7 +509,7 @@ pub(crate) async fn run_p4_marshal_batched(
     always_args: &[&'static str],
     batched_args: &[String],
 ) -> Result<MarshalRun> {
-    let batches = compute_batches(batched_args);
+    let batches = plan_stdin_batches(batched_args, 1);
     let mut run = MarshalRun {
         records: Vec::new(),
         notices: Vec::new(),
@@ -897,6 +910,152 @@ pub(crate) fn compute_batches(batched_args: &[String]) -> Vec<std::ops::Range<us
     batches
 }
 
+/// 走 stdin（`-x -`）的批次的两条硬上限。stdin 不受 Win32 命令行 32767 字符的约束，
+/// 继续按 [`ARGUMENT_LENGTH_MAX`] 预算切批只会让一次调用拆出几十个进程；256 KiB
+/// 让典型的大批量从二十几批降到个位数。条数上限兜的是另一种失衡——全是短路径时
+/// 按字节切不出批。两者都只影响分片粒度（进程数），不影响语义。
+const STDIN_PAYLOAD_MAX: usize = 256 * 1024;
+
+/// 一批最多多少条 spec，见 [`STDIN_PAYLOAD_MAX`]。
+const STDIN_SPEC_MAX: usize = 8192;
+
+/// 一个参数在 stdin 载荷里占的字节：按 [`argument_payload`] 的实际编码算（编码后的
+/// 参数 + 一个换行）。非 ASCII 不用字符数近似——多字节编码与字符集的替代文本
+/// （`&#NNNN;`）都会让真实载荷偏离字符数，按字符数切批会切出超载的进程输入。
+fn stdin_argument_len(arg: &str, encoding: &'static Encoding) -> usize {
+    let (bytes, _, _) = encoding.encode(arg);
+    bytes.len() + 1
+}
+
+/// 把一段（至少两个参数的）连续 range 对半切成两半：前半按字节装到总长的一半为止，
+/// 但至少给后半留一个参数。
+fn split_range_in_half(
+    lengths: &[usize],
+    range: std::ops::Range<usize>,
+) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let total: usize = lengths[range.clone()].iter().sum();
+    let mut acc = 0usize;
+    let mut split = range.start + 1;
+
+    for (index, &len) in lengths
+        .iter()
+        .enumerate()
+        .take(range.end - 1)
+        .skip(range.start)
+    {
+        acc += len;
+        split = index + 1;
+        if acc * 2 >= total {
+            break;
+        }
+    }
+
+    (range.start..split, split..range.end)
+}
+
+/// 按「批容量不超过 `capacity`」装填的贪心切分，条数上限与超载参数独占照旧生效。
+/// `capacity` 越大批数越少，批数随它单调不增——这是对它二分的依据。
+fn capacity_greedy_ranges(lengths: &[usize], capacity: usize) -> Vec<std::ops::Range<usize>> {
+    let limit = capacity.min(STDIN_PAYLOAD_MAX);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut payload = 0usize;
+    let mut specs = 0usize;
+
+    for (index, &len) in lengths.iter().enumerate() {
+        if specs > 0 && (payload + len > limit || specs == STDIN_SPEC_MAX) {
+            ranges.push(start..index);
+            start = index;
+            payload = 0;
+            specs = 0;
+        }
+
+        payload += len;
+        specs += 1;
+    }
+
+    if specs > 0 {
+        ranges.push(start..lengths.len());
+    }
+
+    ranges
+}
+
+/// stdin 批次规划：在硬上限内把参数切成若干连续、不重不漏的 range。
+///
+/// `min_batches` 是**并发度目标**：并行路径传该次调用在旧预算（[`compute_batches`]）下的
+/// 实际批数与 [`MAX_PARALLEL_P4_COMMANDS`] 的较小者——256 KiB 预算下最少批数往往远小于
+/// 它，不补足的话一次调用的并发会从 8 掉到 1；串行路径传 1，批数就是硬约束下的最少批数。
+///
+/// 「总字节除以上限」只是批数的下界：长参数混短参数、条数上限、超载参数都会让同样
+/// 的字节切出更多的批，这里不做「ceil 后精确装满」的假设。硬下界之上的批数靠二分
+/// 「批容量」取齐：容量越小批数越多，能给出 ≤ 目标批数的最小容量同时把**最大批的
+/// 字节**压到最优——并发下墙钟跟着最大批走，这正是要均衡的量。容量最优的批数仍不足
+/// 目标时（长短悬殊的参数装不出更多批），把最大的批对半补足；对半是子集切分，载荷、
+/// 条数与「超载参数独占」在子集上原样成立。目标批数封顶在参数个数——两个参数不为
+/// 凑并发拆成八批。
+pub(crate) fn plan_stdin_batches(
+    batched_args: &[String],
+    min_batches: usize,
+) -> Vec<std::ops::Range<usize>> {
+    if batched_args.is_empty() {
+        return Vec::new();
+    }
+
+    let encoding = p4_command_encoding();
+    let lengths: Vec<usize> = batched_args
+        .iter()
+        .map(|arg| stdin_argument_len(arg, encoding))
+        .collect();
+
+    let target = min_batches.min(batched_args.len());
+
+    let fewest = capacity_greedy_ranges(&lengths, STDIN_PAYLOAD_MAX);
+    if fewest.len() >= target {
+        return fewest;
+    }
+
+    // 二分最小的批容量，使按它装填的批数 ≤ 目标。搜索下界是最大的单参数：容量再小
+    // 连一个参数都装不下，只会让每个参数独占一批。
+    let mut low = lengths.iter().copied().max().unwrap_or(1);
+    let mut high = STDIN_PAYLOAD_MAX.max(low);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if capacity_greedy_ranges(&lengths, mid).len() <= target {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    let mut ranges = capacity_greedy_ranges(&lengths, low);
+
+    // 容量最优也装不出目标批数时补批：反复把字节最大的批对半。
+    while ranges.len() < target {
+        let mut biggest: Option<(usize, usize)> = None;
+        for (index, range) in ranges.iter().enumerate() {
+            if range.end - range.start <= 1 {
+                continue;
+            }
+            let bytes = lengths[range.start..range.end].iter().sum::<usize>();
+            if biggest.is_none_or(|(_, known)| bytes > known) {
+                biggest = Some((index, bytes));
+            }
+        }
+        // 批数 < target ≤ 参数个数 时必有一批装着至少两个参数，否则批数早已等于
+        // 参数个数。`break` 是给这个不变量被破坏时的保险，正常到不了。
+        let Some((index, _)) = biggest else {
+            break;
+        };
+
+        let range = ranges.remove(index);
+        let (head, tail) = split_range_in_half(&lengths, range);
+        ranges.insert(index, tail);
+        ranges.insert(index, head);
+    }
+
+    ranges
+}
+
 /// 把成千上万个参数分批交给 p4：每一批是一个独立的进程，参数从它的 stdin 送进去。
 /// `mode` 不是 [FailureMode::Warn] 时任何一批失败都算失败，调用方必须放弃基于输出的判断。
 pub(crate) async fn run_p4_command_batched(
@@ -908,7 +1067,15 @@ pub(crate) async fn run_p4_command_batched(
     use_changelist: bool,
     mode: FailureMode,
 ) -> Result<Vec<String>> {
-    let batches = compute_batches(batched_args);
+    // 两种参数通道两套预算：stdin 批次按大载荷规划，但并发度维持该次调用在旧命令行
+    // 预算下的水平（`min(旧批数, 8)`）——批数掉了就是并发掉了；`p4 ignores` 这类参数
+    // 留在命令行上的命令仍受 32767 字符约束，继续用 [`compute_batches`]。
+    let batches = if takes_paths_from_stdin(always_args) {
+        let legacy = compute_batches(batched_args).len();
+        plan_stdin_batches(batched_args, legacy.min(MAX_PARALLEL_P4_COMMANDS))
+    } else {
+        compute_batches(batched_args)
+    };
 
     sayln!(
         "      Running \"p4 {}\" with {} batches.",
@@ -971,6 +1138,185 @@ mod tests {
     #[test]
     fn empty_arguments_produce_no_batches() {
         assert!(compute_batches(&[]).is_empty());
+    }
+
+    /// stdin 批次的载荷字节数与 [`argument_payload`] 实际写出的字节一致：多字节编码
+    /// 与字符集的替代文本（`&#NNNN;`）都会让真实载荷偏离字符数，planner 按字符数
+    /// 切批就会切出超载的进程输入。
+    #[test]
+    fn stdin_argument_len_matches_the_payload_actually_written() {
+        let samples = [
+            "//depot/readme.txt",
+            "//depot/使用说明.txt",
+            "a",
+            &"x".repeat(100_000),
+        ];
+        for arg in samples {
+            for encoding in [UTF_8, WINDOWS_1252] {
+                let (payload, _) = argument_payload(&[arg.to_owned()], encoding);
+                assert_eq!(
+                    payload.len(),
+                    stdin_argument_len(arg, encoding),
+                    "{arg} in {}",
+                    encoding.name()
+                );
+            }
+        }
+
+        // 同一个名字在 winansi 里走数字引用，一个汉字膨胀到 8 字节——按字符数近似
+        // 会把它算成 1。
+        let (utf8_payload, _) = argument_payload(&["//depot/使.txt".to_owned()], UTF_8);
+        let (winansi_payload, _) = argument_payload(&["//depot/使.txt".to_owned()], WINDOWS_1252);
+        assert!(winansi_payload.len() > utf8_payload.len());
+    }
+
+    #[test]
+    fn stdin_planning_of_no_arguments_is_no_batches() {
+        assert!(plan_stdin_batches(&[], 1).is_empty());
+        assert!(plan_stdin_batches(&[], 8).is_empty());
+    }
+
+    /// 小输入不膨胀：串行目标下两个短参数就是一批。并发目标高于参数个数时批数封顶在
+    /// 参数个数（真实接线里目标来自 `min(旧批数, 8)`，小输入的旧批数是 1，到不了 8）。
+    #[test]
+    fn stdin_planning_does_not_fan_out_a_tiny_input() {
+        let args = vec!["//depot/a.txt".to_owned(), "//depot/b.txt".to_owned()];
+        assert_eq!(plan_stdin_batches(&args, 1), vec![0..2]);
+        assert_eq!(plan_stdin_batches(&args, 8), vec![0..1, 1..2]);
+    }
+
+    /// 单个参数本身超过载荷上限时独占一批：绝不拆参数、也不切出空批。
+    /// 前后的短参数各自成批，不与它合并（合不进去）。
+    #[test]
+    fn an_oversized_stdin_argument_gets_its_own_batch() {
+        let huge = "x".repeat(STDIN_PAYLOAD_MAX);
+        let args = vec!["//depot/a".to_owned(), huge, "//depot/b".to_owned()];
+
+        assert_eq!(plan_stdin_batches(&args, 1), vec![0..1, 1..2, 2..3]);
+        // 并发目标也不改变它的独占地位。
+        assert_eq!(plan_stdin_batches(&args, 8), vec![0..1, 1..2, 2..3]);
+    }
+
+    /// 加进来正好等于载荷上限不切，再多一个字节就切。边界按「参数编码 + 换行」累计。
+    #[test]
+    fn a_stdin_payload_that_fills_the_limit_exactly_stays_in_one_batch() {
+        let half = "x".repeat(STDIN_PAYLOAD_MAX / 2 - 1);
+        let args = vec![half.clone(), half];
+        assert_eq!(plan_stdin_batches(&args, 1), vec![0..2]);
+
+        let args = vec![
+            "x".repeat(STDIN_PAYLOAD_MAX / 2 - 1),
+            "x".repeat(STDIN_PAYLOAD_MAX / 2),
+        ];
+        assert_eq!(plan_stdin_batches(&args, 1), vec![0..1, 1..2]);
+    }
+
+    /// 全是短参数时条数上限兜底：8193 条切成 2 批，第一批恰好 8192 条。
+    #[test]
+    fn stdin_planning_respects_the_spec_count_limit() {
+        let args: Vec<String> = (0..STDIN_SPEC_MAX + 1)
+            .map(|index| format!("//depot/f{index}"))
+            .collect();
+
+        let batches = plan_stdin_batches(&args, 1);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].end - batches[0].start, STDIN_SPEC_MAX);
+        assert_eq!(batches[1].end - batches[1].start, 1);
+    }
+    /// 串行目标 1：批数就是硬约束下的贪心最少批数，不被拉到 8。
+    #[test]
+    fn serial_stdin_planning_takes_the_fewest_batches_the_limits_allow() {
+        // 每条 17.5KB：旧命令行预算下一条一批，256 KiB 预算下一批装 14 条。
+        let args: Vec<String> = (0..60).map(|_| "x".repeat(17_500)).collect();
+
+        assert_eq!(plan_stdin_batches(&args, 1).len(), 5);
+    }
+
+    /// 并行目标补足：硬下界只有 5 批时，批容量二分把目标 8 批的最大批字节压到最优，
+    /// 并发宽度是该次调用原有的，大载荷不该让它掉下去。
+    #[test]
+    fn parallel_stdin_planning_fills_up_to_the_target_width_and_balances_bytes() {
+        let args: Vec<String> = (0..60).map(|_| "x".repeat(17_500)).collect();
+        let total: usize = 60 * 17_501;
+
+        let batches = plan_stdin_batches(&args, 8);
+        assert_eq!(batches.len(), 8);
+
+        // 等长参数下「最大批」的下界是 ceil(60/8) = 8 条：再小批数就超过目标。
+        // 最优切分应恰好达到这个下界，没有一批吃掉别人的份额。
+        let payload_of = |range: &std::ops::Range<usize>| {
+            args[range.clone()]
+                .iter()
+                .map(|arg| arg.len() + 1)
+                .sum::<usize>()
+        };
+        let bytes: Vec<usize> = batches.iter().map(payload_of).collect();
+        assert_eq!(
+            bytes.iter().copied().max(),
+            Some(8 * 17_501),
+            "最大批没有压到等长参数的下界：{bytes:?}"
+        );
+        assert_eq!(bytes.iter().sum::<usize>(), total, "字节守恒：{bytes:?}");
+    }
+
+    /// 旧预算下的批数决定并行目标：目标批数不因载荷变大而低于 `min(旧批数, 8)`，
+    /// 也不会超过参数个数。
+    #[test]
+    fn parallel_stdin_planning_never_drops_below_the_legacy_width() {
+        // 旧预算（30719 字节）下每条一批：60 批 → 目标 min(60, 8) = 8。
+        let args: Vec<String> = (0..60).map(|_| "x".repeat(20_000)).collect();
+        let legacy = compute_batches(&args).len();
+        assert_eq!(legacy, 60);
+        assert_eq!(plan_stdin_batches(&args, legacy.min(8)).len(), 8);
+
+        // 旧预算只有 1 批的小输入：目标 1（= min(1, 8)，真实接线里的形状），新 planner 不放大并发。
+        let small = vec!["a".to_owned(), "b".to_owned()];
+        assert_eq!(compute_batches(&small).len(), 1);
+        assert_eq!(plan_stdin_batches(&small, 1), vec![0..2]);
+    }
+
+    /// 任何输入、任何并发目标下：批内连续、拼接恰好覆盖全部参数、每批满足硬上限
+    /// （超载参数独占是唯一例外）、批数不超过参数个数。
+    #[test]
+    fn stdin_batches_stay_continuous_bounded_and_exhaustive() {
+        let mut args: Vec<String> = vec![
+            "//depot/使用说明.txt".to_owned(),
+            "x".repeat(STDIN_PAYLOAD_MAX + 5),
+            "x".repeat(STDIN_PAYLOAD_MAX / 2),
+            String::new(),
+            "y".repeat(17_500),
+        ];
+        args.extend((0..STDIN_SPEC_MAX + 7).map(|index| format!("//depot/f{index}")));
+        args.push("z".repeat(STDIN_PAYLOAD_MAX));
+
+        for min_batches in [1usize, 2, 8, 100] {
+            let batches = plan_stdin_batches(&args, min_batches);
+
+            let mut covered = Vec::new();
+            for range in &batches {
+                assert!(!range.is_empty(), "空批：{min_batches}");
+                let specs = range.end - range.start;
+                let payload: usize = args[range.clone()]
+                    .iter()
+                    .map(|arg| stdin_argument_len(arg, UTF_8))
+                    .sum();
+                assert!(
+                    payload <= STDIN_PAYLOAD_MAX || (specs == 1 && payload > STDIN_PAYLOAD_MAX),
+                    "批超载且不是超载参数独占：{min_batches} {range:?} {payload}"
+                );
+                assert!(
+                    specs <= STDIN_SPEC_MAX,
+                    "批条数超限：{min_batches} {range:?}"
+                );
+                covered.extend(range.clone());
+            }
+            assert_eq!(
+                covered,
+                (0..args.len()).collect::<Vec<_>>(),
+                "覆盖不完整或乱序：{min_batches}"
+            );
+            assert!(batches.len() <= args.len());
+        }
     }
 
     /// p4 按命令字符集解码 stdin 上的参数（实测：非法字节会换来
@@ -1310,5 +1656,106 @@ mod tests {
         );
         assert!(FailureMode::Silent.is_lenient());
         assert!(!FailureMode::SilentStrict.is_lenient());
+    }
+
+    /// 假 p4 的源码（现场编译，见 [`crate::test_util::compile_fake_exe`]）：在读 stdin
+    /// **之前**把 stdout 灌满 4 MiB 的合法 marshal 记录、把 stderr 灌满 1 MiB。它复现的
+    /// 是「父进程先写完 stdin 再读输出」的调用方式——大载荷把父进程堵在 stdin 写上，
+    /// 假进程堵在 stdout 写上，两条管道互相等。走 stdin 的载荷必须超过管道容量
+    /// （Windows 上 64 KiB），否则一次 `write_all` 就送完了，死锁复现不出来。
+    const FAKE_P4_SOURCE: &str = r#"
+use std::io::{Read, Write};
+
+fn mstring(value: &[u8]) -> Vec<u8> {
+    let mut out = vec![b's'];
+    out.extend_from_slice(&(value.len() as i32).to_le_bytes());
+    out.extend_from_slice(value);
+    out
+}
+
+fn main() {
+    // 卡住时由假进程自行终止，父调用仍走 status().await 回收，不遗留管道或子进程。
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::process::exit(124);
+    });
+    // 合法 marshal 字典：'{' + 键值对 + '0' 终止。code 取 info，have 解析器对它
+    // 照常消费、不投影成记录——这里只需要格式合法的体积。
+    let filler = vec![b'x'; 64 * 1024];
+    let mut record = vec![b'{'];
+    record.extend(mstring(b"code"));
+    record.extend(mstring(b"info"));
+    record.extend(mstring(b"data"));
+    record.extend(mstring(&filler));
+    record.push(b'0');
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    for _ in 0..64 {
+        let _ = stdout.write_all(&record);
+    }
+    let _ = stdout.flush();
+
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    let err_chunk = vec![b'e'; 64 * 1024];
+    for _ in 0..16 {
+        let _ = stderr.write_all(&err_chunk);
+    }
+    let _ = stderr.flush();
+
+    let mut payload = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut payload);
+    // cwd 由被测代码设成 work_dir，落盘路径因此可预测。
+    let _ = std::fs::write("fake-stdin-payload.bin", &payload);
+}
+"#;
+
+    /// [`run_p4_have`] 的三条管道必须并发推。假 p4 在读 stdin 前灌满 stdout 与 stderr，
+    /// 「先写完 stdin 再读输出」的旧实现会死锁在「我们等 stdin 写完、它等 stdout 排空」
+    /// 上。假进程的 30 秒看门狗会终止阻塞，父调用等待并回收后以失败退出。
+    #[test]
+    fn have_does_not_deadlock_when_the_fake_fills_stdout_before_reading_stdin() {
+        use std::time::{Duration, Instant};
+
+        let fake = compile_fake_exe("fake-p4", FAKE_P4_SOURCE)
+            .expect("必须能编译假 p4，背压回归不能静默跳过");
+
+        let tree = TempTree::new("p4-have-backpressure");
+        let work_dir = tree.root.to_string_lossy().to_string();
+        // specs 全 ASCII：任何命令字符集下编码一致，期望载荷可以在本地构造。
+        let specs: Vec<String> = (0..3000)
+            .map(|index| format!("//depot/fake/long_path_{index:04}/file.bin"))
+            .collect();
+        let mut expected_payload = Vec::new();
+        for spec in &specs {
+            expected_payload.extend_from_slice(spec.as_bytes());
+            expected_payload.push(b'\n');
+        }
+        assert!(expected_payload.len() > 64 * 1024, "载荷必须超过管道容量");
+
+        let options = Options::parse_from(["p4delta", "-w", "p4delta-test"]);
+        let started = Instant::now();
+        let outcome = task::block_on(run_p4_have_with(&fake, &options, &work_dir, &specs));
+
+        // 假进程的输出合法但不是 have 记录（code 是 info）：解析照常完成，记录为空。
+        assert!(
+            outcome.is_ok(),
+            "parsing the fake marshal stream failed: {outcome:?}"
+        );
+
+        // 假进程真的读到了完整的 stdin 载荷——三路并发推的直接证据。
+        let payload_path = tree.root.join("fake-stdin-payload.bin");
+        let payload = std::fs::read(&payload_path).unwrap_or_else(|error| {
+            panic!(
+                "the fake p4 never wrote its stdin payload to {}: {error}",
+                payload_path.display()
+            )
+        });
+        assert_eq!(payload, expected_payload);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the call only finishes inside the timeout budget"
+        );
     }
 }

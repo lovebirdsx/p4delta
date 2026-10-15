@@ -162,6 +162,10 @@ impl Sandbox {
     }
 
     /// 被测程序的命令行，已注入沙箱环境，工作目录是 client Root。
+    ///
+    /// 设了 `P4DELTA_E2E_BIN` 时用它替代 cargo 产物：同一用例分别跑基线与工作区构建
+    /// （A/B 对比调用数与终态），或本地调试某个既不是 `p4delta` 也不是最新构建的可执行文件。
+    /// 它也继承 `cli_in` 的沙箱环境——被测程序拿到的隔离与 cargo 产物完全一致。
     pub fn cli(&self) -> assert_cmd::Command {
         self.cli_in(&self.client_root)
     }
@@ -169,7 +173,10 @@ impl Sandbox {
     /// 同 [`Sandbox::cli`]，但从 `cwd` 启动。多根布局用例要从 AltRoot 里发起：
     /// `p4 info` 按 cwd 认根，启动目录会决定它报哪一个。
     pub fn cli_in(&self, cwd: &Path) -> assert_cmd::Command {
-        let mut command = assert_cmd::Command::cargo_bin("p4delta").expect("binary must build");
+        let mut command = match std::env::var_os("P4DELTA_E2E_BIN") {
+            Some(exe) => assert_cmd::Command::new(exe),
+            None => assert_cmd::Command::cargo_bin("p4delta").expect("binary must build"),
+        };
         command.env_clear();
         command.envs(self.env());
         command.current_dir(cwd);

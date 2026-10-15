@@ -179,6 +179,65 @@ pub(crate) const CHILD_CASE_TEST_NAME: &str = "p4_environment_child_case";
 /// fixture 里的配置文件名，只给子进程设置，不动这台机器的全局配置。
 pub(crate) const TEST_P4CONFIG_NAME: &str = ".p4config";
 
+/// 测试机上的 rustc。与 `tests/support/p4shim.rs` 的同名定位同源（那边是黑盒测试
+/// crate，引用不到这里的 `pub(crate)` 设施）：先按 `CARGO` 的兄弟文件找，再退回 `PATH`。
+fn rustc_exe() -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) { "rustc.exe" } else { "rustc" };
+
+    if let Some(cargo) = env::var_os("CARGO") {
+        let sibling = Path::new(&cargo).with_file_name(exe_name);
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+    }
+
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(exe_name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// 现场编译一个独立的假可执行文件（源码由调用方给，只用 std），返回产物路径；
+/// 找不到 rustc 或编译失败时返回 `None`，调用方按「skipping:」的约定跳过。
+///
+/// 产物落在临时目录、文件名带源码指纹：同一份源码跨用例、跨测试进程复用，
+/// 源码一改旧产物自然失效，不需要另外的时间戳文件。指纹与 `tests/support/p4shim.rs`
+/// 的 FNV-1a 是同一个常数——它只防意外复用，不抗碰撞。
+pub(crate) fn compile_fake_exe(name: &str, source: &str) -> Option<PathBuf> {
+    let rustc = rustc_exe()?;
+
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in source.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    let exe = env::temp_dir().join(format!("p4delta-{name}-{hash:016x}{suffix}"));
+    if exe.is_file() {
+        return Some(exe);
+    }
+
+    let source_path = env::temp_dir().join(format!("p4delta-{name}-{hash:016x}.rs"));
+    std::fs::write(&source_path, source).ok()?;
+    let output = std::process::Command::new(rustc)
+        .arg("--edition")
+        .arg("2021")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .ok()?;
+    if output.status.success() && exe.is_file() {
+        Some(exe)
+    } else {
+        eprintln!(
+            "Warning: could not compile the fake {name} exe: {}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        );
+        None
+    }
+}
+
 /// 用受控环境重新运行本测试二进制里的子用例（`p4_environment_child_case`）。
 /// 需要读 `.p4config` 的用例必须这么跑：进程内的环境改不了，
 /// 而机器的注册表里未必有 P4CONFIG，只有子进程能拿到确定的环境。
