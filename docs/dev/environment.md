@@ -16,6 +16,29 @@ cargo test --all-targets --all-features --locked
 
 关于 e2e 在缺 p4d/p4 时的跳过行为与 CI 的 `P4_E2E_REQUIRED` 门禁，见 [e2e.md](e2e.md)。
 
+## p4 先连服务器，再跑子命令
+
+p4 在跑任何子命令之前**先建立到 `P4PORT` 的连接**：连不上就报
+`Connect to server failed; check $P4PORT.`、退出码 1——**连非法 flag（`p4 reconcile --bogus`）也不例外**，命令行的本地解析排在连接之后。这一点造成一处稳定的本地/CI 差异：
+
+- **开发机**上 p4 有配置（注册表或 `P4*` 环境变量，`p4 set` 能看到），连接瞬间完成；
+- **CI runner** 上什么都没有，p4 兜底去连 `perforce:1666`，DNS 解析加连接超时**每次约 4.7 秒**。
+
+代价落在「拿一个必然失败的 p4 查询当夹具」的单元测试上（它们要的只是「退出码非零 + stderr 有内容」，并不需要连上谁）。2026-10-15 实测，`p4::process::tests::strict_p4_queries_reject_failed_output` 与 `prune::tests::pruning_plan_falls_back_when_a_p4_query_fails` 各调两次 p4，在 windows-latest 上是 **11.0 / 10.9 秒**，本机 0.12 / 0.19 秒，两条合计占该 job 全部用例耗时之和的 14%。
+
+所以 CI 的 `Run tests` 给测试进程设了 `P4PORT=nonexistent.invalid:1666`：
+
+```bash
+# 本机复现 CI 条件（没有 P4 配置的机器天然就是这个条件）
+P4_E2E_REQUIRED=1 P4PORT=nonexistent.invalid:1666 cargo nextest run --all-targets --all-features
+```
+
+`.invalid` 是 RFC 2606 保留 TLD，保证解析不了，p4 在 **150 毫秒**内报同一个
+`Connect to server failed`——失败语义一字不变，只是不再等网络。别图省事换
+`127.0.0.1:1`：本地端口被拒后 p4 仍要 **2.1 秒**才返回（实测），比 `.invalid` 慢一个量级。
+
+两处不受影响：**e2e 沙箱**给被测程序的环境里不继承任何 `P4*` 变量、自己设指向实例 p4d 的 `P4PORT`；**测试发现**走的是 `p4_available()` 的 `p4 -V`，它不需要服务器。本机 491 条在这种环境变量下全绿、整轮墙钟与有服务器时持平（2026-10-15）。
+
 ## WSL：验 Linux 侧行为
 
 装了多个发行版时要显式 `-d` 指定（默认发行版未必与 CI 钉的版本相同），挑与 CI 同版本的，比如 `Ubuntu-24.04`。把 target dir 指到家目录的 ext4，绕开 `/mnt/*` 的 drvfs 慢速，也不污染 Windows 侧的 `target/`：

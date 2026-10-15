@@ -79,6 +79,13 @@ jobs:
           # 让 nextest 把每条用例的耗时也吐成 JSON（进度与结果照常打 stderr，CI 日志不受
           # 影响）。下面的 step 拿它生成最慢用例表。
           NEXTEST_EXPERIMENTAL_LIBTEST_JSON: "1"
+          # p4 跑任何子命令之前都要先连 P4PORT。开发机上 p4 有注册表配置、连接瞬间完成，
+          # runner 上什么都没有，p4 兜底去连 perforce:1666，DNS 加连接超时每次约 4.7 秒
+          # ——两条拿「必然失败的 p4 查询」当夹具的单测实测因此在 windows 上各花 11 秒
+          # （本机 0.12 / 0.19 秒）。.invalid 是 RFC 2606 保留 TLD，保证解析不了，p4 在
+          # 150 毫秒内报同一个 Connect to server failed，失败语义不变。e2e 不受影响：
+          # 沙箱给被测程序的环境里不继承任何 P4* 变量。详见 docs/dev/environment.md。
+          P4PORT: nonexistent.invalid:1666
         # shell 必须是 bash：windows runner 默认的 pwsh 用 UTF-16 写 `>` 重定向，
         # 下面的 jq 会读不出 JSON。
         run: >
