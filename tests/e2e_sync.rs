@@ -1549,8 +1549,13 @@ fn an_injected_verbatim_verdict_deletes_the_candidate() {
         !sandbox.exists("src/使用说明.txt"),
         "裁决说没被忽略，这一轮就该把它删掉"
     );
+    // 取证也要走 stdin：挂在命令行上的 `使用说明.txt` 会被 en-US Windows 按 ACP 吃成
+    // `????.txt`，而 `?` 在 p4 的 file spec 里能匹零个字符——`p4 have src/????.txt`
+    // 会匹到同目录的 `lib.txt`（它有 have 记录），断言在 CI 上必红（见 `p4_lines_paths`）。
     assert!(
-        sandbox.p4_lines(&["have", "src/使用说明.txt"]).is_empty(),
+        sandbox
+            .p4_lines_paths(&["have"], &["src/使用说明.txt"])
+            .is_empty(),
         "have 记录该一起清掉"
     );
     assert!(sandbox.opened().is_empty(), "sync never opens files");

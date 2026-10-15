@@ -324,8 +324,28 @@ impl Sandbox {
     }
 
     /// stdout 按行返回，去掉空行。
+    ///
+    /// **带路径参数时不要用它**：非 ASCII 的名字挂在命令行上会被 Windows 按 ACP 转写，
+    /// 变形出来的通配符可能匹到别的文件（见 [`Sandbox::p4_ok_paths`]）——用
+    /// [`Sandbox::p4_lines_paths`]。
     pub fn p4_lines(&self, args: &[&str]) -> Vec<String> {
         self.p4_ok(args)
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// 同 [`Sandbox::p4_lines`]，但路径参数改从 stdin 交给 p4（`p4 -x - -b <个数>`）。
+    ///
+    /// 带路径参数**必须**用这一份：命令行上的非 ASCII 名字在 ACP 表示不了它的机器上会被
+    /// 吃成 `????`，而 `?` 在 p4 的 file spec 里能匹**零个**字符——`p4 have src/使用说明.txt`
+    /// 会在那里匹到同目录的 `lib.txt`（它有 have 记录），断言变成拿别的文件说话。
+    /// 2026-10-15 的 CI（en-US Windows，ACP=1252）上 `an_injected_verbatim_verdict_deletes_the_candidate`
+    /// 就是这么红的；本机 ACP=65001 时复现不出，别按本地绿下结论。
+    pub fn p4_lines_paths(&self, args: &[&str], paths: &[&str]) -> Vec<String> {
+        self.p4_ok_paths(args, paths)
             .lines()
             .map(str::trim_end)
             .filter(|line| !line.is_empty())
