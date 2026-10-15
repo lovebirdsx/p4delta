@@ -34,6 +34,34 @@ Windows 上另有一条：**别把这条命令的输出接进管道**（`| tee`�
 
 nextest 是 process-per-test，与「逐个二进制串行」的 cargo 不同：冷缓存时（`cargo clean` 之后，或换了 p4d、改了种子）多个进程会同时走到 `ensure_template` 的「各建各的 staging、抢 rename」那条路径上。正确性由 rename 的原子性保证，模板只可能被发布一次；代价是种子会被重复跑几遍，只影响那一次冷跑。热缓存下是一次毫秒级的 stamp 命中。
 
+## 新增用例前先量：一条用例就是整轮的地板
+
+nextest 把每条用例放在一个 worker 上，**并行度切不开一条用例**。所以整轮墙钟 T ≥ 最慢单条 max——夹具造得大的用例会直接把整轮钉在它的耗时上。v0.1.14 引入的 `a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent`（当时 9000 个文件）独占 40.8 秒，CI 的 windows job 因此从 32 秒涨到 103 秒：**是一条用例，不是总量**。
+
+量三个数再决定加不加：
+
+```powershell
+$env:P4_E2E_REQUIRED = "1"        # 全程开着：跳过会伪装成「变快」
+$env:NEXTEST_EXPERIMENTAL_LIBTEST_JSON = "1"
+cargo nextest run --all-targets --all-features --message-format libtest-json > run.jsonl
+# T 看 Summary 行；单条耗时从 run.jsonl 里取 event=ok 的 exec_time 排序
+# 量 Σ 换 --test-threads 4（见下）
+```
+
+- **T ≈ max**：地板主导，先砍最慢的那几条；
+- **T ≈ Σ / 并发度**：总量主导，砍实例数（合并用例、让沙箱复位而不是重起整个）；
+- 都不接近：资源争抢，先找出拖累全体的那条。
+
+三条踩过的坑：
+
+1. **`exec_time` 记的是墙钟**。同一次整轮，Σ 在 16 并发下是 275 秒、4 并发下只有 159 秒——差的那 116 秒是按用例摊到的 I/O 争抢，不是它们的成本。判断「这条用例慢不慢」要低并发量或单跑。
+2. **夹具规模按被测门槛反推，不要「多来点更保险」**。bulk 那条的算式写在它自己的注释里（spec 长度 → 每批条数 → 批数门槛），9000 → 6000 → 3600 靠的都是它，断言一字未改。**spec 越长达到同样批数需要的文件越少**，所以那条「deep path」用例把路径加深反而更快。
+3. **动手前先把时间拆开量**。同一条用例里两个 `p4 submit` 占 63%，那是 p4d 的固有成本（`--parallel=threads=4` 试过，无效）；而首轮 `submit` 之后那次 `p4 sync` 是纯冗余——`submit` 已经把 have 更新到新版本，且 r2 末尾的 `sync ...#1` 才是唯一必需的那次同步。删掉它省 4 秒。不拆开量，很容易把「p4d 的固有成本」和「白花的钱」混为一谈。
+
+**门槛**：新增用例单条超过 3 秒，在注释里写清楚夹具为什么必须这么大、判别力落在哪条断言上；超过 5 秒的考虑挪出默认档。当前最慢的仍是 bulk 那条（3600 文件）：单跑 20.5 秒、整轮里 25.4 秒；整轮墙钟本机 16 核热态 33.5 秒（2026-10-15，优化前 68.4 秒）。
+
+**别再折腾的**（2026-10-15 量过）：默认并发（= CPU 数）已经最优，压到 4 反而慢（44.7 秒）；合并 `e2e_scope` 那 28 条干跑用例最多省十几秒 Σ，折算到墙钟不到 1 秒；沙箱收尾的退避起步值与 `wait_until` 轮询间隔都在毫秒级，改动量级小于测量噪声。墙钟的大头只有两处：最慢的那条用例，和 4 核 CI 上的用例总量。
+
 ## 测试覆盖
 
 - **clean**（`tests/e2e_clean.rs`）：三类动作（删未跟踪文件、还原改动、写回缺失文件）对着真实服务器验证，断言同时落在磁盘内容与 `p4 opened` 上；「已打开的文件不归 clean 管」有专门用例；「head 已删除、本地文件重现」用 `p4 clean -n` 的删除判定交叉验证。`clean_compares_against_the_have_revision_after_a_batch_refresh` 钉住「本地停在 have 版本、head 已往前走」时比对基线取的是 **have 版本**的摘要：两个文本文件一次批量补查（≥2 条才走 `p4 fstat -L`），逐字节等于 have 内容就不许判成改动（把回填改成用 head 字段，这条会红）。三类动作与原生清单的逐文件集合对照尚未自动化，不应把该个案当成完整对照覆盖。
@@ -47,7 +75,7 @@ nextest 是 process-per-test，与「逐个二进制串行」的 cargo 不同：
 
 为什么删除组只能用这个十秒级的失败注入：`p4 sync -f //depot/f#none` 面对**被别的进程占着的文件**会重试约十秒才放弃，而且它会先把 `deleted as` 打到 stdout、把 `unlink: ...` 写到 stderr，**have 记录原样保留**——「看起来成功、其实什么都没做」的典型。这正是那一组的判据必须是 `ExitCodeOrStderr` 而不能是 `ExitCode` 的原因（后者会让它整个隐形）。换更快的失败注入试过四条候选，**全部不成立**：只读位会被 p4 自己清掉、`icacls` 的 DENY ACE 在管理员令牌下被绕过（用例 panic 时还会留在实例目录里删不掉）、`sys.rename.*` 的退避读的是客户端里写死的值、目录与符号链接反而让另一条腿成功。过程见 git 历史。
 
-这十秒也落在那条用例身上，而并行度对它无能为力：一条用例只跑在一个 worker 上，它跑到最后就成了整轮墙钟的地板（实测 18.9s；排除它之后是 8.0s）。所以默认档用 `.config/nextest.toml` 的 `default-filter` 把它排掉，CI 的 Windows job 用 `--ignore-default-filter` 补跑回来——门禁不缺这一环，本地 `cargo nextest run` 快一半。
+这十秒也落在那条用例身上，而并行度对它无能为力：一条用例只跑在一个 worker 上，它跑到最后就成了整轮墙钟的地板。所以默认档用 `.config/nextest.toml` 的 `default-filter` 把它排掉，CI 的 Windows job 用 `--ignore-default-filter` 补跑回来——门禁不缺这一环，本地 `cargo nextest run` 快一截（单跑实测 10.8 秒，2026-10-15；更早一次是 18.9 秒——退避重试的时长随系统状态浮动，十秒量级不变）。
 
 ## 栈边界（`tests/e2e_stack.rs`）
 

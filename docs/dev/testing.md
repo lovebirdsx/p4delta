@@ -16,6 +16,16 @@ cargo install cargo-nextest --locked     # 或者用 nexte.st 上的预编译包
 
 两点与 `cargo test` 的差别要知道：nextest **不跑 doctest**（本项目目前没有真的 doctest，唯一的文档代码块是 text 类型的；将来真加了要另外补 `cargo test --doc`）；nextest 默认**隐藏通过用例的输出**，`skipping:` 那类提示只在你显式 `--no-capture` 或用例失败时才看得见。
 
+整轮墙钟本机 16 核热态 33.5 秒（2026-10-15）。要自己量：
+
+```powershell
+$env:P4_E2E_REQUIRED = "1"        # 全程开着：跳过会伪装成「变快」
+$env:NEXTEST_EXPERIMENTAL_LIBTEST_JSON = "1"
+cargo nextest run --all-targets --all-features --message-format libtest-json > run.jsonl
+```
+
+T 取 `Summary` 行，单条耗时取 `run.jsonl` 里 `event=ok` 的 `exec_time` 排序。三点：`--no-capture` 会让 nextest 串行执行，**不能用来量耗时**；`exec_time` 记的是墙钟，同一次整轮的 Σ 在 16 并发下能到 4 并发下的近两倍（按用例摊到的 I/O 争抢），量 Σ 要加 `--test-threads 4`；墙钟的地板是最慢的那一条（并行度切不开一条用例）。判读方法与新增用例的门槛见 [e2e.md](e2e.md) 的「新增用例前先量」。
+
 `cargo test --all-targets` 默认 fail-fast：lib 单元测试一失败就**不再跑后面的测试二进制**，`tests/cli.rs` 可能长期没被执行过却看着「测试在跑」。用 `--no-fail-fast` 或直接上 nextest 都能避开。
 
 测试分三处：单元测试跟着被测代码放在各模块的 `#[cfg(test)] mod tests` 里，跨模块复用的测试基建在 `src/test_util.rs`；`tests/` 下是黑盒用例，通过进程边界观察，不引用 crate 内部符号；`tests/support/` 是 e2e 沙箱框架。

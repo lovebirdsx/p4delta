@@ -199,8 +199,7 @@ fn an_opened_file_behind_the_target_reaches_the_same_resolve_state_as_native() {
 /// 把文件推过头，而原生 `...@CL` 只推到目标那一版。
 #[test]
 fn an_opened_file_follows_the_changelist_target_not_head() {
-    let (Some(ours), Some(theirs)) = (support::sandbox_or_skip(), support::sandbox_or_skip())
-    else {
+    let (Some(ours), Some(theirs)) = support::sandbox_pair() else {
         return;
     };
 
@@ -375,8 +374,7 @@ fn the_json_stream_reports_an_opened_file_as_resolve() {
 /// 不让整轮伪装成成功。
 #[test]
 fn a_writable_unopened_file_fails_the_same_way_native_does() {
-    let (Some(ours), Some(theirs)) = (support::sandbox_or_skip(), support::sandbox_or_skip())
-    else {
+    let (Some(ours), Some(theirs)) = support::sandbox_pair() else {
         return;
     };
 
@@ -666,8 +664,7 @@ fn a_deleted_as_notice_is_answered_like_native_p4() {
 /// 本地文件；强制修复那一路才删，见 `e2e_sync.rs` 的 `a_never_synced_local_file_is_deleted_without_asking_p4`）。
 #[test]
 fn a_deleted_target_without_a_have_record_is_a_normal_sync_no_op() {
-    let (Some(ours), Some(theirs)) = (support::sandbox_or_skip(), support::sandbox_or_skip())
-    else {
+    let (Some(ours), Some(theirs)) = support::sandbox_pair() else {
         return;
     };
 
@@ -749,8 +746,7 @@ fn to_a_changelist_walks_back_to_that_state_not_to_head() {
 /// 它只是把 `@CL` 交回给原生——用户手工敲 `p4 sync ...@CL` 会发生什么，这里就发生什么。
 #[test]
 fn an_early_target_matches_what_native_p4_would_do() {
-    let (Some(ours), Some(theirs)) = (support::sandbox_or_skip(), support::sandbox_or_skip())
-    else {
+    let (Some(ours), Some(theirs)) = support::sandbox_pair() else {
         return;
     };
 

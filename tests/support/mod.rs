@@ -62,6 +62,32 @@ pub fn sandbox_or_skip() -> Option<Sandbox> {
     }
 }
 
+/// 起两个沙箱，**并行**。
+///
+/// 对拍类用例（`e2e_sync_normal` 的四处）要先有左右两个实例。它们之间没有任何共享
+/// 状态，各自的「复制模板 + 起 p4d + `p4 client -i` + `sync -f`」是独立 I/O，串行做纯属
+/// 白等——冷跑时模板只生成一次（`TEMPLATE_LOCK` 会让后到者等一会儿），热态下两边都是
+/// 纯拷贝。
+///
+/// 跳过语义与 [`sandbox_or_skip`] 逐字一致，包括 `P4_E2E_REQUIRED` 的断言。子线程里
+/// 的 panic **原样重抛**（`resume_unwind` 保留 panic 载荷与位置信息），不能吞成 `None`：
+/// 那会把「p4d 起不来」伪装成「环境没有 p4d」而静默跳过。
+pub fn sandbox_pair() -> (Option<Sandbox>, Option<Sandbox>) {
+    std::thread::scope(|scope| {
+        let left = scope.spawn(sandbox_or_skip);
+        let right = scope.spawn(sandbox_or_skip);
+        let left = match left.join() {
+            Ok(sandbox) => sandbox,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let right = match right.join() {
+            Ok(sandbox) => sandbox,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        (left, right)
+    })
+}
+
 /// 组装 [`Sandbox`] 需要的部件，由 [`Sandbox::start_parts`] 产出。
 ///
 /// 单独拆出来是为了把「起服务器」和「组装 Sandbox」分开：前者的失败发生在

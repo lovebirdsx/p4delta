@@ -69,13 +69,52 @@ jobs:
       # 保证下载没出错，保证不了二进制真的能用。P4_E2E_REQUIRED 补上这道防线：
       # 设了它，跳过就是失败。
       - name: Run tests
+        shell: bash
         env:
           P4_E2E_REQUIRED: "1"
           # p4 只落在 vendor/，既不在 runner 的 PATH 也不在 P4V 安装目录，不指给它，
           # src/test_util.rs 的 p4_available() 就会让依赖真实 p4 的单测一路静默跳过——
           # 一场绿色的空跑。后缀跟着平台走，只有 Windows 的二进制带 .exe。
           P4_EXE: ${{ github.workspace }}/vendor/p4${{ runner.os == 'Windows' && '.exe' || '' }}
-        run: cargo nextest run --all-targets --all-features --locked
+          # 让 nextest 把每条用例的耗时也吐成 JSON（进度与结果照常打 stderr，CI 日志不受
+          # 影响）。下面的 step 拿它生成最慢用例表。
+          NEXTEST_EXPERIMENTAL_LIBTEST_JSON: "1"
+        # shell 必须是 bash：windows runner 默认的 pwsh 用 UTF-16 写 `>` 重定向，
+        # 下面的 jq 会读不出 JSON。
+        run: >
+          cargo nextest run --all-targets --all-features --locked
+          --message-format libtest-json > nextest.jsonl
+      # 整轮墙钟的地板是最慢单条用例——并行度切不开一条用例，判读方法见
+      # docs/dev/e2e.md 的「新增用例前先量」。趋势比总量更能提示回归，且共享 runner
+      # 的抖动大到不该设硬阈值（benchmark.md 里同样的理由）。失败时也传：恰恰是
+      # 那时候最需要知道慢在哪。
+      - name: Upload test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-timings-${{ matrix.os }}
+          path: nextest.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # summary 里再尽量给一张表。jq 不保证每个 runner 都有（windows 上尤其），缺了
+      # 就只留 artifact：这是锦上添花的一步，不该把 job 拖红。
+      - name: Test timings summary
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          command -v jq >/dev/null 2>&1 || exit 0
+          [ -f nextest.jsonl ] || exit 0
+          {
+            echo "### 最慢的 10 条用例"
+            echo ""
+            echo "| 耗时 | 用例 |"
+            echo "| ---: | --- |"
+            jq -r 'select(.type == "test" and .event == "ok") | "\(.exec_time)\t\(.name)"' nextest.jsonl |
+              sort -rn | head -10 |
+              awk -F'\t' '{printf "| %.2fs | `%s` |\n", $1, $2}'
+          } >> "$GITHUB_STEP_SUMMARY"
       # 默认档用 default-filter 排掉了那条 Windows 专用的失败注入用例——它要跑十来秒，
       # 且并行度救不了它（理由写在 .config/nextest.toml 里）。这里补跑回来，门禁才不缺这一环。
       # 不写 if 的话 Linux/macOS 上匹配到 0 条用例，而 --no-tests 默认 fail（退出码 4）会让

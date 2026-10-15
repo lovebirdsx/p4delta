@@ -918,7 +918,6 @@ fn a_force_sync_never_queries_ignores_for_the_whole_workspace() {
         return;
     };
     let Some(shim) = support::P4Shim::build() else {
-        eprintln!("skipping: rustc is not available to build the p4 shim");
         return;
     };
 
@@ -1006,7 +1005,6 @@ fn an_ignored_delete_candidate_is_left_alone() {
     };
     // 真正下发那一轮要让 shim 记下 p4 调用（用来钉住查询范围），编不出 shim 就跳过。
     let Some(shim) = support::P4Shim::build() else {
-        eprintln!("skipping: rustc is not available to build the p4 shim");
         return;
     };
 
@@ -1122,7 +1120,6 @@ fn an_unusable_ignores_verdict_stops_the_run() {
         return;
     };
     let Some(shim) = support::P4Shim::build() else {
-        eprintln!("skipping: rustc is not available to build the p4 shim");
         return;
     };
 
@@ -1254,7 +1251,6 @@ fn a_non_ascii_delete_candidate_is_judged_by_the_verbatim_ignores_query() {
         return;
     };
     let Some(shim) = support::P4Shim::build() else {
-        eprintln!("skipping: rustc is not available to build the p4 shim");
         return;
     };
     if !non_ascii_argv_available(&sandbox) {
@@ -1417,7 +1413,6 @@ fn an_empty_verbose_ignores_output_stops_the_run() {
         return;
     };
     let Some(shim) = support::P4Shim::build() else {
-        eprintln!("skipping: rustc is not available to build the p4 shim");
         return;
     };
 
@@ -1492,7 +1487,6 @@ fn an_injected_verbatim_verdict_deletes_the_candidate() {
         return;
     };
     let Some(shim) = support::P4Shim::build() else {
-        eprintln!("skipping: rustc is not available to build the p4 shim");
         return;
     };
 
@@ -1589,7 +1583,6 @@ fn a_mangled_echo_stops_the_run() {
         return;
     };
     let Some(shim) = support::P4Shim::build() else {
-        eprintln!("skipping: rustc is not available to build the p4 shim");
         return;
     };
 
@@ -1947,36 +1940,83 @@ fn legacy_command_line_batches(specs: &[String]) -> usize {
     batches
 }
 
+/// 夹具专用的并行遍历：把 `items` 分片派给若干线程，每片按序执行 `task(index, item)`。
+///
+/// 只服务于 `a_bulk_deep_path_...` 那条用例的写/删/核对：几千个彼此独立的本地文件操作，
+/// 串行做在开着实时防护的机器上是纯税。片内保持顺序，失败信息里的序号仍然可读；
+/// 任务里 panic 会原样传播（`scope` 在 join 时重抛），不会退化成「线程静默死了、用例照绿」。
+///
+/// **写文件时不要用它替代 [`support::Sandbox::write`]**——那条路径上的清只读位与回拨
+/// mtime 是保命的（见 `Sandbox::write_bytes` 的说明），这里敢省是因为本用例两轮的写入
+/// 随后都会被 p4 自己重写（`p4 add`/`submit` 只读内容；第二轮之后还有一次
+/// `p4 sync //depot/main/bulk/...#1` 把所有文件的 mtime 落成同步时刻）。
+fn par_for_each<T: Sync>(items: &[T], task: impl Fn(usize, &T) + Sync) {
+    if items.is_empty() {
+        return;
+    }
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    let chunk = items.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (chunk_index, slice) in items.chunks(chunk).enumerate() {
+            let task = &task;
+            scope.spawn(move || {
+                for (offset, item) in slice.iter().enumerate() {
+                    task(chunk_index * chunk + offset, item);
+                }
+            });
+        }
+    });
+}
+
 /// 两组深路径在旧预算下都超过 8 批，逐次对账 shim 启动数与 summary，
 /// 并逐文件核对内容及 have。A/B 每次重新建沙箱；基线另设 P4DELTA_E2E_LEGACY_BATCHES。
 #[test]
 fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
     use serde_json::Value;
 
-    const TOTAL: usize = 9000;
-    const RESTORED: usize = 3000;
-    // 五层各 17 字节的目录 + 10 字节文件名：相对路径 ~百字节，全路径远离 MAX_PATH。
-    const RELATIVE_DIR: &str =
-        "bulk/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef";
+    // 规模由「每组各自超过 8 批」这条断言反推（8 = 生产侧的 MAX_PARALLEL_P4_COMMANDS，
+    // 见 src/p4/process.rs）：spec 155 字节 + 换行，旧预算 30719 字节每批装 196 条，
+    // 门槛 = 1569 条/组。1800 给到 10 批、留一批以上余量。
+    //
+    // 规模直接决定这条用例的墙钟：两个 `p4 submit` 合计要处理 2×TOTAL 个文件，占了
+    // 它 60% 以上的时间（2026-10-15 实测），而那是 p4d 的固有成本，压不动。所以路径
+    // 特意比「够深」再多两层——spec 越长，同样的批数需要的文件越少。9000 那次缩到 6000、
+    // 再到 3600，靠的都是这条算式，不是拍脑袋。
+    const TOTAL: usize = 3600;
+    const RESTORED: usize = 1800;
+    // 七层各 17 字节的目录 + 10 字节文件名：相对路径 ~130 字节，全路径仍远离 MAX_PATH
+    // （本机实测 ~198 字节）。spec 长度同时决定每批能装多少条与夹具要造多少文件。
+    const RELATIVE_DIR: &str = concat!(
+        "bulk/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef",
+        "/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef",
+    );
 
     let Some(sandbox) = support::sandbox_or_skip() else {
         return;
     };
     let Some(shim) = support::P4Shim::build() else {
-        eprintln!("skipping: rustc is not available to build the p4 shim");
         return;
     };
 
     // 一次 add、一次 submit 入库并同步到工作区（have 就位），内容带序号、每个文件不同。
+    // 直写 + 并行：这一段与下面第二轮、终态核对共用一个夹具专用写法，前提见
+    // `par_for_each` 上方的说明。
     let contents: Vec<String> = (0..TOTAL)
         .map(|index| format!("base {index:04}\n"))
         .collect();
-    for (index, content) in contents.iter().enumerate() {
-        sandbox.write(&format!("{RELATIVE_DIR}/f{index:04}.txt"), content);
-    }
+    let fixture_dir = sandbox.client_root().join(RELATIVE_DIR);
+    std::fs::create_dir_all(&fixture_dir).expect("create the bulk directory");
+    par_for_each(&contents, |index, content| {
+        std::fs::write(fixture_dir.join(format!("f{index:04}.txt")), content)
+            .expect("write the fixture file");
+    });
     sandbox.p4_ok(&["add", "bulk/..."]);
+    // submit 成功即把 have 更新到刚入库的 rev1，**不要**再补一次 `p4 sync`：本用例唯一
+    // 必需的那次同步是 r2 末尾的 `sync ...#1`（它把内容与 have 一起落回 rev1）。
+    // 提前 sync 一遍 6000 个文件曾白花 4 秒（2026-10-15 实测），结论不变。
     sandbox.p4_ok(&["submit", "-d", "bulk deep paths"]);
-    sandbox.sync();
 
     // update 组（head 前进、工作区落后）：在 depot 里提交第二版，再把 have 拉回第一版。
     // 本地内容回到第一版；仍在磁盘上的文件构成 update 候选。
@@ -1985,16 +2025,17 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
         .map(|index| format!("changed {index:04}\n"))
         .collect();
     sandbox.p4_ok(&["edit", "bulk/..."]);
-    for (index, content) in second.iter().enumerate() {
-        sandbox.write(&format!("{RELATIVE_DIR}/f{index:04}.txt"), content);
-    }
+    par_for_each(&second, |index, content| {
+        std::fs::write(fixture_dir.join(format!("f{index:04}.txt")), content)
+            .expect("write the fixture file");
+    });
     sandbox.p4_ok(&["submit", "-d", "bulk deep paths v2"]);
     sandbox.p4_ok(&["sync", "//depot/main/bulk/...#1"]);
 
     // restore 组：前 RESTORED 个本地文件删掉（have 记录还在）。
-    for index in 0..RESTORED {
+    par_for_each(&second[..RESTORED], |index, _| {
         sandbox.remove(&format!("{RELATIVE_DIR}/f{index:04}.txt"));
-    }
+    });
 
     // 下发规格（测试自算上限用）：force 无 --to 时目标就是 head（rev 2）。
     let depot_prefix = "//depot/main/";
@@ -2004,18 +2045,21 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
     let restore_specs: Vec<String> = (0..RESTORED)
         .map(|index| format!("{depot_prefix}{RELATIVE_DIR}/f{index:04}.txt#2"))
         .collect();
-    let legacy_batches =
-        legacy_command_line_batches(&update_specs) + legacy_command_line_batches(&restore_specs);
-    let expected_batches = if std::env::var_os("P4DELTA_E2E_LEGACY_BATCHES").is_some() {
-        legacy_batches
-    } else {
-        legacy_command_line_batches(&update_specs).min(8)
-            + legacy_command_line_batches(&restore_specs).min(8)
-    };
+    let update_legacy = legacy_command_line_batches(&update_specs);
+    let restore_legacy = legacy_command_line_batches(&restore_specs);
+    // 两组**各自**要超过 8 批（8 = `MAX_PARALLEL_P4_COMMANDS`）：`expected_batches` 取的是
+    // min(旧批数, 8)，合计超过 16 但有一组不到 8 批时，那一组根本没被检验。逐组断言把
+    // 「夹具缩过头」变成一次响亮的失败，而不是静默退化成没测到 clamp。
+    const LEGACY_WIDTH: usize = 8;
     assert!(
-        legacy_batches > 16,
-        "夹具必须超过两组各 8 批，才能检验调用数下降"
+        update_legacy > LEGACY_WIDTH && restore_legacy > LEGACY_WIDTH,
+        "两组都要超过 {LEGACY_WIDTH} 批才能检验调用数下降：update={update_legacy} restore={restore_legacy}"
     );
+    let expected_batches = if std::env::var_os("P4DELTA_E2E_LEGACY_BATCHES").is_some() {
+        update_legacy + restore_legacy
+    } else {
+        update_legacy.min(LEGACY_WIDTH) + restore_legacy.min(LEGACY_WIDTH)
+    };
 
     let log = sandbox.instance_dir().join("p4-shim.log");
     let _ = std::fs::remove_file(&log);
@@ -2116,13 +2160,13 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
 
     // 终态：update 组前进到第二版，restore 组被写回的也是目标（head）版本；
     // have 全部停在 head（rev 2）。
-    for (index, content) in second.iter().enumerate() {
+    par_for_each(&second, |index, content| {
         assert_eq!(
             sandbox.read(&format!("{RELATIVE_DIR}/f{index:04}.txt")),
             *content,
             "文件 {index} 的内容不对"
         );
-    }
+    });
     let have = sandbox.p4_lines(&["have", "//depot/main/bulk/..."]);
     assert_eq!(
         have.len(),

@@ -278,7 +278,6 @@ fn the_summary_count_matches_the_p4_processes_actually_started() {
         return;
     };
     let Some(shim) = support::P4Shim::build() else {
-        eprintln!("skipping: rustc is not available to build the p4 shim");
         return;
     };
     offline_drift(&sandbox);
