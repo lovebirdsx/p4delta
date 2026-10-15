@@ -5,8 +5,9 @@
 # 代价是 nextest 不跑 doctest——本项目目前没有真的 doctest（唯一的代码块是 text
 # 类型的），将来真加了要另外补一条 `cargo test --doc`。
 #
-# 本机 16 核热态的整轮墙钟：2026-10-15 优化后 33.5 秒（最慢单条是 bulk 那条，25.4 秒），
-# 优化前 68.4 秒。判读三个数（T / Σ / max）的方法与新增用例的门槛见
+# 本机 16 核热态的整轮墙钟：2026-10-15 优化后 33.5 秒（当时最慢单条是 bulk 那条，25.4 秒），
+# 优化前 68.4 秒；同一天加入 `a_group_beyond_the_default_stdin_budget_...`（单跑 44.1 秒）
+# 之后，地板换成它——整轮墙钟跟着它走（连续两次 68.8 / 62.3 秒），判读方法见
 # docs/dev/e2e.md 的「新增用例前先量」。
 
 [profile.default]
@@ -56,4 +57,12 @@ default-filter = 'not test(=both_delete_legs_report_their_own_failure) and not b
 # 只放宽这一条而不是全局，别的用例卡住仍会在 180 秒被终止。
 [[profile.default.overrides]]
 filter = 'test(=twenty_thousand_files_fit_the_default_stack)'
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+# stdin 预算那条用例的夹具要 14,400 个文件才能让**单组**载荷越过 8 × 256 KiB（算式写在用例
+# 自己头上：spec 156 字节，2,260,800 字节），本机 16 核热态单跑 44.1 秒，按同样的 3–6 倍估
+# CI 上 130–260 秒——已经越过 180 秒的全局上限，不放宽就会在 CI 上被终止。360 秒与两万文件
+# 那条同一个口径。
+[[profile.default.overrides]]
+filter = 'test(=a_group_beyond_the_default_stdin_budget_still_fits_eight_batches)'
 slow-timeout = { period = "120s", terminate-after = 3 }

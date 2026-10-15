@@ -18,7 +18,7 @@ use crate::charset::{
     decode_p4_bytes, p4_command_encoding, p4_encoding, strip_bom, trim_line_ending,
 };
 use crate::cli::Options;
-use crate::json::{P4Command, count_p4_command, sayln};
+use crate::json::{P4Command, count_p4_command, say_phase, sayln};
 use crate::model::HaveRecord;
 use crate::p4::marshal::{MarshalRecord, MarshalRecordReader, MarshalStreamParser};
 
@@ -890,22 +890,31 @@ pub(crate) const MAX_PARALLEL_P4_COMMANDS: usize = 8;
 /// 按参数长度把参数切成若干片：每片交给一个 p4 进程，片数也就是并发度。
 /// 单个参数超过上限时自己独占一批，而不是切出一个空批。
 pub(crate) fn compute_batches(batched_args: &[String]) -> Vec<std::ops::Range<usize>> {
+    let lengths: Vec<usize> = batched_args.iter().map(|arg| arg.len()).collect();
+    command_line_ranges(&lengths)
+}
+
+/// 命令行分批的**唯一**算式：`lengths` 是每个参数在命令行上占的字节（不含分隔符）。
+/// 判断一格用不含分隔符的长度、累计一格含一个分隔符——这是 [`compute_batches`] 一直
+/// 以来的口径，规划器与诊断侧对删除候选的估算都从它出发。算式只留一处：重写一份近似
+/// 迟早会在边界上漂，而估算一旦偏了，拿它判断「缩短路径表示值不值得」就是拿错数当依据。
+pub(crate) fn command_line_ranges(lengths: &[usize]) -> Vec<std::ops::Range<usize>> {
     let mut batches = Vec::new();
     let mut batch_start = 0;
     let mut batch_size = 0;
 
-    for (index, arg) in batched_args.iter().enumerate() {
-        if batch_size > 0 && batch_size + arg.len() > ARGUMENT_LENGTH_MAX {
+    for (index, &len) in lengths.iter().enumerate() {
+        if batch_size > 0 && batch_size + len > ARGUMENT_LENGTH_MAX {
             batches.push(batch_start..index);
             batch_start = index;
             batch_size = 0;
         }
 
-        batch_size += arg.len() + 1;
+        batch_size += len + 1;
     }
 
     if batch_size > 0 {
-        batches.push(batch_start..batched_args.len());
+        batches.push(batch_start..lengths.len());
     }
 
     batches
@@ -915,10 +924,37 @@ pub(crate) fn compute_batches(batched_args: &[String]) -> Vec<std::ops::Range<us
 /// 继续按 [`ARGUMENT_LENGTH_MAX`] 预算切批只会让一次调用拆出几十个进程；256 KiB
 /// 让典型的大批量从二十几批降到个位数。条数上限兜的是另一种失衡——全是短路径时
 /// 按字节切不出批。两者都只影响分片粒度（进程数），不影响语义。
-const STDIN_PAYLOAD_MAX: usize = 256 * 1024;
+///
+/// 预算是**显式挂在调用上**的（见 [`StdinBudget`]）而不是所有调用点共用一个常量：
+/// `p4 sync -f` 的两个动作组一次要下发的规格比别处大得多（同一个工作区实测 update 4,544
+/// 条 + restore 85,074 条 + delete 84,941 条）。条数上限 8192 已经给这两组定下**至少 11 批**
+/// 的下界，容量 256 KiB → 1 MiB 能把它压到多少要看规格的平均长度（两档都装不出 8 批：
+/// 8 是并发目标，不是批数的可达下界）。放大容量是**只给这两条路**的额度——一批失败要重来的
+/// 量、单个 p4 进程的内存与载荷编码开销都跟着涨，不该顺手给别处；它也不是耗时承诺。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StdinBudget {
+    /// 单批参数载荷的字节上限。
+    payload_max: usize,
 
-/// 一批最多多少条 spec，见 [`STDIN_PAYLOAD_MAX`]。
-const STDIN_SPEC_MAX: usize = 8192;
+    /// 单批参数条数上限。两种预算共用同一个值：它兜的是「全是短路径」那一种失衡，
+    /// 与载荷预算无关。
+    spec_max: usize,
+}
+
+impl StdinBudget {
+    /// 默认预算：256 KiB / 8192 条。除强制修复的 `p4 sync` 外，所有 stdin 调用点都用它。
+    pub(crate) const DEFAULT: Self = Self {
+        payload_max: 256 * 1024,
+        spec_max: 8192,
+    };
+
+    /// 强制修复（`--sync --force`）下 `sync_to_target` / `delete_from_workspace` 的预算：
+    /// 1 MiB / 8192 条。
+    pub(crate) const FORCE_SYNC: Self = Self {
+        payload_max: 1024 * 1024,
+        spec_max: 8192,
+    };
+}
 
 /// 一个参数在 stdin 载荷里占的字节：按 [`argument_payload`] 的实际编码算（编码后的
 /// 参数 + 一个换行）。非 ASCII 不用字符数近似——多字节编码与字符集的替代文本
@@ -956,15 +992,19 @@ fn split_range_in_half(
 
 /// 按「批容量不超过 `capacity`」装填的贪心切分，条数上限与超载参数独占照旧生效。
 /// `capacity` 越大批数越少，批数随它单调不增——这是对它二分的依据。
-fn capacity_greedy_ranges(lengths: &[usize], capacity: usize) -> Vec<std::ops::Range<usize>> {
-    let limit = capacity.min(STDIN_PAYLOAD_MAX);
+fn capacity_greedy_ranges(
+    lengths: &[usize],
+    capacity: usize,
+    budget: StdinBudget,
+) -> Vec<std::ops::Range<usize>> {
+    let limit = capacity.min(budget.payload_max);
     let mut ranges = Vec::new();
     let mut start = 0;
     let mut payload = 0usize;
     let mut specs = 0usize;
 
     for (index, &len) in lengths.iter().enumerate() {
-        if specs > 0 && (payload + len > limit || specs == STDIN_SPEC_MAX) {
+        if specs > 0 && (payload + len > limit || specs == budget.spec_max) {
             ranges.push(start..index);
             start = index;
             payload = 0;
@@ -999,19 +1039,46 @@ pub(crate) fn plan_stdin_batches(
     batched_args: &[String],
     min_batches: usize,
 ) -> Vec<std::ops::Range<usize>> {
+    plan_stdin_batches_with(batched_args, min_batches, StdinBudget::DEFAULT)
+}
+
+/// 同 [`plan_stdin_batches`]，载荷与条数上限由调用方给。两个预算复用这**一份**规划实现：
+/// 差别只在容量，不重不漏、超载独占、并发补足这些不变量对两套预算必须同样成立。
+pub(crate) fn plan_stdin_batches_with(
+    batched_args: &[String],
+    min_batches: usize,
+    budget: StdinBudget,
+) -> Vec<std::ops::Range<usize>> {
     if batched_args.is_empty() {
         return Vec::new();
     }
 
+    plan_stdin_batches_with_lengths(&stdin_argument_lengths(batched_args), min_batches, budget)
+}
+
+/// 一段参数的载荷长度表：每个参数在 stdin 里实际占的字节（编码后的参数 + 一个换行）。
+/// 规划与诊断共用它，免得同一批参数被编码两遍。
+fn stdin_argument_lengths(batched_args: &[String]) -> Vec<usize> {
     let encoding = p4_command_encoding();
-    let lengths: Vec<usize> = batched_args
+    batched_args
         .iter()
         .map(|arg| stdin_argument_len(arg, encoding))
-        .collect();
+        .collect()
+}
 
-    let target = min_batches.min(batched_args.len());
+/// [`plan_stdin_batches_with`] 的本体，长度表由调用方给（诊断要复用它）。
+fn plan_stdin_batches_with_lengths(
+    lengths: &[usize],
+    min_batches: usize,
+    budget: StdinBudget,
+) -> Vec<std::ops::Range<usize>> {
+    if lengths.is_empty() {
+        return Vec::new();
+    }
 
-    let fewest = capacity_greedy_ranges(&lengths, STDIN_PAYLOAD_MAX);
+    let target = min_batches.min(lengths.len());
+
+    let fewest = capacity_greedy_ranges(lengths, budget.payload_max, budget);
     if fewest.len() >= target {
         return fewest;
     }
@@ -1019,16 +1086,16 @@ pub(crate) fn plan_stdin_batches(
     // 二分最小的批容量，使按它装填的批数 ≤ 目标。搜索下界是最大的单参数：容量再小
     // 连一个参数都装不下，只会让每个参数独占一批。
     let mut low = lengths.iter().copied().max().unwrap_or(1);
-    let mut high = STDIN_PAYLOAD_MAX.max(low);
+    let mut high = budget.payload_max.max(low);
     while low < high {
         let mid = low + (high - low) / 2;
-        if capacity_greedy_ranges(&lengths, mid).len() <= target {
+        if capacity_greedy_ranges(lengths, mid, budget).len() <= target {
             high = mid;
         } else {
             low = mid + 1;
         }
     }
-    let mut ranges = capacity_greedy_ranges(&lengths, low);
+    let mut ranges = capacity_greedy_ranges(lengths, low, budget);
 
     // 容量最优也装不出目标批数时补批：反复把字节最大的批对半。
     while ranges.len() < target {
@@ -1049,7 +1116,7 @@ pub(crate) fn plan_stdin_batches(
         };
 
         let range = ranges.remove(index);
-        let (head, tail) = split_range_in_half(&lengths, range);
+        let (head, tail) = split_range_in_half(lengths, range);
         ranges.insert(index, tail);
         ranges.insert(index, head);
     }
@@ -1057,8 +1124,152 @@ pub(crate) fn plan_stdin_batches(
     ranges
 }
 
+/// 一次批量调用的分片计划。
+struct BatchPlan {
+    /// 连续、不重不漏的批：每一批是 `batched_args` 上的一段。
+    ranges: Vec<std::ops::Range<usize>>,
+
+    /// stdin 通道下每个参数在载荷里占的字节。`None` 表示参数走命令行（argv 通道），
+    /// 那时「载荷」就是参数自己的长度——规划与诊断共用这一段编码，不重复算两遍。
+    stdin_lengths: Option<Vec<usize>>,
+
+    /// 规划时给的并发度目标。
+    width_target: usize,
+}
+
+/// 一次批量调用的分片：两种参数通道两套预算。stdin 批次按大载荷规划，但并发度维持该次
+/// 调用在旧命令行预算下的水平（`min(旧批数, 8)`）——批数掉了就是并发掉了；`p4 ignores`
+/// 这类参数留在命令行上的命令仍受 32767 字符约束，继续用 [`compute_batches`]。
+fn plan_batches(always_args: &[&str], batched_args: &[String], budget: StdinBudget) -> BatchPlan {
+    if takes_paths_from_stdin(always_args) {
+        let target = compute_batches(batched_args)
+            .len()
+            .min(MAX_PARALLEL_P4_COMMANDS);
+        let lengths = stdin_argument_lengths(batched_args);
+        let ranges = plan_stdin_batches_with_lengths(&lengths, target, budget);
+
+        BatchPlan {
+            ranges,
+            stdin_lengths: Some(lengths),
+            width_target: target,
+        }
+    } else {
+        BatchPlan {
+            ranges: compute_batches(batched_args),
+            stdin_lengths: None,
+            width_target: MAX_PARALLEL_P4_COMMANDS,
+        }
+    }
+}
+
+/// 一行聚合的分批诊断：命令/组别、参数通道、参数总数、载荷字节、容量与条数上限、
+/// 批数、单批条数/载荷范围、并发目标。
+///
+/// **只有聚合数字，没有逐条路径**：几万条候选逐条打印就是刷屏，而这里要回答的只是
+/// 「切了几批、每批多大、并发多宽」。它也是下一次「调用数为什么是这么多」的唯一直接
+/// 证据——现场的日志只有分类计数，没有载荷分布，反推不出任何结论。
+///
+/// argv 通道的字节数就是命令行上的字节（每个参数自己的长度 + 一个分隔符），与
+/// [`compute_batches`] 用 [`ARGUMENT_LENGTH_MAX`] 做的预算同一口径；那些参数不经过
+/// 字符集编码、也不上 stdin，所以不与 stdin 载荷混为一谈。
+///
+/// `context` 说明这一行属于谁（执行路径是命令名，预演是动作组名）；`executed` 为假时
+/// 明确写上「估算、没有启动进程」——预演必须让人分得清哪些数字来自真实下发。
+fn say_batch_plan(
+    context: &str,
+    plan: &BatchPlan,
+    batched_args: &[String],
+    budget: StdinBudget,
+    executed: bool,
+) {
+    say_phase(
+        "batches",
+        &batch_plan_detail(context, plan, batched_args, budget, executed),
+        None,
+    );
+}
+
+/// [`say_batch_plan`] 的正文。与打印分开是为了它能被单测直接看：这行字是「调用数为什么
+/// 是这么多」的唯一直接证据，它报错字段比报错数字更难发现。
+fn batch_plan_detail(
+    context: &str,
+    plan: &BatchPlan,
+    batched_args: &[String],
+    budget: StdinBudget,
+    executed: bool,
+) -> String {
+    let stdin = plan.stdin_lengths.is_some();
+    let channel = if stdin { "stdin" } else { "argv" };
+    let load = |range: &std::ops::Range<usize>| -> usize {
+        match &plan.stdin_lengths {
+            Some(lengths) => lengths[range.clone()].iter().sum(),
+            None => batched_args[range.clone()]
+                .iter()
+                .map(|arg| arg.len() + 1)
+                .sum(),
+        }
+    };
+
+    let all = 0..batched_args.len();
+    let total: usize = load(&all);
+    let loads: Vec<usize> = plan.ranges.iter().map(load).collect();
+    let specs: Vec<usize> = plan
+        .ranges
+        .iter()
+        .map(|range| range.end - range.start)
+        .collect();
+    let summarize = |values: &[usize]| -> String {
+        match (values.iter().min(), values.iter().max()) {
+            (Some(min), Some(max)) => format!("{min}..{max}"),
+            _ => "n/a".to_owned(),
+        }
+    };
+
+    let payload_max = budget.payload_max;
+    let spec_max = budget.spec_max;
+    let capacity = if stdin {
+        format!("{payload_max} byte(s)/{spec_max} spec(s)")
+    } else {
+        format!("{ARGUMENT_LENGTH_MAX} byte(s)")
+    };
+    let suffix = if executed {
+        String::new()
+    } else {
+        ", estimated, nothing started".to_owned()
+    };
+
+    format!(
+        "{context}, {channel} channel, {} argument(s), {total} byte(s), capacity {capacity}, \
+         {} batch(es), specs {}, load {} byte(s), concurrency target {} (max \
+         {MAX_PARALLEL_P4_COMMANDS} in flight){suffix}",
+        batched_args.len(),
+        plan.ranges.len(),
+        summarize(&specs),
+        summarize(&loads),
+        plan.width_target,
+    )
+}
+
+/// 只规划、不启动：预演用它报出各动作组的预计批数。
+///
+/// 与执行路径共用 [`plan_batches`] 与那行诊断，所以预演报的数就是真跑时该有的批数，
+/// 不是另写一套近似。它**一个进程都不起、一次调用都不记**（`--json` 的 `p4Calls`
+/// 因此完全不受影响）。
+pub(crate) fn say_planned_batches(
+    context: &str,
+    always_args: &[&str],
+    batched_args: &[String],
+    budget: StdinBudget,
+) {
+    let plan = plan_batches(always_args, batched_args, budget);
+    say_batch_plan(context, &plan, batched_args, budget, false);
+}
+
 /// 把成千上万个参数分批交给 p4：每一批是一个独立的进程，参数从它的 stdin 送进去。
 /// `mode` 不是 [FailureMode::Warn] 时任何一批失败都算失败，调用方必须放弃基于输出的判断。
+///
+/// 这是默认预算（[`StdinBudget::DEFAULT`]）的入口；需要另一套预算的调用点走
+/// [`run_p4_command_batched_with_budget`]。
 pub(crate) async fn run_p4_command_batched(
     options: &Options,
     work_dir: &str,
@@ -1068,21 +1279,47 @@ pub(crate) async fn run_p4_command_batched(
     use_changelist: bool,
     mode: FailureMode,
 ) -> Result<Vec<String>> {
-    // 两种参数通道两套预算：stdin 批次按大载荷规划，但并发度维持该次调用在旧命令行
-    // 预算下的水平（`min(旧批数, 8)`）——批数掉了就是并发掉了；`p4 ignores` 这类参数
-    // 留在命令行上的命令仍受 32767 字符约束，继续用 [`compute_batches`]。
-    let batches = if takes_paths_from_stdin(always_args) {
-        let legacy = compute_batches(batched_args).len();
-        plan_stdin_batches(batched_args, legacy.min(MAX_PARALLEL_P4_COMMANDS))
-    } else {
-        compute_batches(batched_args)
-    };
+    run_p4_command_batched_with_budget(
+        options,
+        work_dir,
+        command,
+        always_args,
+        batched_args,
+        use_changelist,
+        mode,
+        StdinBudget::DEFAULT,
+    )
+    .await
+}
+
+/// 同 [`run_p4_command_batched`]，分片预算由调用方给。只有强制修复的 `p4 sync` 两条路会传
+/// [`StdinBudget::FORCE_SYNC`]：同一份规划与执行实现，差别只在单批容量。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_p4_command_batched_with_budget(
+    options: &Options,
+    work_dir: &str,
+    command: P4Command,
+    always_args: &[&'static str],
+    batched_args: &[String],
+    use_changelist: bool,
+    mode: FailureMode,
+    budget: StdinBudget,
+) -> Result<Vec<String>> {
+    let plan = plan_batches(always_args, batched_args, budget);
 
     sayln!(
         "      Running \"p4 {}\" with {} batches.",
         always_args[0],
-        batches.len()
+        plan.ranges.len()
     );
+    say_batch_plan(
+        &format!("p4 {}", always_args[0]),
+        &plan,
+        batched_args,
+        budget,
+        true,
+    );
+    let batches = plan.ranges;
 
     // `buffered` 一次最多轮询 MAX_PARALLEL_P4_COMMANDS 个 future。子进程仍然并行跑：
     // async-process 把管道读取派给阻塞线程池，所以这里不需要 task::spawn，
@@ -1135,6 +1372,12 @@ mod tests {
     use encoding_rs::{UTF_8, WINDOWS_1252};
 
     use crate::prune::IGNORES_ARGS;
+
+    /// 两套预算的容量，用例里按名字引用比按字段访问短。
+    const DEFAULT_PAYLOAD_MAX: usize = StdinBudget::DEFAULT.payload_max;
+    const DEFAULT_SPEC_MAX: usize = StdinBudget::DEFAULT.spec_max;
+    const FORCE_SYNC_PAYLOAD_MAX: usize = StdinBudget::FORCE_SYNC.payload_max;
+    const FORCE_SYNC_SPEC_MAX: usize = StdinBudget::FORCE_SYNC.spec_max;
 
     #[test]
     fn empty_arguments_produce_no_batches() {
@@ -1190,7 +1433,7 @@ mod tests {
     /// 前后的短参数各自成批，不与它合并（合不进去）。
     #[test]
     fn an_oversized_stdin_argument_gets_its_own_batch() {
-        let huge = "x".repeat(STDIN_PAYLOAD_MAX);
+        let huge = "x".repeat(DEFAULT_PAYLOAD_MAX);
         let args = vec!["//depot/a".to_owned(), huge, "//depot/b".to_owned()];
 
         assert_eq!(plan_stdin_batches(&args, 1), vec![0..1, 1..2, 2..3]);
@@ -1201,13 +1444,13 @@ mod tests {
     /// 加进来正好等于载荷上限不切，再多一个字节就切。边界按「参数编码 + 换行」累计。
     #[test]
     fn a_stdin_payload_that_fills_the_limit_exactly_stays_in_one_batch() {
-        let half = "x".repeat(STDIN_PAYLOAD_MAX / 2 - 1);
+        let half = "x".repeat(DEFAULT_PAYLOAD_MAX / 2 - 1);
         let args = vec![half.clone(), half];
         assert_eq!(plan_stdin_batches(&args, 1), vec![0..2]);
 
         let args = vec![
-            "x".repeat(STDIN_PAYLOAD_MAX / 2 - 1),
-            "x".repeat(STDIN_PAYLOAD_MAX / 2),
+            "x".repeat(DEFAULT_PAYLOAD_MAX / 2 - 1),
+            "x".repeat(DEFAULT_PAYLOAD_MAX / 2),
         ];
         assert_eq!(plan_stdin_batches(&args, 1), vec![0..1, 1..2]);
     }
@@ -1215,13 +1458,13 @@ mod tests {
     /// 全是短参数时条数上限兜底：8193 条切成 2 批，第一批恰好 8192 条。
     #[test]
     fn stdin_planning_respects_the_spec_count_limit() {
-        let args: Vec<String> = (0..STDIN_SPEC_MAX + 1)
+        let args: Vec<String> = (0..DEFAULT_SPEC_MAX + 1)
             .map(|index| format!("//depot/f{index}"))
             .collect();
 
         let batches = plan_stdin_batches(&args, 1);
         assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].end - batches[0].start, STDIN_SPEC_MAX);
+        assert_eq!(batches[0].end - batches[0].start, DEFAULT_SPEC_MAX);
         assert_eq!(batches[1].end - batches[1].start, 1);
     }
     /// 串行目标 1：批数就是硬约束下的贪心最少批数，不被拉到 8。
@@ -1276,48 +1519,337 @@ mod tests {
         assert_eq!(plan_stdin_batches(&small, 1), vec![0..2]);
     }
 
-    /// 任何输入、任何并发目标下：批内连续、拼接恰好覆盖全部参数、每批满足硬上限
-    /// （超载参数独占是唯一例外）、批数不超过参数个数。
+    /// 任何输入、任何并发目标、**任何一套预算**下：批内连续、拼接恰好覆盖全部参数、每批
+    /// 满足该预算的硬上限（超载参数独占是唯一例外）、批数不超过参数个数。
+    ///
+    /// 两套预算跑同一份断言是刻意的：预算只该改容量，不重不漏、超载独占、条数上限这些
+    /// 不变量对 1 MiB 与 256 KiB 必须同样成立——同一份规划实现，差别只在一个数。
     #[test]
     fn stdin_batches_stay_continuous_bounded_and_exhaustive() {
         let mut args: Vec<String> = vec![
             "//depot/使用说明.txt".to_owned(),
-            "x".repeat(STDIN_PAYLOAD_MAX + 5),
-            "x".repeat(STDIN_PAYLOAD_MAX / 2),
+            "x".repeat(DEFAULT_PAYLOAD_MAX + 5),
+            "x".repeat(DEFAULT_PAYLOAD_MAX / 2),
             String::new(),
             "y".repeat(17_500),
         ];
-        args.extend((0..STDIN_SPEC_MAX + 7).map(|index| format!("//depot/f{index}")));
-        args.push("z".repeat(STDIN_PAYLOAD_MAX));
+        args.extend((0..DEFAULT_SPEC_MAX + 7).map(|index| format!("//depot/f{index}")));
+        args.push("z".repeat(DEFAULT_PAYLOAD_MAX));
 
-        for min_batches in [1usize, 2, 8, 100] {
-            let batches = plan_stdin_batches(&args, min_batches);
+        for budget in [StdinBudget::DEFAULT, StdinBudget::FORCE_SYNC] {
+            let payload_max = budget.payload_max;
+            let spec_max = budget.spec_max;
 
-            let mut covered = Vec::new();
-            for range in &batches {
-                assert!(!range.is_empty(), "空批：{min_batches}");
-                let specs = range.end - range.start;
-                let payload: usize = args[range.clone()]
-                    .iter()
-                    .map(|arg| stdin_argument_len(arg, UTF_8))
-                    .sum();
-                assert!(
-                    payload <= STDIN_PAYLOAD_MAX || (specs == 1 && payload > STDIN_PAYLOAD_MAX),
-                    "批超载且不是超载参数独占：{min_batches} {range:?} {payload}"
+            for min_batches in [1usize, 2, 8, 100] {
+                let batches = plan_stdin_batches_with(&args, min_batches, budget);
+
+                let mut covered = Vec::new();
+                for range in &batches {
+                    assert!(!range.is_empty(), "空批：{min_batches}");
+                    let specs = range.end - range.start;
+                    let payload: usize = args[range.clone()]
+                        .iter()
+                        .map(|arg| stdin_argument_len(arg, UTF_8))
+                        .sum();
+                    assert!(
+                        payload <= payload_max || (specs == 1 && payload > payload_max),
+                        "批超载且不是超载参数独占：{min_batches} {range:?} {payload}"
+                    );
+                    assert!(specs <= spec_max, "批条数超限：{min_batches} {range:?}");
+                    covered.extend(range.clone());
+                }
+                assert_eq!(
+                    covered,
+                    (0..args.len()).collect::<Vec<_>>(),
+                    "覆盖不完整或乱序：{min_batches}"
                 );
-                assert!(
-                    specs <= STDIN_SPEC_MAX,
-                    "批条数超限：{min_batches} {range:?}"
-                );
-                covered.extend(range.clone());
+                assert!(batches.len() <= args.len());
             }
-            assert_eq!(
-                covered,
-                (0..args.len()).collect::<Vec<_>>(),
-                "覆盖不完整或乱序：{min_batches}"
-            );
-            assert!(batches.len() <= args.len());
         }
+    }
+
+    /// 两套预算的容量就是这两个数：默认档一个字节都不动（现场与既有基准都靠它），
+    /// 强制修复那两条路才拿 1 MiB。条数上限两套相同——它兜的是「全是短路径」那种失衡，
+    /// 与载荷预算无关。
+    #[test]
+    fn the_two_budgets_are_256_kib_and_1_mib() {
+        assert_eq!(StdinBudget::DEFAULT.payload_max, 256 * 1024);
+        assert_eq!(StdinBudget::FORCE_SYNC.payload_max, 1024 * 1024);
+        assert_eq!(StdinBudget::DEFAULT.spec_max, 8192);
+        assert_eq!(StdinBudget::FORCE_SYNC.spec_max, 8192);
+
+        // 默认入口 = 显式传默认预算：加预算参数不该顺手改掉任何既有调用点的行为。
+        let args: Vec<String> = (0..20_000)
+            .map(|index| format!("//depot/f{index}"))
+            .collect();
+        assert_eq!(
+            plan_stdin_batches(&args, 1),
+            plan_stdin_batches_with(&args, 1, StdinBudget::DEFAULT)
+        );
+        // 20,000 条短路径按条数上限切 3 批；载荷预算从 256 KiB 涨到 1 MiB 也翻不动它。
+        assert_eq!(
+            plan_stdin_batches_with(&args, 1, StdinBudget::DEFAULT).len(),
+            3
+        );
+        assert_eq!(
+            plan_stdin_batches_with(&args, 1, StdinBudget::FORCE_SYNC).len(),
+            3
+        );
+    }
+
+    /// 强制修复的预算要解决的正是这一件事：**单个动作组**的载荷超过默认预算的并发宽度
+    /// （8 × 256 KiB）时，默认预算给出的批数会溢过宽度，1 MiB 预算仍落在宽度内。
+    ///
+    /// 夹具必须真的越线：9000 条深路径那种形状**两边都是 8 批**（见
+    /// `the_nine_thousand_spec_fixture_cannot_tell_the_two_budgets_apart`），拿它当优化
+    /// 证据是错的。这里按现场同形的规格长度（约 103 字节/条）取 24,000 条。
+    #[test]
+    fn the_force_sync_budget_collapses_a_group_the_default_budget_splits() {
+        let specs: Vec<String> = deep_specs(24_000);
+        let payload: usize = specs
+            .iter()
+            .map(|spec| stdin_argument_len(spec, UTF_8))
+            .sum();
+        assert!(
+            payload > 8 * DEFAULT_PAYLOAD_MAX,
+            "夹具必须单组越过 8 × 256 KiB：{payload}"
+        );
+
+        let default =
+            plan_stdin_batches_with(&specs, MAX_PARALLEL_P4_COMMANDS, StdinBudget::DEFAULT);
+        let force =
+            plan_stdin_batches_with(&specs, MAX_PARALLEL_P4_COMMANDS, StdinBudget::FORCE_SYNC);
+
+        assert!(
+            default.len() > MAX_PARALLEL_P4_COMMANDS,
+            "默认预算该切出多于并发宽度的批数：{}",
+            default.len()
+        );
+        assert_eq!(
+            force.len(),
+            MAX_PARALLEL_P4_COMMANDS,
+            "1 MiB 预算该刚好铺满 8 个进程：{}",
+            force.len()
+        );
+        for range in &force {
+            let bytes: usize = specs[range.clone()]
+                .iter()
+                .map(|spec| stdin_argument_len(spec, UTF_8))
+                .sum();
+            assert!(
+                bytes <= FORCE_SYNC_PAYLOAD_MAX,
+                "{range:?} 超过 1 MiB：{bytes}"
+            );
+            assert!(range.end - range.start <= FORCE_SYNC_SPEC_MAX, "{range:?}");
+        }
+
+        // 两套预算切的是同一批参数，一个都不多、一个都不少。
+        assert_eq!(
+            default
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum::<usize>(),
+            specs.len()
+        );
+    }
+
+    /// 现有 9000 条夹具（update 6000 + restore 3000）**区分不了两套预算**：两边都是 8 批。
+    ///
+    /// 钉住这一点是为了下次别再把它的数字当这次改动的证据——它证明的是并发补足（0.1.13
+    /// 那一版就有的行为），不是 1 MiB 预算带来的批数下降。新证据必须来自真正越线的夹具。
+    #[test]
+    fn the_nine_thousand_spec_fixture_cannot_tell_the_two_budgets_apart() {
+        let update: Vec<String> = deep_specs(6_000);
+        let restore: Vec<String> = deep_specs(3_000);
+
+        for args in [&update, &restore] {
+            let target = compute_batches(args).len().min(MAX_PARALLEL_P4_COMMANDS);
+            assert_eq!(
+                target, MAX_PARALLEL_P4_COMMANDS,
+                "夹具要够宽才谈得上并发补足"
+            );
+            assert_eq!(
+                plan_stdin_batches_with(args, target, StdinBudget::DEFAULT).len(),
+                MAX_PARALLEL_P4_COMMANDS
+            );
+            assert_eq!(
+                plan_stdin_batches_with(args, target, StdinBudget::FORCE_SYNC).len(),
+                MAX_PARALLEL_P4_COMMANDS
+            );
+        }
+    }
+
+    /// 1 MiB 预算下的边界与独占规则和 256 KiB 那份完全一样：正好装满不切、多一个字节就切、
+    /// 单个超载参数独占一批（前后两个短参数不与之合并）。
+    #[test]
+    fn the_force_sync_budget_keeps_the_same_boundary_rules() {
+        let half = "x".repeat(FORCE_SYNC_PAYLOAD_MAX / 2 - 1);
+        let args = vec![half.clone(), half];
+        assert_eq!(
+            plan_stdin_batches_with(&args, 1, StdinBudget::FORCE_SYNC),
+            vec![0..2]
+        );
+
+        let args = vec![
+            "x".repeat(FORCE_SYNC_PAYLOAD_MAX / 2 - 1),
+            "x".repeat(FORCE_SYNC_PAYLOAD_MAX / 2),
+        ];
+        assert_eq!(
+            plan_stdin_batches_with(&args, 1, StdinBudget::FORCE_SYNC),
+            vec![0..1, 1..2]
+        );
+
+        let args = vec![
+            "//depot/a".to_owned(),
+            "x".repeat(FORCE_SYNC_PAYLOAD_MAX + 1),
+            "//depot/b".to_owned(),
+        ];
+        for target in [1usize, MAX_PARALLEL_P4_COMMANDS] {
+            assert_eq!(
+                plan_stdin_batches_with(&args, target, StdinBudget::FORCE_SYNC),
+                vec![0..1, 1..2, 2..3]
+            );
+        }
+    }
+
+    /// 1 MiB 预算也要补足并发宽度，并把最大批的字节压到等长参数的下界：并发下墙钟跟着
+    /// 最大批走，预算变大不该变成「一个大批 + 七个空转」。
+    #[test]
+    fn the_force_sync_budget_still_fills_the_concurrency_target() {
+        const COUNT: usize = 40_000;
+        const EACH: usize = 100;
+
+        let args: Vec<String> = (0..COUNT).map(|_| "x".repeat(EACH)).collect();
+        let batches =
+            plan_stdin_batches_with(&args, MAX_PARALLEL_P4_COMMANDS, StdinBudget::FORCE_SYNC);
+        assert_eq!(batches.len(), MAX_PARALLEL_P4_COMMANDS);
+
+        let bytes: Vec<usize> = batches
+            .iter()
+            .map(|range| args[range.clone()].iter().map(|arg| arg.len() + 1).sum())
+            .collect();
+        let expected = COUNT / MAX_PARALLEL_P4_COMMANDS * (EACH + 1);
+        assert_eq!(
+            bytes.iter().copied().max(),
+            Some(expected),
+            "最大批没有压到等长参数的下界：{bytes:?}"
+        );
+        assert_eq!(bytes.iter().sum::<usize>(), COUNT * (EACH + 1));
+
+        // 预算只改容量：条数上限照旧压在 8192。
+        assert!(
+            batches
+                .iter()
+                .all(|range| range.end - range.start <= FORCE_SYNC_SPEC_MAX)
+        );
+    }
+
+    /// 强制修复下发时用的命令形状：`p4 sync -f`（见 `crate::reconcile::sync::SYNC_ARGS`）。
+    const SYNC_ARGS_LIKE: &[&str] = &["sync", "-f"];
+
+    /// 与现场同形的深路径规格：`//depot/main/<五层目录>/fNNNN.txt#2`。
+    /// 一条约 103 字节，24,000 条就是 2.4 MB——单组越过 8 × 256 KiB。
+    fn deep_specs(count: usize) -> Vec<String> {
+        const DIR: &str =
+            "bulk/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef";
+
+        (0..count)
+            .map(|index| format!("//depot/main/{DIR}/f{index:04}.txt#2"))
+            .collect()
+    }
+
+    /// 一行聚合诊断要报齐「命令、通道、参数数、载荷字节、容量、批数、单批范围、并发目标」，
+    /// 而且**一个路径原文都不出现**——这行是要落盘的，现场日志不该带工作区路径。
+    #[test]
+    fn the_batch_diagnostic_reports_counts_without_paths() {
+        let specs = deep_specs(24_000);
+        let plan = plan_batches(SYNC_ARGS_LIKE, &specs, StdinBudget::FORCE_SYNC);
+        let line = batch_plan_detail("p4 sync", &plan, &specs, StdinBudget::FORCE_SYNC, true);
+
+        assert!(line.contains("p4 sync, stdin channel"), "{line}");
+        assert!(line.contains("24000 argument(s)"), "{line}");
+        assert!(
+            line.contains("capacity 1048576 byte(s)/8192 spec(s)"),
+            "{line}"
+        );
+        assert!(line.contains("8 batch(es)"), "{line}");
+        assert!(line.contains("concurrency target 8"), "{line}");
+        assert!(line.contains("specs 2988..3017"), "{line}");
+        let total: usize = specs.iter().map(|spec| spec.len() + 1).sum();
+        assert!(line.contains(&format!("{total} byte(s)")), "{line}");
+        assert!(!line.contains("//depot"), "路径原文不该落盘：{line}");
+        assert!(!line.contains("f0000"), "文件名不该落盘：{line}");
+
+        // argv 通道报的是命令行字节与命令行预算（`p4 ignores` 的路径只能挂在命令行上），
+        // 与 stdin 载荷不是同一笔账。
+        let paths: Vec<String> = (0..300)
+            .map(|index| format!(r"C:\ws\dir{index}\file.txt"))
+            .collect();
+        let plan = plan_batches(&IGNORES_ARGS, &paths, StdinBudget::DEFAULT);
+        let line = batch_plan_detail("p4 ignores", &plan, &paths, StdinBudget::DEFAULT, true);
+
+        assert!(line.contains("p4 ignores, argv channel"), "{line}");
+        assert!(line.contains("capacity 30719 byte(s)"), "{line}");
+        assert!(
+            !line.contains("8192 spec(s)"),
+            "argv 通道没有条数上限：{line}"
+        );
+        assert!(!line.contains("//depot"), "{line}");
+    }
+
+    /// 预演那一行必须自证没执行过：后缀写明「估算、没有启动进程」。空参数同样要出一行
+    /// （0 批），否则「这一组一个规格都没发」与「这一组没被规划」在日志里分不出来。
+    #[test]
+    fn the_planned_batch_line_says_nothing_was_started() {
+        let specs = deep_specs(100);
+        let plan = plan_batches(SYNC_ARGS_LIKE, &specs, StdinBudget::FORCE_SYNC);
+        let line = batch_plan_detail(
+            "plan: Update group (p4 sync)",
+            &plan,
+            &specs,
+            StdinBudget::FORCE_SYNC,
+            false,
+        );
+        assert!(
+            line.starts_with("plan: Update group (p4 sync), stdin channel"),
+            "{line}"
+        );
+        assert!(line.ends_with("estimated, nothing started"), "{line}");
+
+        let empty: Vec<String> = Vec::new();
+        let plan = plan_batches(SYNC_ARGS_LIKE, &empty, StdinBudget::FORCE_SYNC);
+        let line = batch_plan_detail("p4 sync", &plan, &empty, StdinBudget::FORCE_SYNC, true);
+        assert!(line.contains("0 argument(s)"), "{line}");
+        assert!(line.contains("0 batch(es)"), "{line}");
+        assert!(line.contains("specs n/a"), "{line}");
+    }
+
+    /// 预演走的是同一个规划入口（[`say_planned_batches`]）：它报的批数就是执行路径会切出的
+    /// 批数，而且**一次调用都不记**——预演的全部意义就是不下发，`p4Calls` 必须一个不动。
+    #[test]
+    fn the_planned_batches_are_the_executor_batches_and_start_nothing() {
+        let specs = deep_specs(24_000);
+
+        let before = crate::json::p4_command_calls(P4Command::Sync);
+        say_planned_batches(
+            "plan: Update group (p4 sync)",
+            SYNC_ARGS_LIKE,
+            &specs,
+            StdinBudget::FORCE_SYNC,
+        );
+        assert_eq!(
+            crate::json::p4_command_calls(P4Command::Sync),
+            before,
+            "预演规划不许记进 p4Calls"
+        );
+
+        assert_eq!(
+            plan_batches(SYNC_ARGS_LIKE, &specs, StdinBudget::FORCE_SYNC)
+                .ranges
+                .len(),
+            MAX_PARALLEL_P4_COMMANDS,
+            "预演报的批数要与执行路径一致"
+        );
     }
 
     /// p4 按命令字符集解码 stdin 上的参数（实测：非法字节会换来
@@ -1720,7 +2252,9 @@ fn main() {
         let tree = TempTree::new("p4-have-backpressure");
         let work_dir = tree.root.to_string_lossy().to_string();
         // specs 全 ASCII：任何命令字符集下编码一致，期望载荷可以在本地构造。
-        let specs: Vec<String> = (0..3000)
+        // 条数要撑到**单次写入超过 1 MiB**：force sync 那一档预算允许一批写到 1 MiB，
+        // 管道背压不能只在 256 KiB 那一档上验证过。
+        let specs: Vec<String> = (0..30_000)
             .map(|index| format!("//depot/fake/long_path_{index:04}/file.bin"))
             .collect();
         let mut expected_payload = Vec::new();
@@ -1728,7 +2262,11 @@ fn main() {
             expected_payload.extend_from_slice(spec.as_bytes());
             expected_payload.push(b'\n');
         }
-        assert!(expected_payload.len() > 64 * 1024, "载荷必须超过管道容量");
+        assert!(
+            expected_payload.len() > 1024 * 1024,
+            "载荷要超过 1 MiB（force sync 的单批上限），实际 {}",
+            expected_payload.len()
+        );
 
         let options = Options::parse_from(["p4delta", "-w", "p4delta-test"]);
         let started = Instant::now();

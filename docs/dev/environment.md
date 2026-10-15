@@ -70,3 +70,26 @@ Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' | Select 
 返回值是 65001 就说明本地没有复现条件，别再花时间在本地试非 ASCII 文件名——直接按「非 ASCII 命令行参数」这一假设去读代码（相关实现：`src/p4/process.rs` 的 `command_line_safe`），或推一次 CI 取数据。
 
 这条事实现在有一处**依赖**它：强制修复的删除保护只能走命令行（`p4 ignores` 不认 stdin），它因此不按平台一刀切，而是运行时逐字核对 p4 回显的路径（`src/workspace.rs::query_ignores_verbose`）——能表示这些名字的机器上照常跑完，表示不了的机器上 fail-closed 停下。对应的两条 e2e 成功用例按同一条事实分档（`Sandbox::argv_carries_non_ascii`），第三条成功用例改由 shim 注入逐字裁决、因此不依赖它；见 [e2e.md](e2e.md)。
+
+## `p4 ignores -i -v` 回显的两种拼法
+
+这条查询的**回显不是请求原文**，而是「按 cwd 解析出来的绝对路径」——**Windows** 上 p4 2024.1
+实测（用例 `src/workspace.rs::relative_ignores_arguments_agree_on_verdicts_but_not_on_the_echo`
+逐条钉住，那条用例也按平台限定在 Windows）：
+
+- 请求给**绝对**写法时，回显与请求逐字相同（这才是现在那条逐字校验赖以成立的前提）；
+- 请求给**相对**写法时，回显是 `cwd + 分隔符 + 请求原文`：cwd 那一段用平台分隔符、请求那一段
+  **保留原样**（`c:\ws\sub/deep/x.txt`），盘符被折成小写。按 `local_path_key` 归一之后一条请求
+  对应一行，逐字比则一条都认不出来。
+
+别的平台上 p4 怎么拼回显没有验证过，不要从这里的拼法外推。
+
+裁决本身与写法无关：同一批文件两种写法的 ignored / not ignored 逐条一致（含祖先规则、通配、
+嵌套 `.p4ignore`、带空格的名字）。所以「把参数换成相对写法以缩短长度」这条路要落地，**改的是回显
+校验那一环**，不是裁决口径。
+
+另有一条与长度无关的形状要当心：被 `!` 重包含规则罩住的文件，p4 回的是
+`<路径> not ignored by <规则来源>`，既不是 `ignored by` 也不是干净的 `not ignored`。当前的
+`verdict_candidates` 只能从这种行切出 `"<路径> not"` 这一段前缀，与请求路径对不上，于是
+**一条命中的 `!` 规则就会让删除保护整批拒绝**（fail-closed，方向没错，但用户会看到整轮停下）。
+修它属于下一步（本次改动只记录事实，不动生产行为）。

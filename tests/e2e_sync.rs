@@ -1919,16 +1919,13 @@ fn a_changelist_is_ignored_with_a_warning() {
         .stdout(predicate::str::contains("Using pending changelist 5").not());
 }
 
-/// 旧命令行预算下的贪心批数，照抄 `compute_batches` 的算式（参数字符数 + 1 累计，
-/// 上限 32767 - 2048）。用例拿它给新预算的批数封顶：stdin 载荷变大了，批数不该
-/// 反而变多。
-fn legacy_command_line_batches(specs: &[String]) -> usize {
-    const BUDGET: usize = 32767 - 2048;
-
+/// 贪心批数：`capacity` 是单批的字节上限，每个参数累计「自己的长度 + 1」。算式与
+/// `compute_batches` 同一口径（判断那一步不含换行，累计那一步含）。
+fn greedy_batches(specs: &[String], capacity: usize) -> usize {
     let mut batches = 0;
     let mut size = 0usize;
     for spec in specs {
-        if size > 0 && size + spec.len() > BUDGET {
+        if size > 0 && size + spec.len() > capacity {
             batches += 1;
             size = 0;
         }
@@ -1938,6 +1935,23 @@ fn legacy_command_line_batches(specs: &[String]) -> usize {
         batches += 1;
     }
     batches
+}
+
+/// 旧命令行预算下的贪心批数（参数留在命令行上的那一档，上限 32767 - 2048）。
+/// 用例拿它给新预算的批数封顶：stdin 载荷变大了，批数不该反而变多。
+fn legacy_command_line_batches(specs: &[String]) -> usize {
+    greedy_batches(specs, 32767 - 2048)
+}
+
+/// 执行器在 `capacity` 这一档 stdin 预算下**实际起的进程数**，按规划规则独立重述：
+/// 先按容量取最少批数；最少批数够不到并发目标时，二分把容量压到刚好装出目标批数，
+/// 于是结果恰好是目标。并发目标是 `min(旧命令行批数, MAX_PARALLEL_P4_COMMANDS)`——
+/// 批数掉了就是并发掉了，所以它同时是批数的下限与上限。
+///
+/// 这是断言「预算改动真的生效」的唯一用法：把 `capacity` 换成另一档，结果必须跟着变。
+fn expected_batches(specs: &[String], capacity: usize) -> usize {
+    const WIDTH: usize = 8;
+    greedy_batches(specs, capacity).max(legacy_command_line_batches(specs).min(WIDTH))
 }
 
 /// 夹具专用的并行遍历：把 `items` 分片派给若干线程，每片按序执行 `task(index, item)`。
@@ -2055,7 +2069,8 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
         update_legacy > LEGACY_WIDTH && restore_legacy > LEGACY_WIDTH,
         "两组都要超过 {LEGACY_WIDTH} 批才能检验调用数下降：update={update_legacy} restore={restore_legacy}"
     );
-    let expected_batches = if std::env::var_os("P4DELTA_E2E_LEGACY_BATCHES").is_some() {
+    // 基线（argv 策略）两类都是 legacy 批数；本构建两类各自被并发目标封顶。
+    let expected_sync_calls = if std::env::var_os("P4DELTA_E2E_LEGACY_BATCHES").is_some() {
         update_legacy + restore_legacy
     } else {
         update_legacy.min(LEGACY_WIDTH) + restore_legacy.min(LEGACY_WIDTH)
@@ -2134,7 +2149,7 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
     );
     assert_eq!(
         sync_calls.len(),
-        expected_batches,
+        expected_sync_calls,
         "sync 实际启动数不符合分批策略：{sync_calls:?}"
     );
 
@@ -2181,6 +2196,363 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
     // A/B 汇总：两次跑（基线与工作区构建）各留一行可比对的数字。
     eprintln!(
         "p4delta A/B: sync={} fstat={} have={} total={} batches={specs_per_batch:?}",
+        by_command["sync"],
+        by_command["fstat"].as_u64().unwrap_or(0),
+        by_command["have"].as_u64().unwrap_or(0),
+        summary["p4Calls"],
+    );
+}
+
+/// 单组载荷越过 8 × 256 KiB 时，只有 force sync 那一档预算装得下 8 批。
+///
+/// `a_bulk_deep_path_...` 的两组在**旧命令行预算**（30,719 字节）下都超过 8 批，但那是
+/// argv 那一档；换成 stdin 的 256 KiB 之后两组载荷都只有 28 万字节、批数由并发目标补到 8，
+/// 两档预算给出**一样**的批数，拿它证明不了预算改动生效。这里按「越过
+/// 8 × 262,144 = 2,097,152 字节」反推规模：spec 156 字节（`//depot/main/` + 141 字节
+/// 相对路径 + `#1`），14,400 条 = 2,260,800 字节。8 批装得下 2,260,800 字节这件事，
+/// 256 KiB 的容量做不到（8 × 262,144 更小）——所以「shim 上数到 8 次 sync 启动」本身就是
+/// 预算生效的证据，不需要更大的夹具去把差距拉大。
+///
+/// 只让 restore 组当大组：三种组里只有它不需要第二次 submit（一次入库，然后在本地把副本
+/// 删掉）。update 组走同一个 `sync_to_target`，delete 组走另一条腿（`#none` 规格），两组
+/// 各 100 条就够把三条腿、计数与终态都覆盖上。
+#[test]
+fn a_group_beyond_the_default_stdin_budget_still_fits_eight_batches() {
+    use serde_json::Value;
+
+    const RESTORED: usize = 14_400;
+    const UPDATED: usize = 100;
+    const DELETED: usize = 100;
+    const TOTAL: usize = RESTORED + UPDATED + DELETED;
+
+    // 形状同 `a_bulk_deep_path_...` 的夹具（七层各 17 字节的目录 + 10 字节文件名），
+    // 但文件名多一位数字：相对路径 141 字节，spec 正好 156。
+    const RELATIVE_DIR: &str = concat!(
+        "bulk/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef",
+        "/d0123456789abcdef/d0123456789abcdef/d0123456789abcdef",
+    );
+    const DEPOT_PREFIX: &str = "//depot/main/";
+    // 默认档的单批字节上限（`StdinBudget::DEFAULT`）。
+    const DEFAULT_PAYLOAD_MAX: usize = 256 * 1024;
+    // force sync 那一档（`StdinBudget::FORCE_SYNC`）。
+    const FORCE_SYNC_PAYLOAD_MAX: usize = 1024 * 1024;
+    // 并发目标上限（`MAX_PARALLEL_P4_COMMANDS`）。
+    const WIDTH: usize = 8;
+
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        return;
+    };
+
+    let fixture_dir = sandbox.client_root().join(RELATIVE_DIR);
+    std::fs::create_dir_all(&fixture_dir).expect("create the bulk directory");
+    // 深目录是刻意用来把 spec 撑长的，顺手守一下全路径：临时根比预期长时应以一句能
+    // 读懂的话失败，而不是一个 `file not found`。
+    let longest = fixture_dir.join(format!("f{:05}.txt", TOTAL - 1));
+    assert!(
+        longest.to_string_lossy().len() < 250,
+        "夹具的全路径太长，MAX_PATH 会挡在前面：{}",
+        longest.display()
+    );
+
+    // 一次 add、一次 submit 入库：submit 成功即把 have 推到 rev1，不需要再补一次 sync。
+    let base: Vec<String> = (0..TOTAL)
+        .map(|index| format!("base {index:05}\n"))
+        .collect();
+    par_for_each(&base, |index, content| {
+        std::fs::write(fixture_dir.join(format!("f{index:05}.txt")), content)
+            .expect("write the fixture file");
+    });
+    sandbox.p4_ok(&["add", "bulk/..."]);
+    sandbox.p4_ok(&["submit", "-d", "bulk deep paths"]);
+
+    // rev2 只动两个小组（大组一个字节都不碰）：update 组改内容，delete 组从库里删掉。
+    // 大组因此停在 rev1 的 head 上，不进 rev2——夹具唯一的一次大 submit 就是上面那次。
+    let updated: Vec<String> = (RESTORED..RESTORED + UPDATED)
+        .map(|index| format!("{RELATIVE_DIR}/f{index:05}.txt"))
+        .collect();
+    let deleted: Vec<String> = (RESTORED + UPDATED..TOTAL)
+        .map(|index| format!("{RELATIVE_DIR}/f{index:05}.txt"))
+        .collect();
+    let updated_paths: Vec<&str> = updated.iter().map(String::as_str).collect();
+    let deleted_paths: Vec<&str> = deleted.iter().map(String::as_str).collect();
+    sandbox.p4_ok_paths(&["edit"], &updated_paths);
+    let changed: Vec<String> = (RESTORED..RESTORED + UPDATED)
+        .map(|index| format!("changed {index:05}\n"))
+        .collect();
+    par_for_each(&changed, |offset, content| {
+        std::fs::write(
+            fixture_dir.join(format!("f{:05}.txt", RESTORED + offset)),
+            content,
+        )
+        .expect("write the changed content");
+    });
+    sandbox.p4_ok_paths(&["delete"], &deleted_paths);
+    sandbox.p4_ok(&["submit", "-d", "bulk deep paths v2"]);
+
+    // 把两个小组的 have 拉回 rev1：update 组因此「head 前进、工作区落后」，delete 组因此
+    // 「head 说删了、本地还有一份」。大组没被动过，have 已经在 rev1 上。
+    let rollback: Vec<String> = updated
+        .iter()
+        .chain(deleted.iter())
+        .map(|path| format!("{DEPOT_PREFIX}{path}#1"))
+        .collect();
+    let rollback_specs: Vec<&str> = rollback.iter().map(String::as_str).collect();
+    sandbox.p4_ok_paths(&["sync"], &rollback_specs);
+
+    // restore 组：本地副本删掉（have 记录还在）。
+    let restored: Vec<String> = (0..RESTORED)
+        .map(|index| format!("{RELATIVE_DIR}/f{index:05}.txt"))
+        .collect();
+    par_for_each(&restored, |_, path| sandbox.remove(path));
+
+    // 三组各自的下发规格（用例自算批数用）：大组的目标是 rev1，update 组是 rev2，
+    // delete 组是 `#none`。
+    let restore_specs: Vec<String> = (0..RESTORED)
+        .map(|index| format!("{DEPOT_PREFIX}{RELATIVE_DIR}/f{index:05}.txt#1"))
+        .collect();
+    let update_specs: Vec<String> = (RESTORED..RESTORED + UPDATED)
+        .map(|index| format!("{DEPOT_PREFIX}{RELATIVE_DIR}/f{index:05}.txt#2"))
+        .collect();
+    let delete_specs: Vec<String> = (RESTORED + UPDATED..TOTAL)
+        .map(|index| format!("{DEPOT_PREFIX}{RELATIVE_DIR}/f{index:05}.txt#none"))
+        .collect();
+    let payload: usize = restore_specs.iter().map(|spec| spec.len() + 1).sum();
+    assert_eq!(
+        restore_specs[0].len(),
+        156,
+        "夹具的 spec 长度变了，批数断言要跟着改"
+    );
+    assert!(
+        payload > WIDTH * DEFAULT_PAYLOAD_MAX,
+        "大组载荷必须越过默认档的 {WIDTH} 批门槛，实际 {payload} 字节"
+    );
+
+    // 这条 A/B 比的是 stdin 的两套容量，开关与 bulk 那条分开：`P4DELTA_E2E_LEGACY_BATCHES`
+    // 指「参数留在命令行上」的更早策略，表达不了这一档。设 `P4DELTA_E2E_DEFAULT_STDIN_BUDGET`
+    // 表示被测二进制只有**默认 256 KiB 档**（0.1.15 就是这一档），不设则按 1 MiB 档。
+    let default_budget = std::env::var_os("P4DELTA_E2E_DEFAULT_STDIN_BUDGET").is_some();
+    let budget_bytes = if default_budget {
+        DEFAULT_PAYLOAD_MAX
+    } else {
+        FORCE_SYNC_PAYLOAD_MAX
+    };
+    // 那两行 `[diag] batches:` / `[diag] delete-candidates:` 是这次改动新增的诊断，0.1.15 上
+    // 根本不存在——A/B 的基线那一轮只比得了批数与终态，不能去断言当时还没有的输出。
+    let reports_diagnostics = !default_budget;
+    // 夹具必须正好落在「两档给不同批数」的那条线上：默认档装不出 8 批，force 档装得下。
+    assert!(
+        expected_batches(&restore_specs, DEFAULT_PAYLOAD_MAX) > WIDTH,
+        "夹具没越过默认档的并发目标，两档预算会给出一样的批数"
+    );
+    let restore_batches = expected_batches(&restore_specs, budget_bytes);
+    let update_batches = expected_batches(&update_specs, budget_bytes);
+    let delete_batches = expected_batches(&delete_specs, budget_bytes);
+    let expected_sync_calls = restore_batches + update_batches + delete_batches;
+
+    // 预演：同一份规划器报出真跑时的批数，且一个 sync 进程都不许起。
+    let dry_log = sandbox.instance_dir().join("p4-shim-dry.log");
+    let _ = std::fs::remove_file(&dry_log);
+    let dry = sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &dry_log)
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "--json"])
+        .arg(".")
+        .output()
+        .expect("run the dry run");
+    assert!(
+        dry.status.success(),
+        "dry run failed:\n{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+
+    let stdout = String::from_utf8(dry.stdout).expect("stdout must be UTF-8");
+    for line in stdout.lines() {
+        serde_json::from_str::<Value>(line)
+            .unwrap_or_else(|error| panic!("stdout 里混进了非 JSON 行: {line:?} ({error})"));
+    }
+
+    let stderr = String::from_utf8_lossy(&dry.stderr);
+    let planned = format!(
+        "[diag] batches: plan: Restore group (p4 sync), stdin channel, {RESTORED} argument(s), \
+         {payload} byte(s), capacity {budget_bytes} byte(s)/8192 spec(s), {restore_batches} batch(es)"
+    );
+    if reports_diagnostics {
+        assert!(
+            stderr.contains(&planned),
+            "预演没有按这一档预算报出大组的批数：\n期望 {planned}\n实际 {stderr}"
+        );
+        assert!(
+            stderr.contains("estimated, nothing started"),
+            "预演那一行必须自证没执行过：{stderr}"
+        );
+    }
+    // 预演只规划不下发：shim 上不该出现任何一次 sync 启动。这一条对两档二进制都成立。
+    let dry_calls = std::fs::read_to_string(&dry_log).unwrap_or_default();
+    assert!(
+        !dry_calls
+            .lines()
+            .any(|line| line.split_whitespace().any(|token| token == "sync")),
+        "预演起了 p4 sync 进程：{dry_calls}"
+    );
+
+    // 真跑：`-a` 下发三组。
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+    let output = sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "-a", "--json"])
+        .arg(".")
+        .output()
+        .expect("run tool");
+    assert!(
+        output.status.success(),
+        "run failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // 执行路径那一行报同样的 capacity 与批数：与预演那一行是同一份规划器的输出。
+    let executed = format!(
+        "[diag] batches: p4 sync, stdin channel, {RESTORED} argument(s), {payload} byte(s), \
+         capacity {budget_bytes} byte(s)/8192 spec(s), {restore_batches} batch(es)"
+    );
+    if reports_diagnostics {
+        assert!(
+            stderr.contains(&executed),
+            "执行路径没有报出大组的批数：\n期望 {executed}\n实际 {stderr}"
+        );
+        // 删除候选的统计：这一组 100 条全在 client root 下、全 ASCII、全走命令行。
+        assert!(
+            stderr.contains("delete-candidates: 100 delete candidate(s)"),
+            "删除候选统计没有报出来：{stderr}"
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+    let records: Vec<Value> = stdout
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|error| panic!("stdout 里混进了非 JSON 行: {line:?} ({error})"))
+        })
+        .collect();
+    let summary = records.last().expect("记录流里至少有一条 summary");
+    assert_eq!(summary["kind"], "summary", "{summary}");
+
+    let counts = summary["counts"]
+        .as_object()
+        .expect("summary 必须带 counts");
+    assert_eq!(
+        counts.get("restore"),
+        Some(&(RESTORED as u64).into()),
+        "{summary}"
+    );
+    assert_eq!(
+        counts.get("update"),
+        Some(&(UPDATED as u64).into()),
+        "{summary}"
+    );
+    assert_eq!(
+        counts.get("delete"),
+        Some(&(DELETED as u64).into()),
+        "{summary}"
+    );
+    assert_eq!(counts.get("revert"), None, "不该有文件进 revert：{summary}");
+    assert_eq!(summary["total"], TOTAL as u64, "{summary}");
+
+    // shim 的逐次启动记录：sync 行数与 summary 对拍，各批 `-b` 条数之和等于三组规格总数。
+    let calls: Vec<String> = std::fs::read_to_string(&log)
+        .expect("shim log must exist")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let sync_calls: Vec<&String> = calls
+        .iter()
+        .filter(|line| line.split_whitespace().any(|token| token == "sync"))
+        .collect();
+    let by_command = summary["p4CallsByCommand"].as_object().expect("对象");
+    assert_eq!(
+        sync_calls.len() as u64,
+        by_command["sync"].as_u64().unwrap_or(0),
+        "shim 启动数与自报计数对不上\ncalls: {sync_calls:?}\n{summary}"
+    );
+    assert_eq!(
+        sync_calls.len(),
+        expected_sync_calls,
+        "sync 实际启动数不符合这一档预算：restore={restore_batches} update={update_batches} \
+         delete={delete_batches}\n{sync_calls:?}"
+    );
+
+    let specs_per_batch: Vec<usize> = sync_calls
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .skip_while(|token| *token != "-b")
+                .nth(1)
+                .and_then(|count| count.parse().ok())
+                .expect("每一批的 -b 后面都是本批条数")
+        })
+        .collect();
+    assert_eq!(
+        specs_per_batch.iter().sum::<usize>(),
+        TOTAL,
+        "各批条数之和必须等于三组规格总数：{specs_per_batch:?}"
+    );
+    assert!(
+        specs_per_batch.iter().all(|count| *count <= 8192),
+        "单批条数超过 stdin 的条数上限：{specs_per_batch:?}"
+    );
+
+    // 终态：restore 组写回 rev1 内容，update 组前进到 rev2，delete 组从磁盘与 have 里消失。
+    par_for_each(&base[..RESTORED], |index, content| {
+        assert_eq!(
+            sandbox.read(&format!("{RELATIVE_DIR}/f{index:05}.txt")),
+            *content,
+            "restore 的文件 {index} 内容不对"
+        );
+    });
+    par_for_each(&changed, |offset, content| {
+        let index = RESTORED + offset;
+        assert_eq!(
+            sandbox.read(&format!("{RELATIVE_DIR}/f{index:05}.txt")),
+            *content,
+            "update 的文件 {index} 内容不对"
+        );
+    });
+    par_for_each(&deleted, |_, path| {
+        assert!(!sandbox.exists(path), "delete 组的 {path} 必须已从磁盘移除");
+    });
+
+    let have = sandbox.p4_lines(&["have", "//depot/main/bulk/..."]);
+    assert_eq!(
+        have.len(),
+        RESTORED + UPDATED,
+        "have 记录数应为 restore + update 两组：{:?}",
+        have.first()
+    );
+    assert_eq!(
+        have.iter().filter(|line| line.contains("#1")).count(),
+        RESTORED,
+        "restore 组的 have 应停在 rev1"
+    );
+    assert_eq!(
+        have.iter().filter(|line| line.contains("#2")).count(),
+        UPDATED,
+        "update 组的 have 应前进到 rev2"
+    );
+
+    // A/B 汇总：两次跑（基线与工作区构建）各留一行可比对的数字。
+    eprintln!(
+        "p4delta A/B (single-group budget): budget={budget_bytes} sync={} fstat={} have={} \
+         total={} batches={specs_per_batch:?}",
         by_command["sync"],
         by_command["fstat"].as_u64().unwrap_or(0),
         by_command["have"].as_u64().unwrap_or(0),

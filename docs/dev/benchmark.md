@@ -45,9 +45,11 @@ pwsh -File scripts/test-benchmark.ps1
    目标快照组则整组前移到首轮 poll。这两组连同查询行按多重集比，其余结构行照旧逐行 diff。
 3. **计时行归一化**：`sed 's/[0-9.]* seconds/<T> seconds/'` 之后再比。
 
-比较分批策略时，`Running "p4 …" with N batches.` 与 JSON summary 的 `p4Calls` /
-`p4CallsByCommand` 是预期变化，单独对账而非当作行为差异忽略。动作多重集、范围、
-成功状态及文件/have 终态仍须一致。
+比较分批策略时，`Running "p4 …" with N batches.`、`[diag] batches:`（命令/组别、参数通道、参数数、
+载荷字节、容量与条数上限、批数、单批范围、并发目标）与 JSON summary 的 `p4Calls` /
+`p4CallsByCommand` 是预期变化，单独对账而非当作行为差异忽略。`[diag] delete-candidates:` 同理——
+它全是聚合数字与**标注了 `estimates, nothing executed`** 的估算，估算不进 `p4Calls`，不能拿它当
+「这一轮真发了多少次调用」的证据。动作多重集、范围、成功状态及文件/have 终态仍须一致。
 
 ## 分批策略沙箱 A/B
 
@@ -60,15 +62,39 @@ P4_E2E_REQUIRED=1 P4DELTA_E2E_BIN=<基线exe绝对路径> P4DELTA_E2E_LEGACY_BAT
 P4_E2E_REQUIRED=1 cargo nextest run -E 'test(a_bulk_deep_path_sync)' --no-capture
 ```
 
+**两个开关各指一档，别混用**，设之前先看那条用例头上的说明：
+
+- `P4DELTA_E2E_LEGACY_BATCHES` = 被测二进制的**路径参数留在命令行上**（更早的 argv 策略）。
+  只给 bulk 那条用；对 0.1.15 这种已经是 stdin 默认档的基线**不要**设。
+- `P4DELTA_E2E_DEFAULT_STDIN_BUDGET` = 被测二进制走 stdin、但只有**默认 256 KiB 档**（没有
+  强制修复那条 1 MiB 额度）。0.1.15 正是这一档，所以那条基线要设上它。
+
 该场景创建 3600 个合成长路径文件（update 1800、restore 1800），逐文件验证内容与 have #2，
 并把 shim 启动次数、`-b` 参数总量与 summary 对账。2026-10-15 Windows 实测：新策略
 sync 16 / 总调用 20；同夹具下 legacy 档的预期批数是 10+10 = 20（推算值，测试在那一档
 断言的也正是它），总调用 24 含 4 次辅助查询。两边终态断言均通过。这不是用户真实工作区
 的加速比例，也不是耗时基准（测试时长包含建库和准备文件）。
 
+**这份夹具分辨不出两档 stdin 预算**（同一天用 0.1.15 实跑核对过：sync 16 / 总调用 20，
+与本构建逐字相同——两组各 1800 条 × 156 字节 ≈ 28 万字节，离默认档的 8 批门槛
+（8 × 262,144 = 210 万字节）还差一个数量级）。要证明 1 MiB 那一档真的生效，用另一条：
+
+```bash
+P4_E2E_REQUIRED=1 P4DELTA_E2E_BIN=<基线exe绝对路径> P4DELTA_E2E_DEFAULT_STDIN_BUDGET=1 \
+  cargo nextest run -E 'test(a_group_beyond_the_default_stdin_budget)' --no-capture
+P4_E2E_REQUIRED=1 cargo nextest run -E 'test(a_group_beyond_the_default_stdin_budget)' --no-capture
+```
+
+它造 14,400 个深路径文件让 **restore 单组**的载荷到 2,260,800 字节——正好越过
+8 × 262,144，所以 256 KiB 那一档装不出 8 批，1 MiB 装得下。2026-10-15 Windows 实测：
+基线（0.1.15）sync 11 / 总调用 16、每批 `-b` 是 `[100, 1669×8, 1048, 100]`；本构建
+sync 10 / 总调用 15、`[100, 1800×8, 100]`，两边终态（内容、have、删除组消失）逐条相同，
+单跑耗时 44.6 / 44.4 秒（含造库，**不是**加速比例）。同一轮里那条 bulk 夹具两档都是 16——
+这正是新夹具存在的理由。
+
 **夹具规模本身会变**（9000 → 6000 → 3600，每次都按「spec 长度 → 每批条数 → 批数门槛」
 反推，算式写在 `tests/e2e_sync.rs` 那条用例的注释里），所以上面这组批数只是当次测量的
-记录：跑 A/B 时以测试自己算出的 legacy 批数为准，别照抄文档里的数字。
+记录：跑 A/B 时以测试自己算出的批数为准，别照抄文档里的数字。
 
 
 两个会得出错误结论的陷阱：

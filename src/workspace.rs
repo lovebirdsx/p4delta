@@ -1476,4 +1476,185 @@ mod tests {
             "全量扫盘必须跑在阻塞线程上：内联跑会把同轮的 depot 查询饿死"
         );
     }
+
+    /// 隔离实验（**不改生产行为**）：把 `p4 ignores -i -v` 的路径换成 client root **相对**
+    /// 写法——cwd 仍是工作区，只是参数短了一截——会看到什么。
+    ///
+    /// **只在 Windows 上跑，而且断言的是 Windows 上的观察**：下面第 2 条看到的回显拼法
+    /// （cwd 段用平台分隔符、请求段保留原样、盘符折小写）是这台机器上 p4 2024.1 的行为，
+    /// 别的平台的 p4 怎么拼没有验证过，不替它下结论。这条实验要回答的是现场那台机器上的
+    /// 「把参数换成相对写法值不值得设计」，所以观察限定在同一个平台上。
+    ///
+    /// 这条要回答的是「把参数换成相对写法值不值得设计」，所以断言的是观察到的事实：
+    ///
+    /// 1. **裁决不变**：同一批文件，绝对请求与相对请求得到逐条一致的 ignored / not ignored。
+    ///    夹具盖住祖先规则（`node_modules/`）、通配（`*.log`）、嵌套 `.p4ignore`
+    ///    （`sub/deep/.p4ignore` 的 `*.tmp`）与名字里带空格的文件。
+    /// 2. **回显换了拼法**：相对请求的回显是「cwd + 请求原文」拼出的绝对路径——cwd 那一段用
+    ///    平台分隔符，请求那一段**保留原样**（本机实测 `c:\ws\sub/deep/x.txt`），盘符被折成
+    ///    小写。于是 [`parse_ignore_verdicts`] 的逐字回显校验在相对请求下一条都认不出来，整轮
+    ///    按 fail-closed 停下——这正是它该做的。要落地「缩短路径表示」，回显校验得换成
+    ///    「cwd 拼回请求之后按 [`local_path_key`] 比」，而且换算回请求侧仍是一路径一映射。
+    /// 3. **`!` 规则命中会让 p4 改说法**：被重包含规则罩住的文件回的是
+    ///    `not ignored by <规则来源>`，既不是 `ignored by`，也不是干净的 `not ignored`。
+    ///    这个形状今天**读不出来**（[`verdict_candidates`] 只能从它切出 `"<路径> not"`），
+    ///    也就是「`.p4ignore` 里有一条真的命中的 `!` 规则」会让删除保护整批拒绝。方向没问题
+    ///    （fail-closed），但这条事实要先摆在这里：相对路径方案经过的是同一个解析器。
+    ///
+    /// 下面两处 `is_err()` 断言记录的是**现状**而不是期望值；解析器改成读得出这两种形状之后，
+    /// 它们应当翻成 `is_ok()`。
+    #[cfg(windows)]
+    #[test]
+    fn relative_ignores_arguments_agree_on_verdicts_but_not_on_the_echo() {
+        use std::path::MAIN_SEPARATOR;
+
+        // 真实 p4 的逐条裁决行；p4 不可用时返回 None（约定同 `prune.rs` 里的同类用例）。
+        fn verdict_lines(root: &std::path::Path, paths: &[&str]) -> Option<Vec<String>> {
+            let mut args: Vec<&str> = vec!["ignores", "-i", "-v"];
+            args.extend_from_slice(paths);
+
+            let output = p4_output(root, &args, &TEST_P4_ENV)?;
+            assert!(
+                output.status.success(),
+                "p4 ignores -i -v failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            Some(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+        }
+
+        // 行里裁决分隔符之前的那一段：即 p4 回显的路径。夹具自己保证路径里不含这两段文本。
+        fn path_part(line: &str) -> &str {
+            match (line.find(" not ignored"), line.find(IGNORED_BY_SEPARATOR)) {
+                (Some(at), _) | (None, Some(at)) => &line[..at],
+                (None, None) => panic!("no verdict in: {line}"),
+            }
+        }
+
+        // 回显路径后面的那段就是裁决；`not ignored by <规则>` 也是「不忽略」。
+        fn verdict_of(line: &str, path: &str) -> bool {
+            let rest = &line[path.len()..];
+            if rest.starts_with(" not ignored") {
+                false
+            } else if rest.starts_with(IGNORED_BY_SEPARATOR) {
+                true
+            } else {
+                panic!("unexpected verdict after {path:?}: {line}");
+            }
+        }
+
+        let tree = TempTree::new("ignores-relative");
+        tree.file(".p4ignore", "node_modules/\n*.log\n!sub/deep/keep.txt\n");
+        tree.file("sub/deep/.p4ignore", "*.tmp\n");
+        tree.file("sub/deep/keep.txt", "x");
+        tree.file("sub/deep/other.tmp", "x");
+        tree.file("sub/deep/plain.txt", "x");
+        tree.file("sp ace/a b.log", "x");
+        tree.file("sp ace/ok.txt", "x");
+        tree.file("node_modules/mod.js", "x");
+        tree.file("top.log", "x");
+        tree.file("top.txt", "x");
+
+        let relative = [
+            "top.log",
+            "top.txt",
+            "sub/deep/keep.txt",
+            "sub/deep/other.tmp",
+            "sub/deep/plain.txt",
+            "sp ace/a b.log",
+            "sp ace/ok.txt",
+            "node_modules/mod.js",
+        ];
+        let absolute: Vec<String> = relative
+            .iter()
+            .map(|path| tree.root.join(path).display().to_string())
+            .collect();
+        let absolute_args: Vec<&str> = absolute.iter().map(String::as_str).collect();
+
+        let Some(absolute_lines) = verdict_lines(&tree.root, &absolute_args) else {
+            return;
+        };
+        let Some(relative_lines) = verdict_lines(&tree.root, &relative) else {
+            return;
+        };
+        assert_eq!(absolute_lines.len(), relative.len(), "{absolute_lines:?}");
+        assert_eq!(relative_lines.len(), relative.len(), "{relative_lines:?}");
+
+        // 绝对请求：回显与请求逐字相同，裁决从请求前缀之后读起。夹具的四种规则都要有回声，
+        // 否则下面那句「裁决一致」就是拿一批空结论在比。
+        let absolute_verdicts: Vec<bool> = relative
+            .iter()
+            .zip(&absolute)
+            .map(|(_, absolute_request)| {
+                let line = absolute_lines
+                    .iter()
+                    .find(|line| line.starts_with(absolute_request.as_str()))
+                    .unwrap_or_else(|| {
+                        panic!("no verdict line for {absolute_request}: {absolute_lines:?}")
+                    });
+                assert_eq!(
+                    path_part(line),
+                    absolute_request.as_str(),
+                    "绝对请求会被逐字回显：{line}"
+                );
+                verdict_of(line, absolute_request)
+            })
+            .collect();
+        assert_eq!(
+            absolute_verdicts,
+            vec![true, false, false, true, false, true, false, true],
+            "夹具的裁决：`*.log` 与 `node_modules/` 命中，`!sub/deep/keep.txt` 把 keep 拉回来，\
+             嵌套的 `*.tmp` 命中 other.tmp，其余不忽略"
+        );
+
+        // 相对请求：回显是「cwd + 请求」，按 [`local_path_key`] 归一之后一条请求恰好对应一行。
+        let echoed = |request: &str| format!("{}{MAIN_SEPARATOR}{request}", tree.root.display());
+        let relative_verdicts: Vec<bool> = relative
+            .iter()
+            .map(|request| {
+                let key = local_path_key(&echoed(request));
+                let line = relative_lines
+                    .iter()
+                    .find(|line| local_path_key(path_part(line)) == key)
+                    .unwrap_or_else(|| {
+                        panic!("相对请求 {request} 的回显对不上：{relative_lines:?}")
+                    });
+                verdict_of(line, path_part(line))
+            })
+            .collect();
+        assert_eq!(
+            relative_verdicts, absolute_verdicts,
+            "两套写法必须给出同样的裁决：\nabsolute {absolute_lines:?}\nrelative {relative_lines:?}"
+        );
+
+        // 但生产那套逐字校验在相对请求下一条都认不出来——整轮会被拒（fail-closed）。
+        let requests: Vec<String> = relative
+            .iter()
+            .map(|request| (*request).to_owned())
+            .collect();
+        assert!(
+            parse_ignore_verdicts(&relative_lines, &requests).is_err(),
+            "相对请求的回显不是请求原文，逐字校验必须认不出来：{relative_lines:?}"
+        );
+
+        // `!` 规则命中时 p4 说的是 `not ignored by <规则来源>`。这行今天也读不出裁决：
+        // 前缀对不上任何请求路径，整批随之被拒。
+        let reinclude = absolute_lines
+            .iter()
+            .find(|line| line.contains(" not ignored by "))
+            .expect("夹具里的 `!` 规则必须命中，否则这条观察没有发生");
+        assert!(
+            reinclude.starts_with(absolute[2].as_str()),
+            "被重包含的是 keep.txt：{reinclude}"
+        );
+        assert!(
+            parse_ignore_verdicts(&absolute_lines, &absolute).is_err(),
+            "现状：一条命中的 `!` 规则就让整批裁决被拒（fail-closed）"
+        );
+    }
 }

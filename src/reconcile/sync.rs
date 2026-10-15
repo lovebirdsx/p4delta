@@ -10,6 +10,7 @@
 //! 判定与分类在 [`analyze_at_target`]，这里只管「报告什么」与「下发什么」。
 
 use std::collections::HashMap;
+use std::path::MAIN_SEPARATOR;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
@@ -22,7 +23,11 @@ use crate::cli::Options;
 use crate::digest::{CachePolicy, is_unchanged_since_sync, parallel_compute_digests};
 use crate::json::{HandoffFile, Mode, P4Command, ignore_query_count, say_phase, sayln};
 use crate::model::{DepotState, HaveRecord, TargetMap, WorkspaceCache, WorkspaceState};
-use crate::p4::process::{FailureMode, run_p4_command_batched};
+use crate::p4::process::{
+    FailureMode, StdinBudget, command_line_ranges, command_line_safe,
+    run_p4_command_batched_with_budget, say_planned_batches,
+};
+use crate::path::{directory_key, local_path_key, normalize_local_path};
 use crate::workspace::{IgnoreQueryMode, query_ignored_paths};
 
 /// 把文件拉到目标版本时下发的 p4 命令。
@@ -282,7 +287,11 @@ async fn delete_from_workspace(
         // 判据用 ExitCodeOrStderr：发过去的都是**有** have 记录的路径，不会碰上
         // 「`... - file(s) up-to-date.`」那类良性 stderr，于是 protections 拒绝这种
         // 「退出码 0、错误只在 stderr」的真失败才暴露得出来（见 [`FailureMode`]）。
-        run_p4_command_batched(
+        //
+        // 预算是 [`StdinBudget::FORCE_SYNC`]：这一组在真实工作区里是单个最大的一批
+        // （实测 84,941 条 `#none` 规格）。条数上限 8192 给它定下至少 11 批的下界
+        // （84941 / 8192），容量再大也压不到 8 批——8 是并发目标，不是批数的可达下界。
+        run_p4_command_batched_with_budget(
             options,
             work_dir,
             P4Command::Sync,
@@ -290,6 +299,7 @@ async fn delete_from_workspace(
             &specs,
             false,
             FailureMode::ExitCodeOrStderr,
+            StdinBudget::FORCE_SYNC,
         )
         .await
         .err()
@@ -325,6 +335,17 @@ fn delete_specs(files: &[DeleteFile]) -> Vec<String> {
         .collect()
 }
 
+/// 一组文件在下发时用的规格：同步组是 `//depot/f#<rev>`，删除组是 `//depot/f#none`。
+///
+/// 预演的批数估算用它，所以那行估算与真跑时交给 p4 的那串参数同源——估算不是另写一套
+/// 近似，而是同一份规划器在同一个输入上的输出。
+fn group_specs(files: &SyncGroupFiles<'_>) -> Vec<String> {
+    match files {
+        SyncGroupFiles::Sync(files) => sync_specs(files),
+        SyncGroupFiles::Delete(files) => delete_specs(files),
+    }
+}
+
 /// 把一批文件拉到它们的目标版本。
 ///
 /// 传 depot 路径而不是 client 路径：目标修订本来就长在 depot 记录上，而且同一个 client
@@ -337,7 +358,11 @@ async fn sync_to_target(options: &Options, work_dir: &str, files: &[SyncFile]) -
     // 否则工作区会停在一个既没拉全、也没人知道的状态上。
     // 判据同 [`crate::reconcile::changes::apply_changes`]：p4 的逐文件错误不改退出码。
     // 错误由 [`apply_sync`] 收集，等其余各类做完再一起报。
-    run_p4_command_batched(
+    //
+    // 预算是 [`StdinBudget::FORCE_SYNC`]：Update / Revert / Restore 三组共用这一条，
+    // 真实工作区里 restore 单组就有 85,074 条规格。同样地，条数上限 8192 决定至少 11 批
+    // 的下界，256 KiB → 1 MiB 的实际差别取决于规格的平均长度，不是「几十批 → 8 批」。
+    run_p4_command_batched_with_budget(
         options,
         work_dir,
         P4Command::Sync,
@@ -345,6 +370,7 @@ async fn sync_to_target(options: &Options, work_dir: &str, files: &[SyncFile]) -
         &specs,
         false,
         FailureMode::ExitCodeOrStderr,
+        StdinBudget::FORCE_SYNC,
     )
     .await?;
 
@@ -392,6 +418,15 @@ pub(crate) async fn apply_sync(
         );
 
         if !options.apply {
+            // 预演用**同一份**规划器报出这一组真跑时会切出几批：批数是调用数的直接来源，
+            // 而调用数是这一档唯一可核对的下发规模。一个进程都不起、一次调用都不记
+            // （`p4Calls` 因此不受影响），它报的就是真跑时该有的批数。
+            say_planned_batches(
+                &format!("plan: {} group (p4 {})", spec.label, SYNC_ARGS[0]),
+                SYNC_ARGS,
+                &group_specs(&files),
+                StdinBudget::FORCE_SYNC,
+            );
             continue;
         }
 
@@ -472,6 +507,317 @@ pub(crate) struct SyncPlan {
     pub(crate) unsupported: Vec<HandoffFile>,
 }
 
+/// 删除候选的纯内存统计与估算。**只输出聚合数字，不含路径原文**——几万条候选的路径
+/// 逐条打印就是刷屏，而且日志里出现工作区路径本身就是泄露。
+///
+/// 为什么要它：现场那一轮 `ignores` 332 次调用只留下了总数，没有候选的长度分布、父目录
+/// 数量与聚集度，下一次「怎么把它降下来」只能靠猜。这里全部在内存里算完：不执行任何 p4
+/// 调用、不改 cwd、不改忽略规则。
+///
+/// `estimated_*` 两项是**估算**，衡量两类还没实现的改动值不值得设计：一是保持 cwd、只把
+/// 参数换成 client root 相对路径（`estimated_cwd_relative`），二是按共同祖先分组、每组
+/// 各自换一次 cwd（`estimated_by_ancestor`）。它们不执行、也**不进实际调用计数**
+/// （`--json` 的 `p4Calls` 只认真的 `spawn`，见 [`crate::json::count_p4_command`]）。
+#[derive(Debug, PartialEq)]
+struct DeleteCandidateStats {
+    total: usize,
+
+    /// 静态判定能在命令行上安全表示的候选（`command_line_safe`：Windows 上是 ASCII 的那
+    /// 些）。不叫「能上命令行」是因为判定与**平台**无关：别的平台 UTF-8 命令行装得下这些
+    /// 名字，这道限制只在会被 ANSI 代码页转码的那些机器上成立。
+    statically_safe: usize,
+
+    /// 绝对路径的字节长度分布（最小值 / 中位数 / 最大值）。
+    absolute: Option<(usize, usize, usize)>,
+
+    /// 文件名的字节长度分布。任何写法下每个候选至少要写上文件名那么长，所以这个分布是
+    /// **理论乐观下界**：现场的文件名长度未知，分组方案再巧也压不到它以下。
+    basename: Option<(usize, usize, usize)>,
+
+    /// client root 相对路径的字节长度分布，只统计真的在 root 下的候选。
+    cwd_relative: Option<(usize, usize, usize)>,
+
+    /// 不在 client root 下的候选数（相对化不了，缺席于上面的分布与估算）。
+    outside_root: usize,
+
+    /// 候选所在的父目录数量与最密那个目录里的候选数（聚集度）。
+    parents: usize,
+    densest_parent: usize,
+
+    /// 今天这条通道的批数：命令行预算下的绝对路径。`query_ignored_paths` 按静态可否上
+    /// 命令行劈成两组（安全组走 `ignores -i`、不安全组走 `ignores -i -v`），**两组各切
+    /// 各的批、成本相加**——只数安全组会把这条通道的规模报低。
+    batches_absolute: usize,
+
+    /// 估算：保持 cwd、参数改成 client root 相对路径时的理论批数。root 之外的候选保持
+    /// 绝对写法（今天就是这样交给 p4 的），静态上不了命令行的候选另发一批，成本都计在内。
+    estimated_cwd_relative: Option<usize>,
+
+    /// 估算：(共同祖先深度, 该深度下的理论批数)。每项都加上那些**改不了写法**的候选
+    /// （root 之外的全部，以及静态上不了命令行的那一组）的绝对回退成本——不然候选全在
+    /// root 外、或全是非 ASCII 时这里会报 0 批，把「代价没算」读成「没有代价」。
+    estimated_by_ancestor: Vec<(usize, usize)>,
+}
+
+/// 估算只在候选数不超过这个上限时做：那是「候选数 × (1 + 祖先深度)」份短路径副本，
+/// 病态输入下不该让诊断本身变成开销。
+const ESTIMATE_MAX_CANDIDATES: usize = 200_000;
+
+/// 估算用的祖先深度：再深收益递减，而每加一层都要把全部候选的相对路径重切一遍。
+const ESTIMATE_ANCESTOR_DEPTHS: [usize; 3] = [1, 2, 3];
+
+impl DeleteCandidateStats {
+    fn of(candidates: &[&str], work_dir: &str) -> Self {
+        Self::of_with_cap(candidates, work_dir, ESTIMATE_MAX_CANDIDATES)
+    }
+
+    fn of_with_cap(candidates: &[&str], work_dir: &str, estimate_cap: usize) -> Self {
+        let root = normalize_local_path(work_dir).into_owned();
+        let root = root.trim_end_matches(MAIN_SEPARATOR);
+        let root_key = local_path_key(root);
+        let estimate = candidates.len() <= estimate_cap;
+
+        let mut statically_safe = 0usize;
+        let mut absolute = Vec::with_capacity(candidates.len());
+        let mut basename = Vec::with_capacity(candidates.len());
+        let mut relative_lengths = Vec::new();
+        let mut outside_root = 0usize;
+        let mut parents: HashMap<String, usize> = HashMap::new();
+        // 估算的三份输入：`relative_args` 是能相对化的候选（静态安全且真在 root 下），
+        // `absolute_args` 是静态安全、但只能在 root 之外保持绝对写法的那些，`unsafe_args`
+        // 是静态上不了命令行的那一组——它们**两种写法都用不了**，只能按绝对回退单独发一批
+        // （与真实通道的两组切分一致），成本必须计进每一条估算。
+        let mut relative_args: Vec<String> = Vec::new();
+        let mut absolute_args: Vec<String> = Vec::new();
+        let mut unsafe_args: Vec<String> = Vec::new();
+
+        for path in candidates {
+            let safe = command_line_safe(path);
+            if safe {
+                statically_safe += 1;
+            } else if estimate {
+                unsafe_args.push((*path).to_owned());
+            }
+            absolute.push(path.len());
+
+            let normalized = normalize_local_path(path);
+            basename.push(basename_len(&normalized));
+            let relative = relative_to_root(&normalized, root, &root_key);
+
+            match relative {
+                Some(rest) => {
+                    relative_lengths.push(rest.len());
+                    if estimate && safe {
+                        relative_args.push(rest.to_owned());
+                    }
+                }
+                None => {
+                    outside_root += 1;
+                    if estimate && safe {
+                        absolute_args.push((*path).to_owned());
+                    }
+                }
+            }
+
+            let parent = std::path::Path::new(path)
+                .parent()
+                .map(|dir| directory_key(dir.to_string_lossy().as_ref()))
+                .unwrap_or_default();
+            *parents.entry(parent).or_insert(0) += 1;
+        }
+
+        let (estimated_cwd_relative, estimated_by_ancestor) = if estimate {
+            let outside_absolute = command_line_batches(absolute_args.iter().map(String::as_str));
+            let unsafe_absolute = command_line_batches(unsafe_args.iter().map(String::as_str));
+            let relatives: Vec<&str> = relative_args.iter().map(String::as_str).collect();
+            (
+                // 安全组是一条命令（能相对的用相对、root 之外的保持绝对），不安全组另发一批。
+                Some(
+                    command_line_batches(
+                        relative_args
+                            .iter()
+                            .chain(absolute_args.iter())
+                            .map(String::as_str),
+                    ) + unsafe_absolute,
+                ),
+                ESTIMATE_ANCESTOR_DEPTHS
+                    .iter()
+                    .map(|depth| {
+                        (
+                            *depth,
+                            batches_by_ancestor(&relatives, *depth)
+                                + outside_absolute
+                                + unsafe_absolute,
+                        )
+                    })
+                    .collect(),
+            )
+        } else {
+            (None, Vec::new())
+        };
+
+        Self {
+            total: candidates.len(),
+            statically_safe,
+            absolute: length_spread(&absolute),
+            basename: length_spread(&basename),
+            cwd_relative: length_spread(&relative_lengths),
+            outside_root,
+            parents: parents.len(),
+            densest_parent: parents.values().copied().max().unwrap_or(0),
+            // 两组各切各的批再相加：凑成一份列表切批会让批跨过分组的边界，比真实的
+            // 两次查询少几批。
+            batches_absolute: command_line_batches(
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|path| command_line_safe(path)),
+            ) + command_line_batches(
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|path| !command_line_safe(path)),
+            ),
+            estimated_cwd_relative,
+            estimated_by_ancestor,
+        }
+    }
+
+    /// 一行给 `[diag]` 的说明。全是数字与估算，**一个路径原文都不含**。
+    fn describe(&self) -> String {
+        let spread = |values: Option<(usize, usize, usize)>| match values {
+            Some((min, median, max)) => format!("{min}/{median}/{max}"),
+            None => "n/a".to_owned(),
+        };
+
+        let mut text = format!(
+            "{} delete candidate(s), {} statically safe for the p4 command line / {} not, absolute \
+             path bytes min/median/max {}, client-root-relative {} ({} outside the root), basename \
+             bytes {} (the optimistic floor for any regrouping), {} parent dir(s) (densest {}), \
+             command-line batches today {}",
+            self.total,
+            self.statically_safe,
+            self.total - self.statically_safe,
+            spread(self.absolute),
+            spread(self.cwd_relative),
+            self.outside_root,
+            spread(self.basename),
+            self.parents,
+            self.densest_parent,
+            self.batches_absolute,
+        );
+
+        match self.estimated_cwd_relative {
+            Some(estimate) => {
+                let by_ancestor = self
+                    .estimated_by_ancestor
+                    .iter()
+                    .map(|(depth, batches)| format!("d{depth}={batches}"))
+                    .collect::<Vec<String>>()
+                    .join(" ");
+                text.push_str(&format!(
+                    "; estimates, nothing executed: {estimate} if the arguments were \
+                     client-root-relative, by shared ancestor {by_ancestor}; both keep the \
+                     candidates outside the root absolute and add the statically unsafe ones \
+                     as an absolute group of their own"
+                ));
+            }
+            None => text.push_str(&format!(
+                "; estimates skipped (over {ESTIMATE_MAX_CANDIDATES} candidates)"
+            )),
+        }
+
+        text
+    }
+}
+
+/// 一段长度分布的最小值 / 中位数 / 最大值。空集合返回 `None`。
+fn length_spread(values: &[usize]) -> Option<(usize, usize, usize)> {
+    if values.is_empty() {
+        return None;
+    }
+
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+
+    Some((
+        sorted[0],
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() - 1],
+    ))
+}
+
+/// 命令行预算（[`ARGUMENT_LENGTH_MAX`]）下的贪心批数：算式只在 [`command_line_ranges`]
+/// 一处，这里只取它的批数（估算不需要 range，也不必把几万条候选复制成 `Vec<String>`——
+/// 长度表是 `usize`）。
+fn command_line_batches<'a>(paths: impl Iterator<Item = &'a str>) -> usize {
+    let lengths: Vec<usize> = paths.map(str::len).collect();
+    command_line_ranges(&lengths).len()
+}
+
+/// 路径最后一段（文件名）的字节长度。任何分组方案下每个候选至少要写上文件名那么长，
+/// 所以这个分布是估算的理论乐观下界。
+fn basename_len(path: &str) -> usize {
+    match path.rfind(MAIN_SEPARATOR) {
+        Some(index) => path.len() - index - 1,
+        None => path.len(),
+    }
+}
+
+/// `path` 在 `root` 之下时返回相对部分（不含衔接的分隔符），否则 `None`。
+///
+/// 组件边界按平台口径比：`C:\ws2` 不在根 `C:\ws` 底下，而 Windows/macOS 上
+/// `c:\ws\x` 与 `C:\ws` 是同一个根（[`local_path_key`] 折大小写，与全仓的路径身份
+/// 口径一致）。切原串仍按字节长度——`local_path_key` 折 Unicode 小写会改变长度，
+/// 所以它只用来比较，`get(..)` 的边界检查兜住切分。
+fn relative_to_root<'a>(path: &'a str, root: &str, root_key: &str) -> Option<&'a str> {
+    let head = path.get(..root.len())?;
+    if local_path_key(head) != root_key {
+        return None;
+    }
+
+    path.get(root.len()..)?
+        .strip_prefix(MAIN_SEPARATOR)
+        .filter(|rest| !rest.is_empty())
+}
+
+/// 估算：按共同祖先（相对路径的前 `depth` 个组件）分组，每组在自己的 cwd 下用**相对**
+/// 参数发问，一共要多少个 argv 批次。分组本身只在这里算，不执行（见
+/// [`DeleteCandidateStats`]）。
+fn batches_by_ancestor(relative: &[&str], depth: usize) -> usize {
+    let mut groups: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for path in relative {
+        let (ancestor, rest) = split_at_ancestor(path, depth);
+        groups.entry(ancestor).or_default().push(rest);
+    }
+
+    groups
+        .values()
+        .map(|group| command_line_batches(group.iter().copied()))
+        .sum()
+}
+
+/// 把相对路径切成「前 `depth` 个组件（共同祖先）」与「相对该祖先的剩余部分」。
+///
+/// 路径浅于 `depth` 时退到它的父目录：再往上就不是这个候选自己的共同祖先了，
+/// 那等于把不相关的文件并进同一组。
+fn split_at_ancestor(path: &str, depth: usize) -> (&str, &str) {
+    let mut seen = 0usize;
+
+    for (index, _) in path.match_indices(MAIN_SEPARATOR) {
+        seen += 1;
+        if seen == depth {
+            return (&path[..index], &path[index + 1..]);
+        }
+    }
+
+    match path.rfind(MAIN_SEPARATOR) {
+        Some(index) => (&path[..index], &path[index + 1..]),
+        None => ("", path),
+    }
+}
+
 /// 删除候选的保护：只对**这一批**候选查一次忽略规则，被规则盖着的从组里摘掉。
 ///
 /// 强制修复不对整个工作区做忽略过滤（成本与理由见 [`crate::workspace::gather_workspace`]），
@@ -492,6 +838,20 @@ async fn protect_delete_candidates(
     }
 
     let candidates = analysis.delete.len();
+
+    // 候选的规模与形状先落进日志：它是「ignores 为什么是这么多次」唯一的直接证据，
+    // 而且一个 p4 调用都不发、不改 cwd、不改忽略规则（见 [`DeleteCandidateStats`]）。
+    let paths: Vec<&str> = analysis
+        .delete
+        .iter()
+        .map(|entry| entry.file.path.as_str())
+        .collect();
+    say_phase(
+        "delete-candidates",
+        &DeleteCandidateStats::of(&paths, work_dir).describe(),
+        None,
+    );
+
     let start_time = Instant::now();
     let queries_before = ignore_query_count();
     let ignored = query_ignored_paths(
@@ -690,10 +1050,12 @@ pub(crate) async fn build_sync_changes(
 mod tests {
     use super::*;
 
+    use std::path::MAIN_SEPARATOR_STR;
     use std::time::UNIX_EPOCH;
 
     use crate::model::{DepotFileRecord, WorkspaceFile};
-    use crate::path::local_path_key;
+    use crate::p4::process::{ARGUMENT_LENGTH_MAX, compute_batches};
+    use crate::path::{local_path_key, path_identity_ignores_case};
     use crate::reconcile::analyze::DeletedAtTarget;
 
     fn sync_file(client_file: &str, depot_file: &str, target_rev: u32) -> SyncFile {
@@ -980,5 +1342,481 @@ mod tests {
         let specs = delete_specs(&[delete_file("a.txt", "//depot/a.txt"), never_synced]);
 
         assert_eq!(specs, ["//depot/a.txt#none"]);
+    }
+
+    // ---- 删除候选的统计与估算 ----
+
+    /// 估算用的贪心算式必须与真实规划器逐字一致：估算要是偏了，拿它判断「缩短路径表示
+    /// 值不值得设计」就是在用一个错数当依据。
+    #[test]
+    fn the_estimate_counts_batches_exactly_like_the_planner() {
+        let paths: Vec<String> = (0..5_000)
+            .map(|index| format!(r"C:\ws\dir{:03}\sub\file{index:04}.txt", index % 97))
+            .collect();
+        assert_eq!(
+            command_line_batches(paths.iter().map(String::as_str)),
+            compute_batches(&paths).len()
+        );
+
+        // 「单个超载参数独占一批」这条规则两边都要有，否则估算会把超长路径按长度均摊。
+        let odd = vec![
+            "short".to_owned(),
+            "x".repeat(ARGUMENT_LENGTH_MAX + 1),
+            "another".to_owned(),
+        ];
+        assert_eq!(
+            command_line_batches(odd.iter().map(String::as_str)),
+            compute_batches(&odd).len()
+        );
+        assert_eq!(compute_batches(&odd).len(), 3);
+    }
+
+    /// 分组估算切的是「共同祖先 + 相对该祖先的剩余部分」：祖先不够深时退到父目录，
+    /// 而不是把不相关的候选并进一组。
+    #[test]
+    fn the_ancestor_split_takes_the_depth_it_is_asked_for() {
+        // 断言里用平台分隔符拼路径：切分器认的是 `MAIN_SEPARATOR`。
+        let rest = |parts: &[&str]| parts.join(MAIN_SEPARATOR_STR);
+        let path = rest(&["a", "b", "c", "f.txt"]);
+
+        assert_eq!(
+            split_at_ancestor(&path, 1),
+            ("a", rest(&["b", "c", "f.txt"]).as_str())
+        );
+        assert_eq!(
+            split_at_ancestor(&path, 2),
+            (rest(&["a", "b"]).as_str(), rest(&["c", "f.txt"]).as_str())
+        );
+        assert_eq!(
+            split_at_ancestor(&path, 3),
+            (rest(&["a", "b", "c"]).as_str(), "f.txt")
+        );
+        // 比路径还深：退到最深那个目录，剩余部分是文件名。
+        assert_eq!(
+            split_at_ancestor(&path, 9),
+            (rest(&["a", "b", "c"]).as_str(), "f.txt")
+        );
+        // 没有目录可退：整条进剩余部分，祖先为空。
+        assert_eq!(split_at_ancestor("f.txt", 3), ("", "f.txt"));
+    }
+
+    /// 统计报的是规模与形状，**一个路径原文都不含**：这行要落盘，工作区路径不该跟着走。
+    #[test]
+    fn the_delete_candidate_stats_describe_shape_without_paths() {
+        let root = if cfg!(windows) { r"C:\ws" } else { "/ws" };
+        let sep = MAIN_SEPARATOR;
+        let candidates = [
+            format!("{root}{sep}a{sep}one.txt"),
+            format!("{root}{sep}a{sep}two.txt"),
+            format!("{root}{sep}b{sep}three.txt"),
+            format!("{root}{sep}b{sep}four.txt"),
+            format!("{root}{sep}b{sep}five.txt"),
+        ];
+        let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+
+        let stats = DeleteCandidateStats::of(&refs, root);
+
+        assert_eq!(stats.total, 5);
+        assert_eq!(stats.statically_safe, 5);
+        assert_eq!(stats.outside_root, 0);
+        assert_eq!(stats.parents, 2, "a 与 b 两个目录");
+        assert_eq!(stats.densest_parent, 3, "b 里有三个候选");
+        assert_eq!(
+            stats.absolute.unwrap().2,
+            candidates.iter().map(|path| path.len()).max().unwrap()
+        );
+        // 文件名是理论乐观下界：它必然短于全路径，但不为零。
+        assert_eq!(
+            stats.basename.unwrap().2,
+            "three.txt".len(),
+            "最长的是 three.txt"
+        );
+        assert!(stats.cwd_relative.unwrap().2 < stats.absolute.unwrap().2);
+        // 五条短路径各自成不了一整批：今天就是一批，相对化之后还是一批。
+        assert_eq!(stats.batches_absolute, 1);
+        assert_eq!(stats.estimated_cwd_relative, Some(1));
+        assert_eq!(stats.estimated_by_ancestor, vec![(1, 2), (2, 2), (3, 2)]);
+
+        let text = stats.describe();
+        assert!(text.contains("5 delete candidate(s)"), "{text}");
+        assert!(
+            text.contains("5 statically safe for the p4 command line / 0 not"),
+            "{text}"
+        );
+        assert!(text.contains("basename bytes"), "{text}");
+        assert!(text.contains("2 parent dir(s) (densest 3)"), "{text}");
+        assert!(text.contains("estimates, nothing executed:"), "{text}");
+        for path in &candidates {
+            assert!(!text.contains(path.as_str()), "路径原文不该落盘：{text}");
+        }
+    }
+
+    /// 估算要真的随路径长度变化，否则它回答不了「缩短路径表示值不值得」这个问题：
+    /// 一个很长的 client root，候选全挤在它的同一个子目录里——相对化省下整个根前缀，
+    /// 按共同祖先分组再省下「相对根的那层子目录」。
+    #[test]
+    fn the_estimates_respond_to_how_long_the_paths_are() {
+        let sep = MAIN_SEPARATOR;
+        let root = if cfg!(windows) {
+            format!(r"C:{sep}workspaces{sep}verylongclientrootname{sep}another{sep}long{sep}here")
+        } else {
+            format!("/workspaces{sep}verylongclientrootname{sep}another{sep}long{sep}here")
+        };
+        let candidates: Vec<String> = (0..20_000)
+            .map(|index| format!(r"{root}{sep}projectdir{sep}file{index:06}.bin"))
+            .collect();
+        let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+
+        let stats = DeleteCandidateStats::of(&refs, &root);
+
+        assert!(
+            stats.batches_absolute > 1,
+            "夹具的绝对路径要长到切出多批：{}",
+            stats.batches_absolute
+        );
+        let relative = stats.estimated_cwd_relative.expect("候选数远低于上限");
+        assert!(
+            relative < stats.batches_absolute,
+            "相对写法没有变少：{} vs {}",
+            stats.batches_absolute,
+            relative
+        );
+        assert_eq!(
+            stats
+                .estimated_by_ancestor
+                .iter()
+                .map(|(depth, _)| *depth)
+                .collect::<Vec<usize>>(),
+            ESTIMATE_ANCESTOR_DEPTHS.to_vec()
+        );
+        assert!(
+            stats
+                .estimated_by_ancestor
+                .iter()
+                .all(|(_, batches)| *batches <= relative),
+            "只有一个子目录时，分组不该比相对写法更贵：{:?} vs {relative}",
+            stats.estimated_by_ancestor
+        );
+
+        // 反过来也一样重要：候选散在大量目录里时，按祖先分组是**每组一次调用**，比一份
+        // 相对路径列表更贵。估算要如实报出这个代价——它给的是判断依据，不是省钱承诺。
+        let scattered: Vec<String> = (0..500)
+            .map(|index| format!(r"{root}{sep}d{index}{sep}f.txt"))
+            .collect();
+        let refs: Vec<&str> = scattered.iter().map(String::as_str).collect();
+        let stats = DeleteCandidateStats::of(&refs, &root);
+        assert!(
+            stats.estimated_by_ancestor[0].1 > stats.estimated_cwd_relative.unwrap(),
+            "散开的候选按祖先分组应当更贵：{:?} vs {:?}",
+            stats.estimated_by_ancestor,
+            stats.estimated_cwd_relative
+        );
+    }
+
+    /// 候选太多时不做分组估算：那是「候选数 × 深度」份短路径副本，诊断本身不该变成开销。
+    /// 与估算无关的那些统计照旧要给出来。
+    #[test]
+    fn the_estimates_are_skipped_when_there_are_too_many_candidates() {
+        let root = r"C:\ws";
+        let candidates: Vec<String> = (0..50)
+            .map(|index| format!(r"{root}\d{index}\f.txt"))
+            .collect();
+        let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+
+        let stats = DeleteCandidateStats::of_with_cap(&refs, root, 10);
+
+        assert_eq!(stats.total, 50);
+        assert_eq!(stats.parents, 50);
+        assert_eq!(stats.estimated_cwd_relative, None);
+        assert!(stats.estimated_by_ancestor.is_empty());
+        assert!(
+            stats.describe().contains("estimates skipped"),
+            "{}",
+            stats.describe()
+        );
+    }
+
+    /// 交不到命令行上的候选（Windows 上的非 ASCII 名字，见 [`command_line_safe`]）单独
+    /// 计数：它们走的是另一条判据（`p4 ignores -i -v` 逐字核对回显），规模决定那条路
+    /// 的代价。空候选不该 panic——`protect_delete_candidates` 提前返回，但那是以「调用方
+    /// 不调用」为前提的，统计函数自身要能处理空输入。
+    #[test]
+    fn the_stats_split_by_the_command_line_and_survive_an_empty_input() {
+        let root = if cfg!(windows) { r"C:\ws" } else { "/ws" };
+        let ascii = format!(r"{root}\plain.txt");
+        let non_ascii = format!(r"{root}\使用说明.txt");
+        let refs = [ascii.as_str(), non_ascii.as_str()];
+
+        let stats = DeleteCandidateStats::of(&refs, root);
+
+        assert_eq!(stats.total, 2);
+        assert_eq!(
+            stats.total - stats.statically_safe,
+            if cfg!(windows) { 1 } else { 0 },
+            "Windows 上非 ASCII 交不到命令行，别的平台没有这道限制"
+        );
+
+        let empty = DeleteCandidateStats::of(&[], root);
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.absolute, None);
+        assert_eq!(empty.batches_absolute, 0);
+        assert_eq!(empty.estimated_cwd_relative, Some(0));
+        assert!(empty.describe().contains("0 delete candidate(s)"));
+    }
+
+    /// 候选不在 client root 下（AltRoots、盘符大小写不一致）时不算进相对长度分布，
+    /// 也不算进相对化估算——那种候选只能照原样交给 p4。
+    #[test]
+    fn candidates_outside_the_client_root_are_counted_separately() {
+        let root = if cfg!(windows) { r"C:\ws" } else { "/ws" };
+        let sep = MAIN_SEPARATOR;
+        let inside = format!("{root}{sep}a.txt");
+        let outside = if cfg!(windows) {
+            format!(r"C:{sep}other{sep}b.txt")
+        } else {
+            format!("/other{sep}b.txt")
+        };
+        // 前缀相同但不是一个目录：组件边界要挡住它。
+        let sibling = if cfg!(windows) {
+            format!(r"C:{sep}ws2{sep}c.txt")
+        } else {
+            format!("/ws2{sep}c.txt")
+        };
+        let refs = [inside.as_str(), outside.as_str(), sibling.as_str()];
+
+        let stats = DeleteCandidateStats::of(&refs, root);
+
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.outside_root, 2, "{outside} 与 {sibling} 都不在根下");
+        assert!(stats.cwd_relative.is_some());
+        // root 之外的候选只能保持绝对写法，但它们的成本必须计进估算——否则一个全在
+        // root 外的现场看到的是「按祖先分组 0 批」，把「没算」读成「不要钱」。
+        assert!(
+            stats
+                .estimated_by_ancestor
+                .iter()
+                .all(|(_, batches)| *batches >= 1),
+            "root 之外的候选也要付绝对写法的成本：{:?}",
+            stats.estimated_by_ancestor
+        );
+    }
+
+    /// 根的比对折大小写：`c:\ws\x` 与根 `C:\ws` 是同一个目录（Windows/macOS），
+    /// 组件边界仍要挡住 `C:\ws2`。折过的键会改字节长度（土耳其语的 `İ` 折成两个
+    /// 字符），所以切分是按原串的字节边界做的。
+    #[test]
+    fn the_root_prefix_comparison_folds_case_per_platform() {
+        if !path_identity_ignores_case() {
+            return;
+        }
+
+        let sep = MAIN_SEPARATOR;
+        let inside = format!("c:{sep}ws{sep}sub{sep}file.txt");
+        let root = format!("C:{sep}ws");
+        let stats = DeleteCandidateStats::of(&[inside.as_str()], &root);
+
+        assert_eq!(stats.outside_root, 0, "盘符/目录名的大小写是同一个根");
+        assert!(stats.cwd_relative.is_some());
+
+        // 折过的键仍要按组件边界比：`C:\ws2` 不在 `C:\ws` 底下。
+        let sibling = format!("C:{sep}WS2{sep}file.txt");
+        let stats = DeleteCandidateStats::of(&[sibling.as_str()], &root);
+        assert_eq!(
+            stats.outside_root, 1,
+            "{sibling} 只是前缀相同，不是一个目录"
+        );
+    }
+
+    /// 候选全在 client root 之外时，两条估算都必须报出绝对写法的成本（> 0 批）：
+    /// 分组在这里帮不上任何忙，但「帮不上忙」不等于「不要钱」。
+    #[test]
+    fn the_estimates_charge_for_candidates_that_can_only_stay_absolute() {
+        let root = if cfg!(windows) { r"C:\ws" } else { "/ws" };
+        let outside = if cfg!(windows) { r"C:\other" } else { "/other" };
+        // 路径长到足以切出多批：单批 30,719 字节，这里总量远超它。
+        let candidates: Vec<String> = (0..20_000)
+            .map(|index| {
+                format!(
+                    r"{outside}{MAIN_SEPARATOR}dir{index:05}{MAIN_SEPARATOR}name_{index:05}.txt"
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+
+        let stats = DeleteCandidateStats::of(&refs, root);
+
+        assert_eq!(stats.outside_root, stats.total);
+        assert!(
+            stats.batches_absolute > 1,
+            "夹具的绝对路径要长到切出多批：{}",
+            stats.batches_absolute
+        );
+        assert_eq!(
+            stats.estimated_cwd_relative,
+            Some(stats.batches_absolute),
+            "没有候选能相对化时，相对化估算就是同一份绝对路径列表"
+        );
+        assert!(
+            stats
+                .estimated_by_ancestor
+                .iter()
+                .all(|(_, batches)| *batches == stats.batches_absolute),
+            "分组帮不上忙，但成本要与绝对写法一致：{:?} vs {}",
+            stats.estimated_by_ancestor,
+            stats.batches_absolute
+        );
+    }
+
+    /// `batches_absolute` 报的是今天这条通道的真实规模：`query_ignored_paths` 按静态可否
+    /// 上命令行劈成两组、**各切各的批再相加**。只数安全组会把这条通道报低一批起。
+    #[test]
+    fn the_command_line_batches_sum_both_static_groups() {
+        let root = if cfg!(windows) { r"C:\ws" } else { "/ws" };
+        // 非 ASCII 名字造得又长又多：它们走的是逐字核对回显的另一条判据（`ignores -i -v`），
+        // 但那也是一批 argv，成本要报出来。
+        let mut candidates: Vec<String> = (0..10)
+            .map(|index| format!(r"{root}{MAIN_SEPARATOR}ascii{index:03}.txt"))
+            .collect();
+        candidates.extend(
+            (0..2_000).map(|index| format!(r"{root}{MAIN_SEPARATOR}说明文档{index:04}号.txt")),
+        );
+        let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+
+        let stats = DeleteCandidateStats::of(&refs, root);
+
+        let safe: Vec<&str> = candidates
+            .iter()
+            .map(String::as_str)
+            .filter(|path| command_line_safe(path))
+            .collect();
+        let unreadable: Vec<&str> = candidates
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !command_line_safe(path))
+            .collect();
+        assert_eq!(stats.statically_safe, safe.len());
+        assert_eq!(
+            stats.batches_absolute,
+            command_line_batches(safe.iter().copied())
+                + command_line_batches(unreadable.iter().copied())
+        );
+        if cfg!(windows) {
+            assert_eq!(stats.statically_safe, 10);
+            assert!(
+                command_line_batches(unreadable.iter().copied()) > 1,
+                "不安全组自己要切出多批，相加才验证得到"
+            );
+            assert_ne!(
+                stats.batches_absolute,
+                command_line_batches(candidates.iter().map(String::as_str)),
+                "两组各自切批，凑成一份列表会少算跨组的边界"
+            );
+        }
+    }
+
+    /// 混合候选里，静态上不了命令行的那一组**两种写法都用不了**：相对化省不下它们，祖先
+    /// 分组也收不进任何一组，只能作为绝对回退单独一批。摘掉它们再算一次，三项数字都该
+    /// 正好少掉那一组自己的批数——少算就是把这个代价读成「不要钱」。
+    #[test]
+    fn the_unsafe_candidates_are_charged_as_an_absolute_fallback_everywhere() {
+        let root = if cfg!(windows) { r"C:\ws" } else { "/ws" };
+        let candidates: Vec<String> = (0..10)
+            .map(|index| format!(r"{root}{MAIN_SEPARATOR}dir{index:02}{MAIN_SEPARATOR}ascii.txt"))
+            .chain(
+                (0..2_000).map(|index| format!(r"{root}{MAIN_SEPARATOR}说明文档{index:04}号.txt")),
+            )
+            .collect();
+        let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+
+        let stats = DeleteCandidateStats::of(&refs, root);
+        let safe: Vec<&str> = candidates
+            .iter()
+            .map(String::as_str)
+            .filter(|path| command_line_safe(path))
+            .collect();
+        let unreadable: Vec<&str> = candidates
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !command_line_safe(path))
+            .collect();
+        let unsafe_absolute = command_line_batches(unreadable.iter().copied());
+        let only_safe = DeleteCandidateStats::of(&safe, root);
+
+        assert_eq!(
+            stats.batches_absolute - only_safe.batches_absolute,
+            unsafe_absolute
+        );
+        assert_eq!(
+            stats.estimated_cwd_relative.unwrap() - only_safe.estimated_cwd_relative.unwrap(),
+            unsafe_absolute
+        );
+        for ((depth, with), (_, without)) in stats
+            .estimated_by_ancestor
+            .iter()
+            .zip(only_safe.estimated_by_ancestor.iter())
+        {
+            assert_eq!(
+                with - without,
+                unsafe_absolute,
+                "深度 {depth} 的分组估算漏了不安全候选的绝对回退"
+            );
+        }
+
+        if cfg!(windows) {
+            assert!(unsafe_absolute > 1, "不安全组要切出多批：{unsafe_absolute}");
+        }
+    }
+
+    /// 估算与规划器不只在「大致相等」上一致：切割的**边界**必须是同一条线。
+    /// `compute_batches` 判断一格用不含分隔符的长度、累计一格含一个分隔符，
+    /// [`command_line_ranges`] 是同一份实现，这里把边界两侧的批数都钉住。
+    #[test]
+    fn the_command_line_boundary_sits_where_the_planner_says_it_does() {
+        // 第一个参数占 101 字节（含分隔符），第二个把它恰好顶到上限：顶到 = 不切，
+        // 超一字节 = 切。
+        let first = "a".repeat(100);
+        let fits = "b".repeat(ARGUMENT_LENGTH_MAX - 100 - 1);
+        let overflows = "b".repeat(ARGUMENT_LENGTH_MAX - 100);
+
+        for (second, expected) in [(&fits, 1usize), (&overflows, 2)] {
+            let args = vec![first.clone(), second.clone()];
+            assert_eq!(
+                compute_batches(&args).len(),
+                expected,
+                "规划器的边界：{} + {}",
+                first.len(),
+                second.len()
+            );
+            assert_eq!(
+                command_line_batches(args.iter().map(String::as_str)),
+                expected,
+                "估算必须落在同一条边界上"
+            );
+        }
+    }
+
+    /// 实测入口的规格必须与执行路径一致：预演报的批数才等于真跑的批数。
+    #[test]
+    fn the_planned_specs_are_the_executed_specs() {
+        let sync_group = [sync_file("a.txt", "//depot/a.txt", 3)];
+        let delete_group = [delete_file("gone.txt", "//depot/gone.txt")];
+
+        assert_eq!(
+            group_specs(&SyncGroupFiles::Sync(&sync_group)),
+            sync_specs(&sync_group)
+        );
+        assert_eq!(
+            group_specs(&SyncGroupFiles::Delete(&delete_group)),
+            delete_specs(&delete_group)
+        );
+        // 删除组里没有 have 记录的候选不产生规格（预演因此报 0 批，与真跑一致）。
+        assert!(
+            delete_specs(&[DeleteFile {
+                client_file: r"C:\ws\b.txt".to_owned(),
+                depot_file: "//depot/b.txt".to_owned(),
+                has_have_record: false,
+            }])
+            .is_empty()
+        );
     }
 }
