@@ -7,6 +7,8 @@
 
 mod support;
 
+use std::time::Instant;
+
 use predicates::prelude::*;
 
 /// 与 `--clean` 最要紧的分水岭：depot 里没有的本地文件是用户自己的东西，sync 一个都不碰。
@@ -1967,7 +1969,13 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
     // 数目不对」的形式出现，读起来像是分批坏了。
     //
     // 逐词比而不是比子串：子串匹配会把 `headRev 20` 也算成一条 `headRev 2`。
-    let initial = sandbox.p4_ok(&["fstat", "-T", "headRev haveRev", "//depot/main/bulk/..."]);
+    let prepared = Instant::now();
+    let initial = sandbox.p4_ok(&[
+        "fstat",
+        "-T",
+        "headRev haveRev headType",
+        "//depot/main/bulk/...",
+    ]);
     let tokens: Vec<&str> = initial.split_whitespace().collect();
     let field = |tag: &str, value: &str| {
         tokens
@@ -1984,6 +1992,11 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
         field("haveRev", "1"),
         TOTAL,
         "模板初态：bulk 的 have 该全停在 rev1"
+    );
+    assert_eq!(
+        field("headType", "text"),
+        TOTAL,
+        "模板初态：bulk 应保持 text 类型，归档方式不改变工作区语义"
     );
     let have = sandbox.p4_lines(&["have", "//depot/main/bulk/..."]);
     assert_eq!(have.len(), TOTAL, "模板初态：have 记录该有 {TOTAL} 条");
@@ -2007,6 +2020,9 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
     // 本地有一份、停在 rev1，而 head 已经前进到 rev2，正是 update 要的形状，不用再造。
     let restored: Vec<usize> = (0..RESTORED).collect();
     par_for_each(&restored, |index, _| sandbox.remove(&relative_path(index)));
+    // 准备阶段的账：初态取证（两次全量 p4 查询 + 逐文件读 3600 份 rev1）与把 restore
+    // 组删成「本地缺、have 还在」的形状，都是用例自己的开销，不计在被测程序头上。
+    support::report_timing("bulk: prepare the fixture", prepared.elapsed());
 
     // 下发规格（测试自算上限用）：force 无 --to 时目标就是 head（rev 2）。
     let depot_prefix = "//depot/main/";
@@ -2035,6 +2051,8 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
     let log = sandbox.instance_dir().join("p4-shim.log");
     let _ = std::fs::remove_file(&log);
 
+    // 被测程序这一段：纯墙钟，含进程启动、3600 条规格的分批下发与全部落盘。
+    let ran = Instant::now();
     let output = sandbox
         .cli()
         .env("P4_EXE", &shim.path)
@@ -2044,6 +2062,7 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
         .arg(".")
         .output()
         .expect("run tool");
+    support::report_timing("bulk: run the tool (--sync --json)", ran.elapsed());
     assert!(
         output.status.success(),
         "run failed:\n{}",
@@ -2132,6 +2151,7 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
     // 终态：update 组前进到第二版，restore 组被写回的也是目标（head）版本；
     // have 全部停在 head（rev 2）。
     let expected: Vec<String> = (0..TOTAL).map(second_revision).collect();
+    let verified = Instant::now();
     par_for_each(&expected, |index, content| {
         assert_eq!(
             sandbox.read(&relative_path(index)),
@@ -2149,6 +2169,9 @@ fn a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent() {
     for line in &have {
         assert!(line.contains("#2"), "have 应全部停在 head：{line}");
     }
+    // 终态取证的账：逐文件读 3600 份 rev2 加一次全量 `p4 have`。它跟被测程序无关，
+    // 但和准备阶段一样属于「用例自己要花的钱」，得从被测程序的读数里摘出来。
+    support::report_timing("bulk: verify the final state", verified.elapsed());
 
     // A/B 汇总：两次跑（基线与工作区构建）各留一行可比对的数字。
     eprintln!(

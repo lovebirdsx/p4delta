@@ -185,7 +185,11 @@ impl Sandbox {
         let copied = Instant::now();
         template::instantiate(&template, paths)?;
         report_timing("instantiate (copy the database)", copied.elapsed());
+        // 起 p4d 要探测空闲端口、重试撞车，还夹着一次 `p4 info` 握手；单独计时，
+        // 避免把服务器启动的等待算进后面的工作区准备或被测程序。
+        let launched = Instant::now();
         let server = P4dServer::launch(&tools.p4d, paths, &tools.p4)?;
+        report_timing("server launch", launched.elapsed());
 
         // client 名一实例一份：工作区互不重叠，digest 缓存的文件名也就不会撞上。
         let client = format!("e2e_{}", paths.name);
@@ -577,17 +581,17 @@ impl Sandbox {
         // 分目录也让 `p4 add bulk/...` 的入库路径更像实际用法。
         const PER_DIR: usize = 100;
         let body = "0123456789abcdef\n".repeat(10);
-        for index in 0..total {
-            let path = self.client_root.join(format!(
-                "bulk/d{:03}/f{:03}.txt",
-                index / PER_DIR,
-                index % PER_DIR
-            ));
-            fs::create_dir_all(path.parent().expect("parent")).expect("create bulk dir");
-            // 首行带序号，**每个文件的内容都不一样**：缓冲复用哪天引入「上一个文件的残留
-            // 字节混进摘要」，每个文件的摘要会各自算错，断言里的「清单为空」立刻变红。
-            // 内容全都一样的话，这种回归算出来的摘要偏偏还是对的，等于白测。
-            fs::write(&path, format!("{index:07}\n{body}")).expect("write bulk file");
+        for group in 0..total.div_ceil(PER_DIR) {
+            let dir = self.client_root.join(format!("bulk/d{group:03}"));
+            fs::create_dir_all(&dir).expect("create bulk dir");
+            let start = group * PER_DIR;
+            for index in start..(start + PER_DIR).min(total) {
+                let path = dir.join(format!("f{:03}.txt", index % PER_DIR));
+                // 首行带序号，**每个文件的内容都不一样**：缓冲复用哪天引入「上一个文件的残留
+                // 字节混进摘要」，每个文件的摘要会各自算错，断言里的「清单为空」立刻变红。
+                // 内容全都一样的话，这种回归算出来的摘要偏偏还是对的，等于白测。
+                fs::write(&path, format!("{index:07}\n{body}")).expect("write bulk file");
+            }
         }
 
         self.p4_ok(&["add", "bulk/..."]);
@@ -597,8 +601,9 @@ impl Sandbox {
         let mut pending = vec![self.client_root.join("bulk")];
         while let Some(dir) = pending.pop() {
             for entry in fs::read_dir(&dir).expect("read bulk dir") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
+                let entry = entry.expect("dir entry");
+                let path = entry.path();
+                if entry.file_type().expect("bulk entry type").is_dir() {
                     pending.push(path);
                 } else {
                     clear_readonly(&path);
@@ -724,9 +729,20 @@ impl Drop for Sandbox {
             return;
         }
 
+        // 收尾三段各记一笔：规模用例的实例目录里有几千个文件，删目录往往是
+        // 「用例断言早就跑完、进程却还在」的那一段，热跑墙钟要核账就得看见它。
+        let killed = Instant::now();
         self.server.kill();
+        report_timing("sandbox drop: kill the server", killed.elapsed());
+        let cache_cleared = Instant::now();
         self.remove_predicted_cache();
+        report_timing(
+            "sandbox drop: remove the predicted cache",
+            cache_cleared.elapsed(),
+        );
+        let removed = Instant::now();
         self.paths.remove();
+        report_timing("sandbox drop: remove the instance dir", removed.elapsed());
     }
 }
 
@@ -823,10 +839,12 @@ pub fn listed_changes(stdout: &str) -> Vec<(String, String)> {
 
 /// 分段计时，由 `P4DELTA_E2E_TIMING` 打开。
 ///
-/// 默认什么都不做；打开后只往 stderr 多打几行（测试框架默认捕获用例输出，不会混进断言
-/// 看的 stdout），用来把「模板构造 / 实例化复制 / 初始 sync」各自花了多久分出来——
-/// 这三个阶段正是「热路径只该做几次 I/O」那笔账要核对的。
-fn report_timing(stage: &str, elapsed: Duration) {
+/// 默认只检查开关；打开后只往 stderr 多打几行（测试框架默认捕获用例输出，不会混进断言
+/// 看的 stdout），区分模板、复制、启动、同步与收尾开销，不把夹具成本算到被测 CLI 头上。
+///
+/// `pub` 是给规模用例用的：它们自带的准备 / 调用 / 取证三段也在墙钟里占大头，
+/// 得跟沙箱的这几段放在同一份读数里才看得出账。
+pub fn report_timing(stage: &str, elapsed: Duration) {
     if std::env::var_os("P4DELTA_E2E_TIMING").is_some() {
         eprintln!("e2e-timing {stage}: {:.3}s", elapsed.as_secs_f64());
     }

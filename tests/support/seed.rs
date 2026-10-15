@@ -213,7 +213,14 @@ fn fill_depot(p4: &Path, paths: &InstancePaths, port: u16, kind: Kind) -> io::Re
 fn fill_bulk(p4: &Path, root: &Path, port: u16) -> io::Result<()> {
     let bulk_dir = root.join(bulk::RELATIVE_DIR);
     bulk::write_first(&bulk_dir);
-    run_p4(p4, port, root, Some(CLIENT), &["add", "bulk/..."], None)?;
+    run_p4(
+        p4,
+        port,
+        root,
+        Some(CLIENT),
+        &["add", "-t", bulk::FILE_TYPE, "bulk/..."],
+        None,
+    )?;
     run_p4(
         p4,
         port,

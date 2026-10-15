@@ -23,6 +23,10 @@ pub const TOTAL: usize = 3600;
 /// 于是它们落进 Restore 组，其余落进 Update 组。
 pub const RESTORED: usize = 1800;
 
+/// RCS 差分让一个路径的两版共用一份归档，避免逐版 gzip 附带的文件与目录复制。
+/// 只改变测试种子的服务端存储，两版历史与工作区 text 内容照常保留。
+pub const FILE_TYPE: &str = "text+D";
+
 /// 七层各 17 字节的目录 + 10 字节文件名：相对路径 ~130 字节，全路径仍远离 MAX_PATH
 /// （本机实测 ~198 字节）。spec 长度同时决定每批能装多少条与夹具要造多少文件，
 /// 所以路径是刻意做深的。
