@@ -12,11 +12,11 @@
 cargo install cargo-nextest --locked     # 或者用 nexte.st 上的预编译包，快得多
 ```
 
-`.config/nextest.toml` 里配了三条，理由写在文件内注释里：不 fail-fast（一次把失败跑全，而不是首个失败就跳过后面所有）、不重试（不靠重试掩盖 flake）、单用例 180 秒硬超时（nextest 默认只把超时的用例标记为「慢」，不终止进程）。
+`.config/nextest.toml` 的理由写在文件内注释里：不 fail-fast（一次把失败跑全）、不重试（不掩盖 flake）、单用例 180 秒硬超时；默认档排除只适合专项运行的用例，bulk 用例优先启动以免拖尾。排除项与补跑方法见 [e2e.md](e2e.md)。
 
 两点与 `cargo test` 的差别要知道：nextest **不跑 doctest**（本项目目前没有真的 doctest，唯一的文档代码块是 text 类型的；将来真加了要另外补 `cargo test --doc`）；nextest 默认**隐藏通过用例的输出**，`skipping:` 那类提示只在你显式 `--no-capture` 或用例失败时才看得见。
 
-整轮墙钟本机 16 核热态 33.5 秒（2026-10-15）。要自己量：
+整轮墙钟、冷/热夹具口径与实测记录统一见 [e2e.md](e2e.md) 的「新增用例前先量」。要自己量：
 
 ```powershell
 $env:P4_E2E_REQUIRED = "1"        # 全程开着：跳过会伪装成「变快」

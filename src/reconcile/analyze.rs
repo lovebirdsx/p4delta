@@ -460,7 +460,7 @@ fn push_deleted<'a>(
 /// 强制修复下不做全盘过滤（原因见该函数），而 `.p4ignore` 也从不阻止 `p4 sync -f` 更新已入库
 /// 的文件——把这类文件当成缺失，会让它们被无条件重写。
 /// **删除组是例外**：它唯一不可逆，所以单个候选取出来之后还要过一道忽略查询
-/// （[`crate::reconcile::sync::protect_delete_candidates`]，在 [`analyze_at_target`] 之后调用）。
+/// （`crate::reconcile::sync::protect_delete_candidates`，在 [`analyze_at_target`] 之后调用）。
 ///
 /// `target` 里查不到即视为目标时刻不在库。两种来源都归此列：目标时刻已是删除版本，
 /// 或（只有 changelist 目标才可能）目标时刻它还没进 depot——实测过 `p4 sync -f ./...@CL`

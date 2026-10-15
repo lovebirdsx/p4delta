@@ -5,8 +5,10 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use super::bulk;
 use super::p4d::P4dServer;
 use super::paths::InstancePaths;
+use super::template::Kind;
 use super::tools::Tools;
 
 /// 沙箱里唯一的用户名。
@@ -98,14 +100,15 @@ pub fn put_client(p4: &Path, port: u16, cwd: &Path, form: &str) -> io::Result<()
     run_p4(p4, port, cwd, None, &["client", "-i"], Some(form))
 }
 
-/// 在 `staging` 里生成一份 p4d 数据库模板。
+/// 在 `staging` 里生成一份 p4d 数据库模板。`kind` 决定 depot 里放什么内容
+/// （见 [`Kind`]）：[`Kind::Base`] 是五个基础文件，[`Kind::Bulk`] 再追加 bulk 夹具的两版。
 ///
 /// 只放 depot 与提交历史，**不放 client**：client 由每个实例自己建，
 /// 名字唯一、Root 指向自己的工作区——顺带让 digest 缓存的文件名一实例一份。
 ///
 /// 跑完只留下 `server/`：工作区、缓存、日志在实例化时都会重建，
 /// 留着只会让模板目录变大，而且日志里的端口号对每个实例都是错的。
-pub fn seed_into(staging: &Path, tools: &Tools) -> io::Result<()> {
+pub fn seed_into(staging: &Path, tools: &Tools, kind: Kind) -> io::Result<()> {
     let paths = InstancePaths::at(staging.to_path_buf());
     paths.create()?;
 
@@ -115,10 +118,13 @@ pub fn seed_into(staging: &Path, tools: &Tools) -> io::Result<()> {
     // 少了这一步，第一条 p4 命令会撞在没起来的服务器上，靠客户端内部重试
     // 硬扛两秒多——能用，但每次建模板都白等。
     let mut server = P4dServer::launch(&tools.p4d, &paths, &tools.p4)?;
-    let result = fill_depot(&tools.p4, &paths, server.port());
+    let filled = fill_depot(&tools.p4, &paths, server.port(), kind);
     // 这里必须干净收尾，不能强杀：模板要的是刷完盘之后的数据库。
-    server.stop_cleanly(&tools.p4, &paths.dir, USER);
-    result?;
+    // `stop_cleanly` 报错就说明它没能干净停下（被强杀的那份可能只刷了一半盘），
+    // 这个错误同样要往上报——只有干净退出的模板才允许被发布。
+    let stopped = server.stop_cleanly(&tools.p4, &paths.dir, USER);
+    filled?;
+    stopped?;
 
     for leftover in [&paths.ws_root, &paths.cache, &paths.home, &paths.log] {
         remove_any(leftover);
@@ -150,7 +156,10 @@ fn init_unicode_database(p4d: &Path, paths: &InstancePaths) -> io::Result<()> {
 }
 
 /// 建 client、写基线文件、提交。`//depot` 由 p4d 初始化时自动创建，不用自己建。
-fn fill_depot(p4: &Path, paths: &InstancePaths, port: u16) -> io::Result<()> {
+///
+/// `kind` 为 [`Kind::Bulk`] 时，在基础五文件之后、**同一个 client 里**再把 bulk
+/// 夹具的两版提交上去（rev1 → rev2），于是模板里 bulk 的 head 就是 rev2。
+fn fill_depot(p4: &Path, paths: &InstancePaths, port: u16, kind: Kind) -> io::Result<()> {
     let root = paths.client_root(CLIENT);
     fs::create_dir_all(&root)?;
 
@@ -178,6 +187,10 @@ fn fill_depot(p4: &Path, paths: &InstancePaths, port: u16) -> io::Result<()> {
         run_p4(p4, port, &root, Some(CLIENT), args, None)?;
     }
 
+    if kind == Kind::Bulk {
+        fill_bulk(p4, &root, port)?;
+    }
+
     // 建它的目的只是把文件提交进去；模板里不留 client，
     // 否则每个实例还得先把它改造成自己的，不如各建各的。
     run_p4(
@@ -189,6 +202,38 @@ fn fill_depot(p4: &Path, paths: &InstancePaths, port: u16) -> io::Result<()> {
         None,
     )?;
     Ok(())
+}
+
+/// 往同一个 client 里塞 bulk 夹具的两版：一次 `add` + 一次 `submit` 入库 rev1，
+/// 再 `p4 edit` 覆盖内容 + 一次 `submit` 得到 rev2（head）。
+///
+/// 逐文件提交（`Sandbox::commit` 那种写法）是不行的：两版合计 7200 次入库，会起几万个
+/// p4 进程。而这一段只在模板**首次**构造时跑一次（见 `template.rs`），实例那一轮只剩一次
+/// `sync ...#1`。规模、深路径与内容生成都在 `bulk.rs` 里，与用例共用同一份定义。
+fn fill_bulk(p4: &Path, root: &Path, port: u16) -> io::Result<()> {
+    let bulk_dir = root.join(bulk::RELATIVE_DIR);
+    bulk::write_first(&bulk_dir);
+    run_p4(p4, port, root, Some(CLIENT), &["add", "bulk/..."], None)?;
+    run_p4(
+        p4,
+        port,
+        root,
+        Some(CLIENT),
+        &["submit", "-d", "bulk fixture"],
+        None,
+    )?;
+
+    // `p4 edit` 会把文件改成可写，下一步的覆盖才写得进去。
+    run_p4(p4, port, root, Some(CLIENT), &["edit", "bulk/..."], None)?;
+    bulk::write_second(&bulk_dir);
+    run_p4(
+        p4,
+        port,
+        root,
+        Some(CLIENT),
+        &["submit", "-d", "bulk fixture v2"],
+        None,
+    )
 }
 
 fn write_file(root: &Path, relative: &str, contents: &str) -> io::Result<()> {

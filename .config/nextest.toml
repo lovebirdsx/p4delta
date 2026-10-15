@@ -5,9 +5,8 @@
 # 代价是 nextest 不跑 doctest——本项目目前没有真的 doctest（唯一的代码块是 text
 # 类型的），将来真加了要另外补一条 `cargo test --doc`。
 #
-# 本机 16 核热态的整轮墙钟：2026-10-15 优化后 33.5 秒（最慢单条是 bulk 那条，25.4 秒），
-# 优化前 68.4 秒。判读三个数（T / Σ / max）的方法与新增用例的门槛见
-# docs/dev/e2e.md 的「新增用例前先量」。
+# 整轮墙钟、冷热口径与新增用例的门槛统一见 docs/dev/e2e.md。
+# 计时要区分 T / Σ / max；一条慢用例的调度位置也会决定有多少工作能够重叠。
 
 [profile.default]
 # cargo 与 nextest 默认都是「首个失败就停」。cargo 那边是后续二进制整个不跑、
@@ -48,6 +47,12 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # 按二进制整段排除而不是点名每一条：这个文件里的用例都是同一类（release 档才成立），
 # 将来往里加用例也不该悄悄回到快档。
 default-filter = 'not test(=both_delete_legs_report_their_own_failure) and not binary(e2e_stack)'
+
+# bulk 即使命中模板也要铺盘、同步与逐文件取证，先启动才能与其余用例重叠；
+# 默认顺序会把它排在大多数测试之后，白白把单条耗时接到整轮尾部。实测见 docs/dev/e2e.md。
+[[profile.default.overrides]]
+filter = 'test(=a_bulk_deep_path_sync_keeps_counts_files_and_have_consistent)'
+priority = 100
 
 # 两万文件那条用例自带一份两万文件的夹具，大头是造数据：建文件 + `p4 add`/`submit`/`sync`
 # （本机 8 核 release 热构建 15.6 秒，其中摘要本身不到 0.3 秒）。CI runner 只有 4 vCPU、

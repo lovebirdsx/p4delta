@@ -367,7 +367,7 @@ fn refusal_notice(message: &str) -> bool {
 /// 就是清掉 have 记录（实测：`p4 sync -n //depot/f#none` 对 have=1、本地已删的路径回同一条
 /// `deleted as`、退出码 0、stderr 空）。所以它要成为候选、按 [`NativeAction::Deleted`] 下发
 /// `#none`；本地与 have 都没有时同一行只是描述，`#none` 落下去没有动作（实测：没有 have
-/// 记录的路径 `#none` 是 no-op，见 [`crate::reconcile::sync`] 的 `delete_specs`），而记录流
+/// 记录的路径 `#none` 是 no-op，见 `crate::reconcile::sync` 的 `delete_specs`），而记录流
 /// 取自 apply 自己的回答，不会多报。
 ///
 /// 识别要求结构完整（`//` depot 规格 + 数字修订号 + ` - deleted as ` + 非空本地路径），

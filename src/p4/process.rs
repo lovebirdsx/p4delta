@@ -260,7 +260,7 @@ pub(crate) fn command_line_safe(path: &str) -> bool {
 /// 不报告——报告交给各自的调用方，在 `-v` 下按自己的口径打印：
 ///
 /// - 文件级过滤有补救：`p4 ignores` 不认 stdin，但 `p4 add -n` 认，于是那些名字改走
-///   那条字节无损的通道补判（见 [`crate::workspace::query_ignored_refusals`]）。
+///   那条字节无损的通道补判（见 `crate::workspace::query_ignored_refusals`）。
 /// - 目录级剪枝没有补救：交不出去的目录照常完整扫描，只损失性能。
 pub(crate) fn split_command_line_paths<'a>(
     paths: impl IntoIterator<Item = &'a String>,

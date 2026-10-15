@@ -215,8 +215,12 @@ impl P4dServer {
     /// 「Unicode clients require a unicode enabled server」。
     ///
     /// 慢（约一秒），但模板只建一次。
-    pub fn stop_cleanly(&mut self, p4: &Path, cwd: &Path, user: &str) {
-        let _ = Command::new(p4)
+    ///
+    /// 三处都算「没干净停下」，任何一处都要报错交给调用方，因为这份数据库不该被发成模板：
+    /// `p4 admin stop` 自己失败、进程不肯退出，或者它是带着非零退出码走的。出错路径不再
+    /// 手工收尾，交给 `Drop` 的 `kill()`（RAII）。
+    pub fn stop_cleanly(&mut self, p4: &Path, cwd: &Path, user: &str) -> io::Result<()> {
+        let stopped = Command::new(p4)
             .arg("-p")
             .arg(self.address())
             .arg("-u")
@@ -229,15 +233,29 @@ impl P4dServer {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()?;
+        if !stopped.success() {
+            return Err(io::Error::other(format!(
+                "`p4 admin stop` failed ({stopped}); refusing to snapshot the database"
+            )));
+        }
         // 等它真的退出，否则接下来的复制会读到写了一半的数据库。
-        // 停不下来就强杀——宁可放弃这个模板，也不能把测试挂死在这里。
         if !self.wait_until(SHUTDOWN_TIMEOUT) {
-            self.kill();
-            return;
+            return Err(io::Error::other(format!(
+                "p4d did not exit within {SHUTDOWN_TIMEOUT:?} after `p4 admin stop`; \
+                 refusing to snapshot a database that is only half on disk"
+            )));
+        }
+        if let Some(status) = self.child.try_wait()?
+            && !status.success()
+        {
+            return Err(io::Error::other(format!(
+                "p4d exited with {status}; refusing to snapshot the database"
+            )));
         }
         let _ = fs::remove_file(&self.journal);
         let _ = fs::remove_file(&self.pid_file);
+        Ok(())
     }
 
     /// 日志末尾若干行，附在失败信息里。

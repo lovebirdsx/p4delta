@@ -630,7 +630,7 @@ pub(crate) fn p4_command_calls(command: P4Command) -> usize {
 /// 本轮为「忽略判定」启动过的 p4 次数：`p4 ignores` 加上 `p4 add -n` 兜底。
 ///
 /// 两个类别合起来才是完整答案——兜底那条只在非 ASCII 路径上才会发，单看任何一路都会漏。
-/// 判定口径集中在这里，调用点（[`crate::workspace`] 与 [`crate::reconcile::sync`] 的诊断）
+/// 判定口径集中在这里，调用点（[`crate::workspace`] 与 `crate::reconcile::sync` 的诊断）
 /// 只取差值，不各自挑类别。
 pub(crate) fn ignore_query_count() -> usize {
     p4_command_calls(P4Command::Ignores) + p4_command_calls(P4Command::Add)

@@ -339,13 +339,11 @@ pub(crate) const IGNORES_VERBOSE_ARGS: [&str; 3] = ["ignores", "-i", "-v"];
 /// 输出里就当没被忽略——对删除保护来说，这半个结论正好落在最危险的方向。`-v` 会为每条路径
 /// 回一行明确的 `not ignored` 或 `ignored by <规则来源>`，把「沉默」变成「明说」。
 ///
-/// 为什么路径挂命令行：`p4 ignores` 不认 `-x -`（见 [`takes_paths_from_stdin`]），而命令行在
+/// 为什么路径挂命令行：`p4 ignores` 不认 `-x -`（见 `takes_paths_from_stdin`），而命令行在
 /// Windows 上要过一遍系统 ANSI 代码页，非 ASCII 的名字可能被换掉。所以这里不假设它一定送得
 /// 进去，而是**逐字核对回显**：p4 把请求的路径原样回显，一个字不同就当这条通道不可用，整轮
 /// 停下（见 [`parse_ignore_verdicts`]）。能不能用是运行时的取舍——本机 p4 送得进去就正常
 /// 跑完，送不进去就 fail-closed，不由平台一刀切。
-///
-/// [`takes_paths_from_stdin`]: crate::p4::process::takes_paths_from_stdin
 async fn query_ignores_verbose(
     options: &Options,
     work_dir: &str,

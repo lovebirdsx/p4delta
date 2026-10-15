@@ -11,7 +11,7 @@ cargo nextest run --all-targets --all-features
 ```
 
 CI 以 `-D warnings` 为硬门禁，clippy 有任何警告都算失败。测试跑 cargo-nextest 而不是
-`cargo test`（理由、安装、`.config/nextest.toml` 的三条配置见
+`cargo test`（理由、安装、`.config/nextest.toml` 的配置见
 [docs/dev/testing.md](docs/dev/testing.md)）。
 
 ## 文档

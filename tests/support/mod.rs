@@ -3,7 +3,8 @@
 //! 框架照搬 `test-p4` 的机制，用 Rust 重写：
 //!
 //! - **模板复制**：种子只跑一次（[`template::ensure_template`]），之后每个实例
-//!   从模板复制数据库，省掉十几次 p4 往返。
+//!   从模板复制数据库，省掉十几次 p4 往返。模板按 [`template::Kind`] 分种类
+//!   （基础五文件 / 基础 + bulk 两版），各有各的指纹与互斥。
 //! - **环境隔离**：被测程序拿到的环境里没有任何继承来的 `P4*` 变量
 //!   （[`Sandbox::env`]），p4 到底连哪台服务器没有第二种解释。
 //! - **独立端口**：让 OS 分配空闲端口，所以同机并行的实例互不干扰。
@@ -16,6 +17,7 @@
 //! 这个 allow 是必需的，不是偷懒。
 #![allow(dead_code)]
 
+pub mod bulk;
 mod p4d;
 mod p4shim;
 mod paths;
@@ -28,7 +30,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use p4d::P4dServer;
 use paths::InstancePaths;
@@ -38,8 +40,19 @@ use tools::Tools;
 #[allow(unused_imports)]
 pub use p4shim::P4Shim;
 
-/// 起一个沙箱；找不到 p4d/p4 时返回 `None`，调用方据此打印一行
-/// `skipping:` 后跳过。
+/// 起一个用基础模板的沙箱；跳过语义见 `sandbox_or_skip_kind`。
+pub fn sandbox_or_skip() -> Option<Sandbox> {
+    sandbox_or_skip_kind(template::Kind::Base)
+}
+
+/// 起一个用 **bulk 模板**（[`template::Kind::Bulk`]）的沙箱：depot 里已经躺着
+/// `bulk.rs` 描述的那两版内容，实例起来只补一次 `sync ...#1`。跳过语义与
+/// [`sandbox_or_skip`] 逐字一致。
+pub fn bulk_sandbox_or_skip() -> Option<Sandbox> {
+    sandbox_or_skip_kind(template::Kind::Bulk)
+}
+
+/// 两种种类共用的跳过语义。
 ///
 /// 「没有 p4d」是环境不支持，跳过；「有 p4d 但起不来」是真实错误，
 /// 直接 panic——不能把它伪装成环境不支持。
@@ -48,8 +61,8 @@ pub use p4shim::P4Shim;
 /// 「下载失败导致 e2e 整段没跑」变成一个红色的失败，而不是一次绿色的空跑。
 /// 靠 grep 日志做不到这件事：那行 `skipping:` 走的是 stderr，而测试框架默认
 /// 会捕获用例的输出（libtest 与 nextest 都是），它压根不会出现在 CI 日志里。
-pub fn sandbox_or_skip() -> Option<Sandbox> {
-    match Sandbox::start() {
+fn sandbox_or_skip_kind(kind: template::Kind) -> Option<Sandbox> {
+    match Sandbox::start_template(kind) {
         Some(sandbox) => Some(sandbox),
         None => {
             assert!(
@@ -66,7 +79,7 @@ pub fn sandbox_or_skip() -> Option<Sandbox> {
 ///
 /// 对拍类用例（`e2e_sync_normal` 的四处）要先有左右两个实例。它们之间没有任何共享
 /// 状态，各自的「复制模板 + 起 p4d + `p4 client -i` + `sync -f`」是独立 I/O，串行做纯属
-/// 白等——冷跑时模板只生成一次（`TEMPLATE_LOCK` 会让后到者等一会儿），热态下两边都是
+/// 白等——冷跑时模板只生成一次（模板互斥会让后到者等一会儿），热态下两边都是
 /// 纯拷贝。
 ///
 /// 跳过语义与 [`sandbox_or_skip`] 逐字一致，包括 `P4_E2E_REQUIRED` 的断言。子线程里
@@ -108,17 +121,21 @@ pub struct Sandbox {
 
 impl Sandbox {
     pub fn start() -> Option<Sandbox> {
-        let tools = tools::discover()?;
-        Some(Self::start_with(tools))
+        Self::start_template(template::Kind::Base)
     }
 
-    fn start_with(tools: Tools) -> Sandbox {
+    fn start_template(kind: template::Kind) -> Option<Sandbox> {
+        let tools = tools::discover()?;
+        Some(Self::start_with(tools, kind))
+    }
+
+    fn start_with(tools: Tools, kind: template::Kind) -> Sandbox {
         let paths = InstancePaths::new(&paths::unique_instance_name());
 
         // 这一段失败要自己收尸：`Sandbox` 还没造出来，它的 Drop 还没接管，
         // 而实例目录已经建了。少了这一步，探测到坏 p4d、模板生成失败、
         // 端口起不来这些情况都会在 `target/e2e/instances/` 里留下空壳。
-        let parts = match Self::start_parts(&tools, &paths) {
+        let parts = match Self::start_parts(&tools, &paths, kind) {
             Ok(parts) => parts,
             Err(error) => {
                 paths.remove();
@@ -135,19 +152,39 @@ impl Sandbox {
         };
         // 到这里 Drop 已经接管，下面的失败由它清理。
         sandbox.put_client(&seed::default_view(&sandbox.client));
-        sandbox.p4_ok(&["sync", "-f"]);
+        let synced = Instant::now();
+        if kind == template::Kind::Bulk {
+            // bulk 模板的 bulk 目录 head 已是 rev2，而规模用例要的现场是「本地与 have
+            // 都停在 rev1」——一次 `...#1` 直接落定，不走「先同步到 rev2 再退回 #1」的
+            // 回头路。基础文件只有 rev1，`#1` 对它们就是 head，不受影响。
+            sandbox.p4_ok(&["sync", "-f", "//depot/main/...#1"]);
+        } else {
+            // 基础模板的 depot 全是 rev1，全量拉一次即可。
+            sandbox.p4_ok(&["sync", "-f"]);
+        }
+        report_timing("initial sync", synced.elapsed());
         sandbox
     }
 
     /// 起服务器、建工作区，产出组装 [`Sandbox`] 需要的部件。
-    fn start_parts(tools: &Tools, paths: &InstancePaths) -> io::Result<Parts> {
+    fn start_parts(
+        tools: &Tools,
+        paths: &InstancePaths,
+        kind: template::Kind,
+    ) -> io::Result<Parts> {
         // 同名残留可能来自上一次被 Ctrl-C 或 CI 超时打断的运行——那种结束方式
         // 不走 Drop。pid 会被系统回收，所以「新」实例名未必真的新，而残留的
         // journal 会被 p4d 重放到刚从模板复制来的干净库上，把初始状态改回去。
         paths.remove();
         paths.create()?;
-        let template = template::ensure_template(tools)?;
+        // 冷跑（首次构造模板）与热跑（stamp 命中）都落在下面这两步里，计时把它们分开：
+        // 前者是几十秒级的 p4 往返，后者是查一次 stamp 加一次目录复制。
+        let built = Instant::now();
+        let template = template::ensure_template(tools, kind)?;
+        report_timing("template build (cold) or lookup (hot)", built.elapsed());
+        let copied = Instant::now();
         template::instantiate(&template, paths)?;
+        report_timing("instantiate (copy the database)", copied.elapsed());
         let server = P4dServer::launch(&tools.p4d, paths, &tools.p4)?;
 
         // client 名一实例一份：工作区互不重叠，digest 缓存的文件名也就不会撞上。
@@ -782,6 +819,17 @@ pub fn listed_changes(stdout: &str) -> Vec<(String, String)> {
                 .then(|| (label.to_owned(), file.to_owned()))
         })
         .collect()
+}
+
+/// 分段计时，由 `P4DELTA_E2E_TIMING` 打开。
+///
+/// 默认什么都不做；打开后只往 stderr 多打几行（测试框架默认捕获用例输出，不会混进断言
+/// 看的 stdout），用来把「模板构造 / 实例化复制 / 初始 sync」各自花了多久分出来——
+/// 这三个阶段正是「热路径只该做几次 I/O」那笔账要核对的。
+fn report_timing(stage: &str, elapsed: Duration) {
+    if std::env::var_os("P4DELTA_E2E_TIMING").is_some() {
+        eprintln!("e2e-timing {stage}: {:.3}s", elapsed.as_secs_f64());
+    }
 }
 
 /// 把沙箱环境装到命令上。
