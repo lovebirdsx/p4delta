@@ -77,7 +77,7 @@ fn sandbox_or_skip_kind(kind: template::Kind) -> Option<Sandbox> {
 
 /// 起两个沙箱，**并行**。
 ///
-/// 对拍类用例（`e2e_sync_normal` 的四处）要先有左右两个实例。它们之间没有任何共享
+/// 对拍类用例（`e2e_sync_normal` 里的那些）要先有左右两个实例。它们之间没有任何共享
 /// 状态，各自的「复制模板 + 起 p4d + `p4 client -i` + `sync -f`」是独立 I/O，串行做纯属
 /// 白等——冷跑时模板只生成一次（模板互斥会让后到者等一会儿），热态下两边都是
 /// 纯拷贝。
@@ -86,9 +86,19 @@ fn sandbox_or_skip_kind(kind: template::Kind) -> Option<Sandbox> {
 /// 的 panic **原样重抛**（`resume_unwind` 保留 panic 载荷与位置信息），不能吞成 `None`：
 /// 那会把「p4d 起不来」伪装成「环境没有 p4d」而静默跳过。
 pub fn sandbox_pair() -> (Option<Sandbox>, Option<Sandbox>) {
+    pair_with(sandbox_or_skip, sandbox_or_skip)
+}
+
+/// [`sandbox_pair`] 的通用形态：两边的现场由调用方给（例如「已打开、have 落后」那份
+/// 夹具），仍然是并行起、panic 原样重抛。返回值的形状与 [`sandbox_pair`] 一致。
+pub fn pair_with<L, R>(left: L, right: R) -> (Option<Sandbox>, Option<Sandbox>)
+where
+    L: FnOnce() -> Option<Sandbox> + Send,
+    R: FnOnce() -> Option<Sandbox> + Send,
+{
     std::thread::scope(|scope| {
-        let left = scope.spawn(sandbox_or_skip);
-        let right = scope.spawn(sandbox_or_skip);
+        let left = scope.spawn(left);
+        let right = scope.spawn(right);
         let left = match left.join() {
             Ok(sandbox) => sandbox,
             Err(panic) => std::panic::resume_unwind(panic),
@@ -143,7 +153,7 @@ impl Sandbox {
             }
         };
 
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             tools,
             paths,
             server: parts.server,
@@ -151,7 +161,13 @@ impl Sandbox {
             client_root: parts.client_root,
         };
         // 到这里 Drop 已经接管，下面的失败由它清理。
-        sandbox.put_client(&seed::default_view(&sandbox.client));
+        let viewed = Instant::now();
+        let view = seed::default_view(&sandbox.client);
+        sandbox.put_client_when_ready(&view);
+        report_timing(
+            "put client (doubles as the readiness probe)",
+            viewed.elapsed(),
+        );
         let synced = Instant::now();
         if kind == template::Kind::Bulk {
             // bulk 模板的 bulk 目录 head 已是 rev2，而规模用例要的现场是「本地与 have
@@ -185,10 +201,11 @@ impl Sandbox {
         let copied = Instant::now();
         template::instantiate(&template, paths)?;
         report_timing("instantiate (copy the database)", copied.elapsed());
-        // 起 p4d 要探测空闲端口、重试撞车，还夹着一次 `p4 info` 握手；单独计时，
-        // 避免把服务器启动的等待算进后面的工作区准备或被测程序。
+        // 起 p4d 要探测空闲端口、重试撞车；单独计时，避免把服务器启动的等待算进
+        // 后面的工作区准备或被测程序。这里只等到端口在听，协议层的就绪由
+        // `put_client_when_ready` 的第一条真实命令回答。
         let launched = Instant::now();
-        let server = P4dServer::launch(&tools.p4d, paths, &tools.p4)?;
+        let server = P4dServer::launch_listening(&tools.p4d, paths)?;
         report_timing("server launch", launched.elapsed());
 
         // client 名一实例一份：工作区互不重叠，digest 缓存的文件名也就不会撞上。
@@ -627,6 +644,26 @@ impl Sandbox {
         let form = seed::client_form(&self.client, &self.client_root, view);
         seed::put_client(&self.tools.p4, self.server.port(), &self.client_root, &form)
             .expect("update the client spec");
+    }
+
+    /// 实例的第一条真实命令：交出 client 表单，同时兼任服务器的就绪探测。
+    ///
+    /// 端口开始监听 ≠ 协议层能应答。原来这里先起一个 `p4 info` 探测进程、成功了再交表单，
+    /// 而两个都是 10 MB 级的进程启动——每个实例白付一次，一整轮下来是一百多次。
+    /// 改成直接交表单：成功就说明服务器已经在答话，那次探测整个省掉。
+    ///
+    /// 失败才回落到原来的两段式探测（[`P4dServer::wait_ready`]），再把表单交一次：
+    /// 探测的等待上限、错误文案与端口冲突重试都不变，代价只是撞墙那一次多一个进程。
+    /// 探测过了却仍交不上表单，报的就是表单那条错误——与原来的先后顺序一致。
+    fn put_client_when_ready(&mut self, view: &[String]) {
+        let form = seed::client_form(&self.client, &self.client_root, view);
+        if seed::put_client(&self.tools.p4, self.server.port(), &self.client_root, &form).is_ok() {
+            return;
+        }
+        self.server
+            .wait_ready(&self.tools.p4, &self.paths.dir)
+            .unwrap_or_else(|error| panic!("could not start the sandbox: {error}"));
+        self.put_client(view);
     }
 
     // ---- 环境 ----

@@ -34,11 +34,35 @@ pub struct P4dServer {
 impl P4dServer {
     /// 起一个 p4d 并等它就绪，端口被抢走时换一个重来。
     ///
+    /// 「就绪」指协议层能应答（`p4 info` 成功）。冷路径（模板 seed）用它：接下来是
+    /// 一串 p4 命令，先探测一次比让第一条命令去撞更省事。实例热路径改用
+    /// [`P4dServer::launch_listening`]——那里第一条真实命令就能兼任探测。
+    pub fn launch(exe: &Path, paths: &InstancePaths, p4: &Path) -> io::Result<Self> {
+        Self::launch_until(exe, paths, |server| server.wait_ready(p4, &paths.dir))
+    }
+
+    /// 起一个 p4d，只等到端口开始监听，**不**做协议层探测。
+    ///
+    /// 端口在听只说明进程绑上了 socket；能不能应答由调用方的第一条真实命令回答
+    /// （见 `Sandbox::put_client_when_ready`）。这样每个实例省掉一次
+    /// `p4 info` 进程——一整轮是一百多次 10 MB 级的进程启动。
+    pub fn launch_listening(exe: &Path, paths: &InstancePaths) -> io::Result<Self> {
+        Self::launch_until(exe, paths, |server| {
+            server.wait_listening(Instant::now() + READY_TIMEOUT)
+        })
+    }
+
+    /// 「起服务器 + 等它可用」的骨架，`ready` 决定这一次算不算起来了。
+    ///
     /// 端口是「先 bind 到 0 拿一个空闲端口、立刻放开、再交给 p4d」这样选的，
     /// 从放开到 p4d 真正 bind 之间有一段窗口，并行的另一个实例可能在这期间
     /// 拿到同一个端口——Windows 尤其倾向于把刚释放的端口再发一次，实测并行跑
     /// 整个测试集时能撞上 `WSAEADDRINUSE`。这不是故障，重试就行。
-    pub fn launch(exe: &Path, paths: &InstancePaths, p4: &Path) -> io::Result<Self> {
+    fn launch_until(
+        exe: &Path,
+        paths: &InstancePaths,
+        mut ready: impl FnMut(&mut Self) -> io::Result<()>,
+    ) -> io::Result<Self> {
         for attempt in 1..=PORT_ATTEMPTS {
             // p4d 往 `-L` 指定的文件是**追加**写，不是覆盖。上一次尝试留下的
             // `WSAEADDRINUSE` 会一直挂在末尾，让这次真正的失败被误判成端口冲突，
@@ -46,7 +70,7 @@ impl P4dServer {
             let _ = fs::remove_file(&paths.log);
 
             let mut server = Self::start(exe, paths)?;
-            let error = match server.wait_ready(p4, &paths.dir) {
+            let error = match ready(&mut server) {
                 Ok(()) => return Ok(server),
                 Err(error) => error,
             };
@@ -109,14 +133,21 @@ impl P4dServer {
         format!("127.0.0.1:{}", self.port)
     }
 
-    /// 轮询直到服务器应答。只由 [`P4dServer::launch`] 调用——外面看到的
-    /// 应该是一个已经能用 `p4` 连上的服务器，而不是一个刚 spawn 出来的进程。
+    /// 轮询直到服务器应答：先等端口开始监听，再用 `p4 info` 确认协议层就绪。
     ///
-    /// 分两步：先等端口开始监听，再用 `p4 info` 确认协议层就绪。
+    /// 外面看到的应该是一个已经能用 `p4` 连上的服务器，而不是一个刚 spawn 出来的进程。
+    /// 冷路径（[`P4dServer::launch`]）与「第一条真实命令撞了墙」的回落路径都用它。
+    pub fn wait_ready(&mut self, p4: &Path, cwd: &Path) -> io::Result<()> {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        self.wait_listening(deadline)?;
+        self.wait_serving(p4, cwd, deadline)
+    }
+
+    /// 等端口开始监听。端口已经在听时立刻返回。
+    ///
     /// 这一步省不掉——p4 客户端连不上端口时会在内部重试两秒多，
     /// 拿失败的 `p4 info` 当轮询器会让每次启动白白慢十几秒。
-    fn wait_ready(&mut self, p4: &Path, cwd: &Path) -> io::Result<()> {
-        let deadline = Instant::now() + READY_TIMEOUT;
+    fn wait_listening(&mut self, deadline: Instant) -> io::Result<()> {
         let address = SocketAddr::from(([127, 0, 0, 1], self.port));
 
         while TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err() {
@@ -129,8 +160,11 @@ impl P4dServer {
             }
             thread::sleep(Duration::from_millis(10));
         }
+        Ok(())
+    }
 
-        // 端口已经在听了，这时候的探测失败都是快的。
+    /// 端口已经在听之后，用 `p4 info` 确认协议层就绪——这时候的探测失败都是快的。
+    fn wait_serving(&mut self, p4: &Path, cwd: &Path, deadline: Instant) -> io::Result<()> {
         let mut interval = Duration::from_millis(20);
         loop {
             self.check_alive()?;

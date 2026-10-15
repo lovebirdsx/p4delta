@@ -163,9 +163,9 @@ fn an_opened_file_is_left_to_p4() {
 /// 这一条钉的是「不做自动 resolve」：待解决的合并必须留给用户。
 #[test]
 fn an_opened_file_behind_the_target_reaches_the_same_resolve_state_as_native() {
-    let (Some(ours), Some(theirs)) = (
-        sandbox_with_an_opened_file_behind_head(),
-        sandbox_with_an_opened_file_behind_head(),
+    let (Some(ours), Some(theirs)) = support::pair_with(
+        sandbox_with_an_opened_file_behind_head,
+        sandbox_with_an_opened_file_behind_head,
     ) else {
         return;
     };
@@ -476,9 +476,9 @@ fn a_refused_local_change_is_reported_as_a_refusal_not_an_incomplete_answer() {
 /// 正确性主张——不该因为有一批被拒就把整轮停下，也不该顺手把被拒的文件也写了。
 #[test]
 fn a_refusal_does_not_stop_the_files_native_would_transfer() {
-    let (Some(ours), Some(theirs)) = (
-        sandbox_with_allwrite_noclobber(),
-        sandbox_with_allwrite_noclobber(),
+    let (Some(ours), Some(theirs)) = support::pair_with(
+        sandbox_with_allwrite_noclobber,
+        sandbox_with_allwrite_noclobber,
     ) else {
         return;
     };
@@ -557,9 +557,9 @@ fn a_refusal_inside_an_excluded_entry_is_never_written_to() {
 /// 而原生会动它们。
 #[test]
 fn a_refusal_next_to_an_opened_file_leaves_the_opened_one_to_native() {
-    let (Some(ours), Some(theirs)) = (
-        sandbox_with_allwrite_noclobber(),
-        sandbox_with_allwrite_noclobber(),
+    let (Some(ours), Some(theirs)) = support::pair_with(
+        sandbox_with_allwrite_noclobber,
+        sandbox_with_allwrite_noclobber,
     ) else {
         return;
     };
@@ -601,9 +601,9 @@ fn a_refusal_next_to_an_opened_file_leaves_the_opened_one_to_native() {
 /// 一致。同一轮里还放了逐文件拒绝腿（用户现场的另一半）：两族 info 必须各走各的路。
 #[test]
 fn a_deleted_as_notice_is_answered_like_native_p4() {
-    let (Some(ours), Some(theirs)) = (
-        sandbox_with_allwrite_noclobber(),
-        sandbox_with_allwrite_noclobber(),
+    let (Some(ours), Some(theirs)) = support::pair_with(
+        sandbox_with_allwrite_noclobber,
+        sandbox_with_allwrite_noclobber,
     ) else {
         return;
     };
