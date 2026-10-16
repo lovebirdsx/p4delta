@@ -40,6 +40,12 @@ use crate::prune::PrunePlan;
 use crate::scope::{EntryKind, ExcludeSet, Scope};
 use crate::workspace::{gather_workspace, map_new_paths, rescan_tracked_pruned_dirs};
 
+/// 强制修复（`--sync --force`）的进度阶段表。与 open / clean 那张不同：它多一段 `scan`
+/// （查询四路与工作区扫描都在这里，一次宽拉取里占掉大半时间，只报 `start` 会一直停在原地），
+/// 且没有 `report`（这一段就是 `apply` 本身）。step 是下标 + 1，单调不回跳。
+pub(crate) const SYNC_FORCE_PHASES: [&str; 6] =
+    ["start", "scan", "analyze", "digest", "apply", "done"];
+
 /// 一轮 reconcile 的编排：拉齐 fstat / 工作区 / have / `--to` 目标快照四路数据、
 /// 分析、算摘要，最后把变更下发给 p4。多个范围入口合并成这一轮——一次操作、一个视图。
 pub(crate) async fn reconcile_scope(
@@ -51,6 +57,12 @@ pub(crate) async fn reconcile_scope(
     // cwd 是这一轮已确认的 client root：`.p4config` / P4IGNORE 的发现跟着它走，
     // 而不是跟着某个可选的入口目录漂。
     let work_dir = scope.work_dir.as_str();
+
+    // 走到这里的 `--sync` 一定是强制修复（普通同步在 lib.rs 就分叉走了），进段信号跟着
+    // 分叉条件走，免得将来新增入口时错发。
+    if options.sync {
+        emit_progress("scan", None);
+    }
 
     sayln!(
         "Processing {} scope entr{}.",
@@ -934,6 +946,18 @@ mod tests {
     use crate::test_util::{TempTree, depot_record, symlink_file};
 
     // ---- 摘要阶段的小工具 ----
+
+    /// 强制修复的阶段表：顺序就是 `step` 的顺序，消费方按它显示「第几段 / 共几段」。
+    #[test]
+    fn sync_force_phases_are_stable_and_ordered() {
+        assert_eq!(SYNC_FORCE_PHASES[0], "start");
+        assert_eq!(SYNC_FORCE_PHASES[SYNC_FORCE_PHASES.len() - 1], "done");
+        // 比默认表多一段 `scan`（查询与工作区扫描），且没有 `report`。
+        assert_eq!(
+            SYNC_FORCE_PHASES,
+            ["start", "scan", "analyze", "digest", "apply", "done"]
+        );
+    }
 
     /// 一个 mtime 距 UNIX_EPOCH 指定秒数的工作区文件。
     fn dated_file(path: &str, modified: u64) -> WorkspaceFile {

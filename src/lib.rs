@@ -203,6 +203,12 @@ fn run_once(options: &mut Options) -> Result<()> {
         work_dir: crate::scope::work_dir_for(&client_root),
     };
 
+    // 强制修复走 reconcile 管线，阶段表要在 `start` 之前定下来——晚一步，`start` 会按默认
+    // 表读成 1/5，与随后的 2/6 对不上。
+    if options.sync && options.force {
+        json::set_phases(&reconcile::SYNC_FORCE_PHASES);
+    }
+
     json::emit_progress("start", None);
 
     if options.clean {

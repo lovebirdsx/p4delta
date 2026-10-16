@@ -274,15 +274,26 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 {"kind":"progress","phase":"digest","step":3,"total":5,"message":"Checking digests for 340 files."}
 ```
 
-阶段是固定枚举：`start` `analyze` `digest` `report` `done`。`step` 是阶段在表里的下标 + 1，
-单调不回跳，`total` 恒为 5。消费者**只许把它当进度提示**，不许拿它当结论。
+阶段在三条路径上各是一张固定表，`step` 是阶段在表里的下标 + 1，单调不回跳。消费者**只许
+把它当进度提示**，不许拿它当结论。
 
-普通同步（`--sync` 不带 `--force`）走的是另一张表——它没有 analyze / digest，却有
-preview / filter / apply：`start` `preview` `filter` `apply` `done`（同样 5 段）。报一个
-这一轮根本不会出现的阶段，只会让消费方以为工具卡住了，所以按模式换表。`total` 两种都是 5。
+- 默认（open / clean 的 reconcile 管线）：`start` `analyze` `digest` `report` `done`（`total:5`）
+- 普通同步（`--sync` 不带 `--force`）：`start` `preview` `filter` `apply` `done`（`total:5`）
+- 强制修复（`--sync --force`，同样走 reconcile 管线）：`start` `scan` `analyze` `digest`
+  `apply` `done`（`total:6`）。比默认表多一段 `scan`——查询四路与工作区扫描都在这一段，
+  一次宽拉取里占掉大半时间，只报 `start` 会一直停在原地。
+
+表定的是**顺序与编号**，不是「每段必到」：中间任意段都可能整段跳过，消费方按收到的最后一条
+为准。两条已知的跳法：`digest` 在 mtime 捷径全部命中时没有摘要要算（`step` 从 `analyze` 直接
+跳到 `apply`）；`apply` 在这一轮无事可做时也不会发（「没有文件要同步」与「工作区为空」两条早退
+路径都直接收尾），此时看到的是 `start` `scan` `analyze` `done`。
+
+报一个这一轮根本不会出现的阶段，只会让消费方以为工具卡住了，所以按模式换表。
 
 只收「顺序主干」上的阶段：`depot` / `scan` / `have` 三路是并发跑的，从并发分支里发进度会让
-`step` 回跳，而回跳的进度条比没有进度条更难读。这三路的细节走 `message`（自由文本）。
+`step` 回跳，而回跳的进度条比没有进度条更难读。这三路的细节走 `message`（自由文本）。注意
+`progress.phase:"scan"` 与 `[diag]` 行里的 `scan`（`workspace` 那一路）**不是一回事**：前者是
+主干上「查询 + 工作区扫描」整段，后者只是并发三路里的一路，同名不同层。
 
 ## 新增的开关
 

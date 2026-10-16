@@ -20,7 +20,9 @@ use super::{HashStats, delete_workspace_files};
 use crate::cache::{CacheWriter, save_cache};
 use crate::cli::Options;
 use crate::digest::{CachePolicy, is_unchanged_since_sync, parallel_compute_digests};
-use crate::json::{HandoffFile, Mode, P4Command, ignore_query_count, say_phase, sayln};
+use crate::json::{
+    HandoffFile, Mode, P4Command, emit_progress, ignore_query_count, say_phase, sayln,
+};
 use crate::model::{DepotState, HaveRecord, TargetMap, WorkspaceCache, WorkspaceState};
 use crate::p4::process::{FailureMode, run_p4_command_batched};
 use crate::workspace::{IgnoreQueryMode, query_ignored_paths};
@@ -357,6 +359,7 @@ pub(crate) async fn apply_sync(
     work_dir: &str,
     sync: &SyncChanges,
 ) -> Result<()> {
+    emit_progress("apply", None);
     if options.apply {
         sayln!("   Syncing the workspace to the target depot revision.");
     } else {
@@ -543,6 +546,7 @@ pub(crate) async fn build_sync_changes(
     cache: &mut WorkspaceCache,
     cache_writer: &mut Option<CacheWriter>,
 ) -> Result<SyncPlan> {
+    emit_progress("analyze", None);
     sayln!("   Analyzing files against the target depot revision.");
     let start_time = Instant::now();
     let mut analysis = analyze_at_target(depot, workspace, target)?;
@@ -634,7 +638,9 @@ pub(crate) async fn build_sync_changes(
         }
 
         if !needs_digest.is_empty() {
-            sayln!("   Checking digests for {} files.", needs_digest.len());
+            let message = format!("Checking digests for {} files.", needs_digest.len());
+            sayln!("   {message}");
+            emit_progress("digest", Some(&message));
 
             let mut hashed = HashStats::new();
 

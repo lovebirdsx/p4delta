@@ -65,6 +65,19 @@ impl Run {
             .collect()
     }
 
+    /// stderr 里的全部 progress 记录，按出现顺序。
+    ///
+    /// stderr 是混合流：`--json` 下人类可读的 `[diag]` 与报告行也改道到这里，所以只挑
+    /// 能解析成 `kind:"progress"` 的行。解析本身也是断言——progress 不是合法 JSON 行，
+    /// 这里就捡不到它。
+    fn progress(&self) -> Vec<Value> {
+        self.stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+            .filter(|record| record["kind"] == "progress")
+            .collect()
+    }
+
     /// 所有文件记录的 `class`，按出现顺序。
     fn classes(&self) -> Vec<&str> {
         self.files()
@@ -877,4 +890,61 @@ fn the_batch_only_handoff_paths_still_carry_both_paths() {
         );
         assert!(record["rev"].is_null(), "整批转交没有逐文件版本：{record}");
     }
+}
+
+/// 强制修复的阶段阶梯：与默认表（open / clean）和普通同步那张都不同——它多一段 `scan`
+/// （查询四路与工作区扫描都在这里，一次宽拉取里最长的一段），`total` 是 6。
+///
+/// 两条独立断言，缺一不可：
+/// - 阶梯本身——消费方靠它显示「现在在干什么」，段位缺了或顺序错了，进度就在骗人；
+/// - `start` 那条的 `total` 已经是 6——表必须在发 `start` 之前换掉，晚一步消费方会看到
+///   1/5 接 2/6，进度当场回跳。
+#[test]
+fn a_force_sync_reports_the_six_stage_ladder() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // 造一处本地改动，让 analyze 的分类与 apply 的计数都有实际内容。
+    sandbox.write("readme.txt", "locally changed\n");
+
+    let run = run_json(&sandbox, &["--sync", "--force", "."]);
+    assert!(run.ok, "{}", run.stderr);
+
+    let progress = run.progress();
+    let phases: Vec<&str> = progress
+        .iter()
+        .map(|record| record["phase"].as_str().expect("phase 必须是字符串"))
+        .collect();
+
+    for record in &progress {
+        assert_eq!(record["total"], 6, "force 表的 total 恒为 6：{record}");
+    }
+
+    // `digest` 只在「目标版本没变」的候选上出现，是否出现取决于种子；主干各段必须齐。
+    for phase in ["start", "scan", "analyze", "apply", "done"] {
+        assert!(phases.contains(&phase), "缺了 {phase} 段：{phases:?}");
+    }
+
+    let step = |phase: &str| -> u64 {
+        progress
+            .iter()
+            .find(|record| record["phase"] == phase)
+            .unwrap_or_else(|| panic!("没有 {phase} 段：{phases:?}"))["step"]
+            .as_u64()
+            .expect("step 必须是整数")
+    };
+    assert_eq!(step("start"), 1, "{phases:?}");
+    assert!(step("start") < step("scan"), "{phases:?}");
+    assert!(step("scan") < step("analyze"), "{phases:?}");
+    assert!(step("analyze") < step("apply"), "{phases:?}");
+    assert!(step("apply") < step("done"), "{phases:?}");
+    assert_eq!(step("done"), 6, "{phases:?}");
+
+    // step 单调不回跳——回跳的进度条比没有进度条更难读。
+    let steps: Vec<u64> = progress
+        .iter()
+        .map(|record| record["step"].as_u64().expect("step 必须是整数"))
+        .collect();
+    assert!(steps.windows(2).all(|pair| pair[0] < pair[1]), "{steps:?}");
 }
