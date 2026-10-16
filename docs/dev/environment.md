@@ -41,17 +41,21 @@ P4_E2E_REQUIRED=1 P4PORT=nonexistent.invalid:1666 cargo nextest run --all-target
 
 ## WSL：验 Linux 侧行为
 
-装了多个发行版时要显式 `-d` 指定（默认发行版未必与 CI 钉的版本相同），挑与 CI 同版本的，比如 `Ubuntu-24.04`。把 target dir 指到家目录的 ext4，绕开 `/mnt/*` 的 drvfs 慢速，也不污染 Windows 侧的 `target/`：
+装了多个发行版时要显式 `-d` 指定（默认发行版未必与 CI 钉的版本相同），挑与 CI 同版本的，比如 `Ubuntu-24.04`：
 
 ```bash
-wsl -d Ubuntu-24.04 -e bash -lc 'cd /mnt/e/git_project/p4delta && \
+wsl -d Ubuntu-24.04 -e bash -lc 'cd ~/git_project/p4delta && \
   export PATH=$HOME/.cargo/bin:$PATH && \
   CARGO_TARGET_DIR=$HOME/p4delta-target cargo test --lib --locked <过滤词>'
 ```
 
+里面的 `CARGO_TARGET_DIR` 只对**仓库在 Windows 盘上**（`/mnt/*`）的情形有意义：把 target dir 指到家目录的 ext4，绕开 drvfs 的慢速。仓库本身就在 ext4 上时不必为速度设它，留着的作用只剩「与 Windows 侧那份构建分开」——两边各自的 `target/` 不互相踩。`scripts/install-local.sh` 认这个变量：设了就去那里取产物，不设就用仓库里的 `target/`。
+
 别并发跑两个 rustup（同时写同一个 toolchain 目录会 `recovering from a partially installed toolchain`、报 `bin/rust-gdb` 冲突而装坏）；撞上时再跑一次 `rustup toolchain list` 触发同步自愈。
 
 要在这边跑 e2e（而不只是 `--lib`）就先下一份 Linux 版 p4：`bash scripts/fetch-p4-tools.sh`，再把 `P4_EXE` 指过去。它按 `uname` 挑包，往 `vendor/` 放的是无后缀的 `p4`/`p4d`，与 Windows 侧那两个 `.exe` 并存，也不进版本库。
+
+构建出来的那份想在 WSL 里**当命令用**，跑 `bash scripts/install-local.sh`：cargo build → 冒烟跑一次 `--version` → 原子替换到 `~/.local/bin/p4delta`。它不碰 P4V，也不碰 PATH（`~/.local/bin` 由发行版的 `~/.profile` 默认加进去）——往 P4V 里装是 Windows 侧 `scripts/install-local.ps1` 的事（见 [release.md](release.md)）。
 
 这个仓库反复踩过「只在 Windows 上过」的坑——用例硬编码 `C:\ws\...`，而 `local_path_key` 按 `MAIN_SEPARATOR` 切组件、假造路径还未必是本地意义上的绝对路径，于是 ubuntu 与 macos 上失败、Windows 上照过。推 CI 前先在 WSL 里复现一遍 Linux 侧。形态有三种，写用例时对着查：
 
