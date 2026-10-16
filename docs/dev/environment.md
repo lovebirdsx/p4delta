@@ -37,7 +37,11 @@ P4_E2E_REQUIRED=1 P4PORT=nonexistent.invalid:1666 cargo nextest run --all-target
 `Connect to server failed`——失败语义一字不变，只是不再等网络。别图省事换
 `127.0.0.1:1`：本地端口被拒后 p4 仍要 **2.1 秒**才返回（实测），比 `.invalid` 慢一个量级。
 
-两处不受影响：**e2e 沙箱**给被测程序的环境里不继承任何 `P4*` 变量、自己设指向实例 p4d 的 `P4PORT`；**测试发现**走的是 `p4_available()` 的 `p4 -V`，它不需要服务器。本机 491 条在这种环境变量下全绿、整轮墙钟与有服务器时持平（2026-10-15）。
+不受影响的是**自己隔离过配置文件**的那些调用方：**e2e 沙箱**给被测程序的环境里不继承任何 `P4*` 变量、自己设指向实例 p4d 的 `P4PORT`；**依赖真实 p4 的单元测试**在 `src/test_util.rs` 里设了 `P4CONFIG=p4delta-test-no-config`；**测试发现**走的是 `p4_available()` 的 `p4 -V`，它不需要服务器。本机 491 条在这种环境变量下全绿、整轮墙钟与有服务器时持平（2026-10-15）。
+
+**没隔离过的调用方，这条命令救不了它。** p4 的优先级是「命令行 > `.p4config` 文件 > 环境变量 > 注册表」，文件比环境变量高；而 p4 是从 cwd **逐级向上**找 `.p4config` 的（`~/.p4enviro` 里的 `P4CONFIG=.p4config` 让它在缺省情况下就会去找），在仓库里跑测试，项目根正在它的下游。WSL 的家目录里常有一份 `~/.p4config`，那份若指向不可达的服务器，症状取决于对端是 DROP 还是 REJECT——DROP 时要把 SYN 重传等完（Linux 默认约 127 秒）。2026-10-16 实测：`tests/cli.rs` 的两条用例（`-w` 短名那条、普通同步拒绝本地排除那条）因此把整轮拖到 **133.656 秒**，被 nextest 打上 `SLOW [>120s]`，而 `P4PORT=nonexistent.invalid:1666` 在它们身上**无效**——被 `.p4config` 盖掉了。
+
+修法是在调用方自己补齐两行：`P4CONFIG=noconfig`（指向一个不存在的文件名，p4 因此不读任何配置文件）加 `P4PORT=nonexistent.invalid:1666`（DNS 立刻 NXDOMAIN）。`tests/cli.rs` 的 `cli()` 已按此修好：整轮回到 **4.442 秒**，地板换成纯计算的 `scan::tests::a_large_tree_is_split_with_the_default_limits`（4.28 秒）。这与 `tests/support/mod.rs` 的 `Sandbox::env` 是同一套处置，只是沙箱把 `P4PORT` 指向自己的 p4d。
 
 ## WSL：验 Linux 侧行为
 
@@ -54,6 +58,8 @@ wsl -d Ubuntu-24.04 -e bash -lc 'cd ~/git_project/p4delta && \
 别并发跑两个 rustup（同时写同一个 toolchain 目录会 `recovering from a partially installed toolchain`、报 `bin/rust-gdb` 冲突而装坏）；撞上时再跑一次 `rustup toolchain list` 触发同步自愈。
 
 要在这边跑 e2e（而不只是 `--lib`）就先下一份 Linux 版 p4：`bash scripts/fetch-p4-tools.sh`，再把 `P4_EXE` 指过去。它按 `uname` 挑包，往 `vendor/` 放的是无后缀的 `p4`/`p4d`，与 Windows 侧那两个 `.exe` 并存，也不进版本库。
+
+这边的家目录里若配过 p4（`~/.p4config`），它比环境变量更优先，症状与处置见上面的「p4 先连服务器，再跑子命令」——跑整轮前先确认一遍，否则整轮会从几秒变成两分钟。
 
 构建出来的那份想在 WSL 里**当命令用**，跑 `bash scripts/install-local.sh`：cargo build → 冒烟跑一次 `--version` → 原子替换到 `~/.local/bin/p4delta`。它不碰 P4V，也不碰 PATH（`~/.local/bin` 由发行版的 `~/.profile` 默认加进去）——往 P4V 里装是 Windows 侧 `scripts/install-local.ps1` 的事（见 [release.md](release.md)）。
 

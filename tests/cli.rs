@@ -1,6 +1,8 @@
 //! 黑盒 CLI 测试：只通过进程边界观察，不引用 crate 内部符号。
 //!
-//! 这些用例都不需要 p4：它们要么在参数解析阶段就结束，要么在不碰服务器的分支上失败。
+//! 这些用例都不需要服务器上的任何东西：它们要么在参数解析阶段就结束，要么在问完 p4
+//! 「client root 在哪」、拿到一个否定的答案之后就失败。有两条真的会起 p4 进程，那一步
+//! 连不上任何服务器是由 `cli()` 的环境配置保证的，见那里。
 //!
 //! 让它们不依赖机器上有没有 p4 的是 `cli()` 里的 `P4COMMANDCHARSET`，不是命令行的
 //! `--charset utf8`：`src/charset.rs` 的跳过条件要求 `P4CHARSET` 与 `P4COMMANDCHARSET`
@@ -16,10 +18,24 @@ use predicates::prelude::*;
 /// 起一个命令行。清掉 P4CLIENT，否则本机的值会让「没有工作区」的用例失真。
 /// P4_EXE 同理：它是生产代码定位 p4 的第一顺位，本机残留一个值会改变下面每条用例的走向。
 /// `P4COMMANDCHARSET` 的用处见模块文档。
+///
+/// `P4CONFIG` 与 `P4PORT` 把「连哪台服务器」也钉死。有两条用例（`-w` 短名那条、
+/// 普通同步拒绝本地排除那条）虽然不判定服务器上的任何东西，却要问 p4 拿 client root，
+/// 于是真会起一个 p4 进程。而 p4 的优先级是「命令行 > `.p4config` 文件 > 环境变量 >
+/// 注册表」（同 `tests/support/mod.rs` 的 `Sandbox::env`），只覆盖 `P4PORT` 压不住开发机
+/// `~/.p4config` 里的那份——p4 从 cwd 逐级向上就能找到它。那份若指向不可达的服务器，
+/// 这两条就挂在 TCP 握手上：对端 DROP 而非 REJECT 时要等完 SYN 重传（Linux 默认约 127
+/// 秒），整轮墙钟被它们钉在 133.7 秒，其余 485 条合计只要 4.4 秒（2026-10-16 实测）。
+///
+/// `noconfig` 是个不存在的文件名，p4 因此不读任何配置文件；`.invalid` 是 RFC 2606
+/// 的保留后缀，DNS 立刻回 NXDOMAIN，失败落在毫秒级。两个都要：只关配置文件的话
+/// `P4PORT` 会回落去解析默认的 `perforce:1666`，白等一次 DNS 超时（实测 2 秒对 0.01 秒）。
 fn cli() -> Command {
     let mut cmd = Command::cargo_bin("p4delta").expect("binary must build");
     cmd.env_remove("P4CLIENT");
     cmd.env_remove("P4_EXE");
+    cmd.env("P4CONFIG", "noconfig");
+    cmd.env("P4PORT", "nonexistent.invalid:1666");
     cmd.env("P4COMMANDCHARSET", "utf8");
     cmd
 }
