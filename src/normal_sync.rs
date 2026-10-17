@@ -34,7 +34,10 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::cli::Options;
-use crate::json::{FileRecord, Mode, P4Command, count, emit_file, emit_progress, sayln};
+use crate::json::{
+    ConflictRecord, FileRecord, Mode, P4Command, count, emit_conflict, emit_file, emit_progress,
+    sayln,
+};
 use crate::p4::marshal::MarshalRecord;
 use crate::p4::process::{plan_stdin_batches, run_p4_marshal_batched, run_p4_marshal_slice};
 use crate::path::local_path_key;
@@ -265,11 +268,13 @@ pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<
     // 拿补查去解释它只会整轮失败，它也不该成为写入候选；**删除落地**（见 [`deleted_notice`]）
     // 反过来是候选——原生这一轮会把这个路径的删除落下去。三者的原文都已由 process 层
     // 原样转出（stderr），这里不再重复打印。
-    let mut refusals = 0;
+    let mut refusals = Vec::new();
     let mut notices = Vec::new();
     for notice in preview.notices {
-        if refusal_notice(&notice) {
-            refusals += 1;
+        if let Some(refusal) = parse_refusal_notice(&notice) {
+            if refusal_in_scope(&refusal, scope) {
+                refusals.push(refusal);
+            }
         } else if let Some((depot_file, client_file)) = deleted_notice(&notice) {
             candidates.push(Candidate {
                 depot_file: depot_file.to_owned(),
@@ -281,6 +286,7 @@ pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<
             notices.push(notice);
         }
     }
+    let refusals = dedupe_refusals(refusals);
     if !notices.is_empty() {
         // 预演报了没进正文记录的事（实测只有已打开文件那一类）：身份得补查，
         // 否则这些文件会被悄悄跳过，而原生会动它们。
@@ -294,21 +300,29 @@ pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<
     }
 
     if candidates.is_empty() {
-        if refusals == 0 {
+        if refusals.is_empty() {
             sayln!("No files to sync, everything up to date.");
         } else {
             // 被拒的文件一条都没动（原生不覆盖本地修改/同名文件）。这句**不能**说
             // 「已是最新」：拒绝意味着工作区与目标不同，只是这一轮不去覆盖它。
             sayln!(
-                "      p4 refused to overwrite {refusals} file(s) (locally modified or untracked); \
-                 nothing was synced for them."
+                "      p4 refused to overwrite {} file(s) (locally modified or untracked); \
+                 nothing was synced for them.",
+                refusals.len()
             );
         }
+        // 这一轮不会再起 apply 命令，但拒绝就是最终结论：带 `-a` 时仍按 apply 段发。
+        emit_conflicts(
+            options,
+            &refusals,
+            if options.apply { "apply" } else { "preview" },
+        );
         return Ok(());
     }
 
     if !options.apply {
         report_groups(options, &candidates, "preview");
+        emit_conflicts(options, &refusals, "preview");
         sayln!("Re-run with -a to sync the workspace.");
         return Ok(());
     }
@@ -318,9 +332,43 @@ pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<
         "   Applying the transfer with p4 (opened files and writable-file protection stay p4's call)."
     );
 
-    apply(options, work_dir, &candidates, scope).await?;
+    apply(options, work_dir, &candidates, &refusals, scope).await?;
 
     Ok(())
+}
+
+/// 原生逐文件拒绝的种类。三种在原生输出里是同一族 `info` 提示，处置却分两桶：
+/// `update` / `delete` 有本地改动，`overwrite` 是未跟踪的同名文件挡路；前两者里
+/// `delete` 还不能逐文件强制覆盖（那行带的是本地 have 版本）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusalReason {
+    UpdateModified,
+    DeleteModified,
+    OverwriteExisting,
+}
+
+impl RefusalReason {
+    /// 记录里的 `reason`。改它就是改 `--json` 契约。
+    fn as_str(self) -> &'static str {
+        match self {
+            RefusalReason::UpdateModified => "update-modified",
+            RefusalReason::DeleteModified => "delete-modified",
+            RefusalReason::OverwriteExisting => "overwrite-existing",
+        }
+    }
+}
+
+/// 一条逐文件拒绝。身份与原因都留着：编辑器靠它们决定给「收集改动 / 查看差异 / 强制拉取」
+/// 里的哪几个按钮，不再从 stderr 文本反推。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefusalNotice {
+    depot_file: String,
+    /// 原生原文里的 `#rev`。update / overwrite 是**要拉到的目标版本**，delete 是本地
+    /// have 版本（目标处已删，没有别的修订号可指）。
+    rev: String,
+    /// 本地路径原文；范围判断与报告都用它。
+    local_path: String,
+    reason: RefusalReason,
 }
 
 /// 原生逐文件拒绝的 `info` 提示（`allwrite noclobber` 客户端，实测 2024.2）：本地改了又没打开的
@@ -330,31 +378,74 @@ pub(crate) async fn run_normal_sync(options: &Options, scope: &Scope) -> Result<
 ///
 /// 它区别于「已打开的文件」那句提示：这里指的文件原生一个都不会动，把路径交给 [`opened_candidates`]
 /// 补查就是在拿一份错的答案去写。判据要求消息结构完整（`//` depot 规格 + 数字修订号 + ` - can't ` +
-/// 已知动词 + 非空本地路径），任何一条对不上都返回 `false`，交给调用方 fail-closed——「认不出」
+/// 已知动词 + 非空本地路径），任何一条对不上都返回 `None`，交给调用方 fail-closed——「认不出」
 /// 绝不能读成「没事」。
-fn refusal_notice(message: &str) -> bool {
-    let Some((spec, rest)) = message.split_once(" - can't ") else {
-        return false;
-    };
-    let Some((depot_file, rev)) = spec.rsplit_once('#') else {
-        return false;
-    };
+fn parse_refusal_notice(message: &str) -> Option<RefusalNotice> {
+    let (spec, rest) = message.split_once(" - can't ")?;
+    let (depot_file, rev) = spec.rsplit_once('#')?;
     if !depot_file.starts_with("//") || rev.is_empty() || !rev.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
+        return None;
     }
 
     // 动词与本地路径之间必须有一个空格，且路径非空：`... modified files ...` 这类拼写差别
     // 会在这里落空，而不是被当成同一条消息。
-    [
-        "update modified file",
-        "delete modified file",
-        "overwrite existing file",
-    ]
-    .iter()
-    .any(|phrase| {
-        rest.strip_prefix(phrase)
-            .is_some_and(|path| path.starts_with(' ') && !path.trim().is_empty())
-    })
+    for (phrase, reason) in [
+        ("update modified file", RefusalReason::UpdateModified),
+        ("delete modified file", RefusalReason::DeleteModified),
+        ("overwrite existing file", RefusalReason::OverwriteExisting),
+    ] {
+        let Some(path) = rest
+            .strip_prefix(phrase)
+            .and_then(|path| path.strip_prefix(' '))
+        else {
+            continue;
+        };
+        let path = path.trim_end();
+        if path.is_empty() {
+            return None;
+        }
+        return Some(RefusalNotice {
+            depot_file: depot_file.to_owned(),
+            rev: rev.to_owned(),
+            local_path: path.to_owned(),
+            reason,
+        });
+    }
+
+    None
+}
+
+/// 同一条拒绝可能在预演与执行两段各出现一次。按身份去重，保留第一次出现的顺序。
+fn dedupe_refusals(refusals: Vec<RefusalNotice>) -> Vec<RefusalNotice> {
+    let mut kept: Vec<RefusalNotice> = Vec::with_capacity(refusals.len());
+    for refusal in refusals {
+        if !kept.contains(&refusal) {
+            kept.push(refusal);
+        }
+    }
+    kept
+}
+
+/// 拒绝记录只发范围内的：范围外的文件原生也不会按 δ 的意图去动（排除项/范围文件之外），
+/// 把它们报给消费方只会多出几条点不动的补救项。
+fn refusal_in_scope(notice: &RefusalNotice, scope: &Scope) -> bool {
+    let key = local_path_key(&notice.local_path);
+    !scope.excludes.excludes_key(&key) && scope.includes_key(&key)
+}
+
+/// 一条运行只发一套冲突记录：预演发 `preview`，带 `-a` 时统一发 `apply`。
+/// 被拒文件不会进入 apply 的规格列表，所以 apply 阶段的种子必须来自预演那份。
+fn emit_conflicts(options: &Options, conflicts: &[RefusalNotice], stage: &'static str) {
+    for conflict in conflicts {
+        emit_conflict(&ConflictRecord {
+            reason: conflict.reason.as_str(),
+            depot_file: &conflict.depot_file,
+            client_file: &conflict.local_path,
+            rev: &conflict.rev,
+            stage,
+            applied: options.apply,
+        });
+    }
 }
 
 /// 「删除落地」的 `info` 提示（实测 2024.2）：目标处该路径处于删除状态、本地那份已经不在
@@ -555,6 +646,7 @@ async fn apply(
     options: &Options,
     work_dir: &str,
     candidates: &[Candidate],
+    preview_conflicts: &[RefusalNotice],
     scope: &Scope,
 ) -> Result<()> {
     let mut specs = Vec::with_capacity(candidates.len());
@@ -568,6 +660,10 @@ async fn apply(
 
     let mut failures: Vec<String> = Vec::new();
     let mut applied: Vec<Candidate> = Vec::new();
+    // 被拒文件不会进入下发的规格列表，apply 命令自己不会再报它们：预演那份就是这一段的
+    // 种子。先发出去，后面批次中途失败也不至于把已经观察到的冲突丢掉。
+    let mut conflicts = preview_conflicts.to_vec();
+    emit_conflicts(options, &conflicts, "apply");
 
     // 下发批次按 stdin 的硬上限规划、目标 1 批：串行纪律保持（一批收完再发下一批），
     // 变的只是不再按旧的命令行长度预算把几万条规格拆成几十个进程。
@@ -582,6 +678,22 @@ async fn apply(
             &specs[range],
         )
         .await?;
+
+        // 预演之后文件又被改了的竞态：apply 自己也会拒绝。先去重再发，失败的记录流里
+        // 仍留着已观察到的这一批。
+        let mut fresh = Vec::new();
+        for notice in &run.notices {
+            if let Some(refusal) = parse_refusal_notice(notice)
+                && refusal_in_scope(&refusal, scope)
+                && !conflicts.contains(&refusal)
+            {
+                fresh.push(refusal);
+            }
+        }
+        if !fresh.is_empty() {
+            conflicts.extend(fresh.iter().cloned());
+            emit_conflicts(options, &fresh, "apply");
+        }
 
         let records = candidates_from(&run.records)?;
         let records = dedupe(records)?;
@@ -1047,15 +1159,42 @@ mod tests {
     // ---- 已知拒绝的识别 ----
 
     /// 实测原文（2024.2，`allwrite noclobber` 客户端，`p4 -G sync -n` 的 `info` 记录）。
-    /// 三条同属一个已知族：`update` / `delete` / 同名文件挡路。
+    /// 三条同属一个已知族：`update` / `delete` / 同名文件挡路。身份字段一个都不能丢——
+    /// 编辑器的补救按钮全靠它们。
     #[test]
     fn the_measured_refusal_notices_are_recognized() {
-        for message in [
-            r"//depot/main/readme.txt#2 - can't update modified file E:\ws\readme.txt",
-            r"//depot/main/going.txt#1 - can't delete modified file E:\ws\going.txt",
-            r"//depot/main/blocked.txt#1 - can't overwrite existing file E:\ws\blocked.txt",
+        for (message, depot_file, rev, local_path, reason, reason_text) in [
+            (
+                r"//depot/main/readme.txt#2 - can't update modified file E:\ws\readme.txt",
+                "//depot/main/readme.txt",
+                "2",
+                r"E:\ws\readme.txt",
+                RefusalReason::UpdateModified,
+                "update-modified",
+            ),
+            (
+                r"//depot/main/going.txt#1 - can't delete modified file E:\ws\going.txt",
+                "//depot/main/going.txt",
+                "1",
+                r"E:\ws\going.txt",
+                RefusalReason::DeleteModified,
+                "delete-modified",
+            ),
+            (
+                r"//depot/main/blocked.txt#1 - can't overwrite existing file E:\ws\blocked.txt",
+                "//depot/main/blocked.txt",
+                "1",
+                r"E:\ws\blocked.txt",
+                RefusalReason::OverwriteExisting,
+                "overwrite-existing",
+            ),
         ] {
-            assert!(refusal_notice(message), "{message}");
+            let notice = parse_refusal_notice(message).unwrap_or_else(|| panic!("{message}"));
+            assert_eq!(notice.depot_file, depot_file, "{message}");
+            assert_eq!(notice.rev, rev, "{message}");
+            assert_eq!(notice.local_path, local_path, "{message}");
+            assert_eq!(notice.reason, reason, "{message}");
+            assert_eq!(notice.reason.as_str(), reason_text, "{message}");
         }
     }
 
@@ -1063,9 +1202,14 @@ mod tests {
     /// 所以能从最后一个 `#` 切出修订号的那个判据不会踩到本地名）。
     #[test]
     fn a_refusal_with_an_awkward_local_path_is_recognized() {
-        assert!(refusal_notice(
-            r"//depot/main/weird%231.txt#3 - can't update modified file E:\my ws\weird#1.txt"
-        ));
+        let notice = parse_refusal_notice(
+            r"//depot/main/weird%231.txt#3 - can't update modified file E:\my ws\weird#1.txt",
+        )
+        .expect("带空格与 # 的本地路径不该挡住识别");
+
+        assert_eq!(notice.depot_file, "//depot/main/weird%231.txt");
+        assert_eq!(notice.rev, "3");
+        assert_eq!(notice.local_path, r"E:\my ws\weird#1.txt");
     }
 
     /// 认不出的一律不是拒绝，由调用方 fail-closed。**已打开文件那句提示尤其不能被吞掉**：
@@ -1089,7 +1233,37 @@ mod tests {
             r"//depot/main/gone.txt#1 - deleted as E:\ws\gone.txt",
             "",
         ] {
-            assert!(!refusal_notice(message), "{message}");
+            assert!(parse_refusal_notice(message).is_none(), "{message}");
+        }
+    }
+
+    /// 预演与 apply 可能各报一次同一条拒绝：按完整身份去重，不能把同一条算两遍。
+    #[test]
+    fn duplicate_refusals_collapse_to_one() {
+        let one = parse_refusal_notice(
+            r"//depot/main/readme.txt#2 - can't update modified file E:\ws\readme.txt",
+        )
+        .unwrap();
+
+        assert_eq!(dedupe_refusals(vec![one.clone(), one.clone()]), [one]);
+    }
+
+    /// 范围外的拒绝既不发记录也不计数：消费方拿到它只会多出一条点不动的补救项。
+    #[test]
+    fn refusals_outside_the_scope_are_dropped() {
+        let scope = scope_of(&[(r"C:\ws", EntryKind::Directory)], &[r"C:\ws\gen"]);
+
+        for (path, expected) in [
+            (r"C:\ws\a.txt", true),
+            (r"C:\ws\gen\out.txt", false),
+            (r"C:\other\a.txt", false),
+        ] {
+            let message = format!(
+                "//depot/main/a.txt#2 - can't update modified file {}",
+                platform_path(path)
+            );
+            let notice = parse_refusal_notice(&message).expect("测试消息本身是完整的拒绝");
+            assert_eq!(refusal_in_scope(&notice, &scope), expected, "{path}");
         }
     }
 

@@ -10,6 +10,7 @@
 //! 判定与分类在 [`analyze_at_target`]，这里只管「报告什么」与「下发什么」。
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
@@ -25,7 +26,9 @@ use crate::json::{
 };
 use crate::model::{DepotState, HaveRecord, TargetMap, WorkspaceCache, WorkspaceState};
 use crate::p4::process::{FailureMode, run_p4_command_batched};
-use crate::workspace::{IgnoreQueryMode, query_ignored_paths};
+use crate::path::local_path_key;
+use crate::scope::SCOPE_FILE_NAME;
+use crate::workspace::{IgnoreQueryMode, map_paths_strict, query_ignored_paths};
 
 /// 把文件拉到目标版本时下发的 p4 命令。
 ///
@@ -77,6 +80,19 @@ pub(crate) struct DeleteFile {
     has_have_record: bool,
 }
 
+/// 要删掉的未跟踪文件：depot 里没有记录，但 client view 能映射到它。
+///
+/// 与 [`DeleteFile`] 的区别是**没有 have 记录可清**：这些路径从来不在 depot 里，所以
+/// 只删磁盘，绝不下发 `#none`。
+#[derive(Debug, PartialEq)]
+pub(crate) struct UntrackedFile {
+    /// workspace 语法，删文件与 `-l` 清单显示用。
+    client_file: String,
+
+    /// depot 语法。仅用于记录与人工核对——删除本身不需要 p4。
+    depot_file: String,
+}
+
 /// 一类变更要执行的动作。
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SyncAction {
@@ -85,6 +101,9 @@ enum SyncAction {
 
     /// 删掉工作区里的文件（目标时刻该路径不在库）。
     DeleteFromDisk,
+
+    /// 删掉 depot 不跟踪、client view 能映射、且未被 p4ignore 保护的本地文件。
+    DeleteUntracked,
 }
 
 /// 一类变更在报告与执行上的全部差异。
@@ -101,12 +120,15 @@ struct SyncGroupSpec {
     action: SyncAction,
 }
 
-/// 四类变更的处理方式。顺序即输出顺序，必须与 [SyncChanges::groups] 一一对应。
+/// 五类变更的处理方式。顺序即输出顺序，必须与 [SyncChanges::groups] 一一对应。
 ///
 /// Update 与 Revert 分开是刻意的：前者是「本地落后了，正常拉取」，后者是「你在本地改了
 /// 一个没打开编辑的文件，改动会被丢弃」——风险等级不同，混在一组就是在误导
 /// （立场同 `clean.rs` 里那段「标题与动作必须一致」的注释）。
-const SYNC_GROUPS: [SyncGroupSpec; 4] = [
+///
+/// Untracked 只在 `--delete-untracked` 下非空：它删的不是 depot 在这个目标版本上的决定，
+/// 而是用户自己放进工作区、p4 从来不管的东西，所以单列一组、单独一句警告。
+const SYNC_GROUPS: [SyncGroupSpec; 5] = [
     SyncGroupSpec {
         id: "update",
         label: "Update",
@@ -134,6 +156,12 @@ const SYNC_GROUPS: [SyncGroupSpec; 4] = [
         title: "      Deleting {} files in workspace, not present in the depot at the target revision.",
         action: SyncAction::DeleteFromDisk,
     },
+    SyncGroupSpec {
+        id: "untracked",
+        label: "Untracked",
+        title: "      Deleting {} untracked files from the workspace.",
+        action: SyncAction::DeleteUntracked,
+    },
 ];
 
 /// 一类变更名下的文件。两类的元素类型不同（要同步的规格 vs 要删的路径），
@@ -141,6 +169,7 @@ const SYNC_GROUPS: [SyncGroupSpec; 4] = [
 enum SyncGroupFiles<'a> {
     Sync(&'a [SyncFile]),
     Delete(&'a [DeleteFile]),
+    Untracked(&'a [UntrackedFile]),
 }
 
 impl<'a> SyncGroupFiles<'a> {
@@ -148,6 +177,7 @@ impl<'a> SyncGroupFiles<'a> {
         match self {
             SyncGroupFiles::Sync(files) => files.len(),
             SyncGroupFiles::Delete(files) => files.len(),
+            SyncGroupFiles::Untracked(files) => files.len(),
         }
     }
 
@@ -179,11 +209,19 @@ impl<'a> SyncGroupFiles<'a> {
                     rev: None,
                 })
                 .collect(),
+            SyncGroupFiles::Untracked(files) => files
+                .iter()
+                .map(|file| GroupRow {
+                    client_file: file.client_file.as_str(),
+                    depot_file: file.depot_file.as_str(),
+                    rev: None,
+                })
+                .collect(),
         }
     }
 }
 
-/// sync 要做的四类动作。
+/// sync 要做的五类动作。
 #[derive(Debug, Default)]
 pub(crate) struct SyncChanges {
     /// 本地有一份、但不是目标版本：拉到目标版本覆盖它。
@@ -197,17 +235,24 @@ pub(crate) struct SyncChanges {
 
     /// 目标时刻该路径不在库、本地却有：删掉。
     delete: Vec<DeleteFile>,
+
+    /// `--delete-untracked`：depot 不跟踪、client view 能映射、p4ignore 不保护的本地文件。
+    untracked: Vec<UntrackedFile>,
 }
 
 impl SyncChanges {
-    /// 从分类结果与摘要结果投影出要下发的四类动作。
+    /// 从分类结果与摘要结果投影出要下发的各类动作。
     ///
     /// `drifted` 是摘要判定为「不是目标版本」的那批，由调用方在算完摘要后传入：
     /// 摘要是 [`SyncAnalysis::check`] 的后续，这里只负责拼装。
     ///
-    /// 与 `CleanChanges::project` 不同，这里不会失败——需要的 depot 路径与目标修订在
-    /// 分类时就已经跟着记录一起带出来了（[`SyncSource`]），没有「回头查不到」的余地。
-    pub(crate) fn project(analysis: &SyncAnalysis<'_>, drifted: Vec<SyncSource<'_>>) -> Self {
+    /// `untracked` 由调用方在扫盘之后单独发现（见 [`discover_untracked`]）：它不属于
+    /// depot 与工作区的差异分析，而是「depot 根本不管」的那批。
+    pub(crate) fn project(
+        analysis: &SyncAnalysis<'_>,
+        drifted: Vec<SyncSource<'_>>,
+        untracked: Vec<UntrackedFile>,
+    ) -> Self {
         let mut revert = to_sync_files(&analysis.revert);
         revert.extend(to_sync_files(&drifted));
 
@@ -224,6 +269,7 @@ impl SyncChanges {
                     has_have_record: entry.record.have_rev.is_some(),
                 })
                 .collect(),
+            untracked,
         }
     }
 
@@ -234,11 +280,16 @@ impl SyncChanges {
             SyncGroupFiles::Sync(self.revert.as_slice()),
             SyncGroupFiles::Sync(self.restore.as_slice()),
             SyncGroupFiles::Delete(self.delete.as_slice()),
+            SyncGroupFiles::Untracked(self.untracked.as_slice()),
         ])
     }
 
     pub(crate) fn total(&self) -> usize {
-        self.update.len() + self.revert.len() + self.restore.len() + self.delete.len()
+        self.update.len()
+            + self.revert.len()
+            + self.restore.len()
+            + self.delete.len()
+            + self.untracked.len()
     }
 }
 
@@ -353,7 +404,126 @@ async fn sync_to_target(options: &Options, work_dir: &str, files: &[SyncFile]) -
     Ok(())
 }
 
-/// 报告 sync 的四类变更，并在 `-a` 时执行它们。
+/// 从工作区里删掉一批未跟踪文件。它们没有 have 记录，所以只删磁盘，不下发 `#none`。
+async fn delete_untracked_from_workspace(files: &[UntrackedFile]) -> Result<()> {
+    let paths: Vec<String> = files.iter().map(|file| file.client_file.clone()).collect();
+    delete_workspace_files(&paths)
+}
+
+/// 发现未跟踪文件并做删除前的两道保护。
+///
+/// 判据是两条同时成立：`p4 where` 能把它映射进 client view，且 depot 记录里没有它。
+/// 只有第一条不够——depot 记录为空时，任何本地文件都会被看成未跟踪；只有第二条也不够——
+/// view 之外的文件 p4 根本不看，删它们是在动用户明确排除的东西（比如另一个工具的仓库）。
+///
+/// 两道保护都是 fail-closed：`p4 where` 失败即整轮失败（失败不能被读成「没有映射」），
+/// `p4 ignores` 的严格查询失败也即整轮失败（空结果会被读成「一个都没被忽略」）。
+async fn discover_untracked(
+    options: &Options,
+    work_dir: &str,
+    depot: &DepotState,
+    workspace: &WorkspaceState,
+) -> Result<Vec<UntrackedFile>> {
+    if !options.delete_untracked {
+        return Ok(Vec::new());
+    }
+
+    if depot.file_records.is_empty() {
+        bail!(
+            "--delete-untracked refused: p4 returned no depot records at all, so p4delta \
+             cannot tell untracked files apart from a broken scope or client mapping. \
+             Nothing was deleted."
+        );
+    }
+
+    // 范围文件永远不是删除候选：正常路径下它由 `scope.rs` 的隐式排除挡在扫盘之外，但
+    // `--no-scope-file`（用户确认「按所选执行」）根本不会登记那条排除。删掉它会让之后
+    // 每一轮都静默退化成「没有范围配置」、范围放大到整个工作区——一次删除换来更大的
+    // 后续破坏，所以这里无条件按 client root 下的固定位置剔除。
+    let scope_file_key = local_path_key(
+        &Path::new(work_dir)
+            .join(SCOPE_FILE_NAME)
+            .display()
+            .to_string(),
+    );
+    let candidates: Vec<String> = workspace
+        .files
+        .iter()
+        .filter(|file| file.path_lower != scope_file_key)
+        .filter(|file| depot.get_client_record(&file.path_lower).is_none())
+        .map(|file| file.path.clone())
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let scanned = candidates.len();
+    let mapped = map_paths_strict(options, work_dir, &candidates).await?;
+    let mut untracked = Vec::new();
+    let mut outside_view = 0;
+    let mut view_excluded = 0;
+    for entry in mapped {
+        if entry.unmapped {
+            view_excluded += 1;
+        }
+        let Some(depot_file) = entry.depot_file else {
+            outside_view += 1;
+            continue;
+        };
+        // 二次核对：映射出的 depot 路径已经有记录，说明前一步的本地键没对上（大小写或
+        // 拼写差异）。宁可少删，不可把已跟踪文件当成未跟踪。
+        if depot
+            .file_records
+            .iter()
+            .any(|record| record.depot_file == depot_file)
+        {
+            continue;
+        }
+        untracked.push(UntrackedFile {
+            client_file: entry.client_file,
+            depot_file,
+        });
+    }
+    if outside_view > 0 {
+        sayln!(
+            "Skipped {outside_view} untracked candidate(s) outside the client view \
+             ({view_excluded} excluded by the view)."
+        );
+    }
+    if untracked.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let start_time = Instant::now();
+    let queries_before = ignore_query_count();
+    let ignored = query_ignored_paths(
+        options,
+        work_dir,
+        untracked.iter().map(|file| &file.client_file),
+        IgnoreQueryMode::Strict,
+    )
+    .await?;
+    let queries = ignore_query_count() - queries_before;
+
+    let before = untracked.len();
+    untracked.retain(|file| !ignored.contains(&file.client_file));
+    let kept = before - untracked.len();
+    if kept > 0 {
+        sayln!("Kept {kept} p4ignore-protected untracked file(s).");
+    }
+    say_phase(
+        "untracked-protection",
+        &format!(
+            "{scanned} untracked candidate(s) checked against the client view and the ignore \
+             rules with {queries} p4 query/queries, {kept} kept"
+        ),
+        Some(start_time.elapsed().as_secs_f32()),
+    );
+
+    Ok(untracked)
+}
+
+/// 报告 sync 的五类变更，并在 `-a` 时执行它们。
 pub(crate) async fn apply_sync(
     options: &Options,
     work_dir: &str,
@@ -370,6 +540,12 @@ pub(crate) async fn apply_sync(
     sayln!(
         "      WARNING: this overwrites local changes to files that are not opened. It cannot be undone."
     );
+    if options.delete_untracked {
+        sayln!(
+            "      WARNING: --delete-untracked also removes local files the depot does not track \
+             (p4ignore-protected files are kept). It cannot be undone."
+        );
+    }
 
     let start_time = Instant::now();
     let mut failures: Vec<String> = Vec::new();
@@ -406,6 +582,9 @@ pub(crate) async fn apply_sync(
             }
             (SyncAction::DeleteFromDisk, SyncGroupFiles::Delete(files)) => {
                 delete_from_workspace(options, work_dir, files).await
+            }
+            (SyncAction::DeleteUntracked, SyncGroupFiles::Untracked(files)) => {
+                delete_untracked_from_workspace(files).await
             }
             // 表与字段的配对由 `every_group_is_paired_with_the_matching_action` 钉死，
             // 走不到这里；真走到了说明表被改坏了，不能静默按其中一边执行。
@@ -577,6 +756,7 @@ pub(crate) async fn build_sync_changes(
     // （摘掉的不再删，也就构不成误删），最后才是那几句可见度提示——它们数的是真要动的文件。
     protect_delete_candidates(options, work_dir, &mut analysis).await?;
     guard_case_conflicts(&analysis, depot, target)?;
+    let untracked = discover_untracked(options, work_dir, depot, workspace).await?;
 
     // 本地从没同步过、却已经有一份同名文件的那批：会被 depot 内容整份覆盖，而且与
     // 「落后了拉一把」不是一回事——没有旧版本可退回。它落在 Update 组里，光看组标题
@@ -680,7 +860,7 @@ pub(crate) async fn build_sync_changes(
     }
 
     Ok(SyncPlan {
-        changes: SyncChanges::project(&analysis, drifted),
+        changes: SyncChanges::project(&analysis, drifted, untracked),
         unsupported: analysis
             .unsupported
             .iter()
@@ -696,11 +876,16 @@ pub(crate) async fn build_sync_changes(
 mod tests {
     use super::*;
 
+    use std::path::Path;
     use std::time::UNIX_EPOCH;
+
+    use async_global_executor as task;
+    use clap::Parser;
 
     use crate::model::{DepotFileRecord, WorkspaceFile};
     use crate::path::local_path_key;
     use crate::reconcile::analyze::DeletedAtTarget;
+    use crate::scope::SCOPE_FILE_NAME;
 
     fn sync_file(client_file: &str, depot_file: &str, target_rev: u32) -> SyncFile {
         SyncFile {
@@ -717,6 +902,13 @@ mod tests {
             client_file: client_file.to_owned(),
             depot_file: depot_file.to_owned(),
             has_have_record: true,
+        }
+    }
+
+    fn untracked_file(client_file: &str, depot_file: &str) -> UntrackedFile {
+        UntrackedFile {
+            client_file: client_file.to_owned(),
+            depot_file: depot_file.to_owned(),
         }
     }
 
@@ -740,13 +932,14 @@ mod tests {
         }
     }
 
-    /// 四类各放一个可区分的文件名，用来验证标签与文件的配对。
+    /// 五类各放一个可区分的文件名，用来验证标签与文件的配对。
     fn sync_with_one_file_each() -> SyncChanges {
         SyncChanges {
             update: vec![sync_file("update.txt", "//depot/update.txt", 2)],
             revert: vec![sync_file("revert.txt", "//depot/revert.txt", 3)],
             restore: vec![sync_file("restore.txt", "//depot/restore.txt", 4)],
             delete: vec![delete_file("delete.txt", "//depot/delete.txt")],
+            untracked: vec![untracked_file("junk.log", "//depot/junk.log")],
         }
     }
 
@@ -755,7 +948,7 @@ mod tests {
     /// [SYNC_GROUPS] 与 [SyncChanges] 字段的对应关系全靠人工维护：条目数量对不上会
     /// 编译失败，但两条**对调**不会——那只会让标题、清单与实际动作错配。这里钉死整张表。
     #[test]
-    fn sync_group_order_matches_the_four_sync_fields() {
+    fn sync_group_order_matches_the_five_sync_fields() {
         let sync = sync_with_one_file_each();
 
         let observed: Vec<(&str, Vec<String>)> = sync
@@ -779,12 +972,13 @@ mod tests {
                 ("Revert", vec!["revert.txt".to_owned()]),
                 ("Restore", vec!["restore.txt".to_owned()]),
                 ("Delete", vec!["delete.txt".to_owned()]),
+                ("Untracked", vec!["junk.log".to_owned()]),
             ]
         );
-        assert_eq!(sync.total(), 4);
+        assert_eq!(sync.total(), 5);
     }
 
-    /// 每一行都带齐两个路径；`rev` 只有删除组缺席——那一行的意思是「目标时刻它不该在」，
+    /// 每一行都带齐两个路径；`rev` 只有删除组与未跟踪组缺席——那两行的意思是「它不该在」，
     /// 没有一个版本号说得通。
     #[test]
     fn every_sync_row_carries_both_paths() {
@@ -816,6 +1010,7 @@ mod tests {
             match (spec.action, &files) {
                 (SyncAction::SyncToTarget, SyncGroupFiles::Sync(_)) => {}
                 (SyncAction::DeleteFromDisk, SyncGroupFiles::Delete(_)) => {}
+                (SyncAction::DeleteUntracked, SyncGroupFiles::Untracked(_)) => {}
                 (action, _) => panic!("{}: mispaired with {action:?}", spec.label),
             }
         }
@@ -830,7 +1025,8 @@ mod tests {
 
             let rendered = render_title(spec.title, 3);
             assert!(!rendered.contains("{}"), "{}", spec.label);
-            assert!(rendered.contains("3 files"), "{}: {rendered}", spec.label);
+            assert!(rendered.contains('3'), "{}: {rendered}", spec.label);
+            assert!(rendered.contains("files"), "{}: {rendered}", spec.label);
         }
     }
 
@@ -858,6 +1054,77 @@ mod tests {
         assert_eq!(specs, ["//depot/a.txt#3", "//depot/b.txt#7"]);
     }
 
+    // ---- 未跟踪文件 ----
+
+    /// 没开开关时一个查询都不发，空 depot 也照常返回空集。
+    #[test]
+    fn untracked_discovery_is_off_by_default() {
+        let options = Options::parse_from(["p4delta", "--sync", "--force", "-w", "ws"]);
+        let depot = DepotState::default();
+        let workspace = WorkspaceState {
+            files: vec![workspace_file(r"C:\ws\a.txt")],
+            ..Default::default()
+        };
+
+        let untracked = task::block_on(discover_untracked(&options, "", &depot, &workspace))
+            .expect("没开开关不该失败");
+        assert!(untracked.is_empty());
+    }
+
+    /// depot 记录为空时无法区分「全部是未跟踪」与「范围/client 映射坏了」：删任何文件都是
+    /// 在赌。校验必须发生在 `p4 where` 之前，连一个子进程都不该起。
+    #[test]
+    fn delete_untracked_refuses_an_empty_depot() {
+        let options = Options::parse_from([
+            "p4delta",
+            "--sync",
+            "--force",
+            "--delete-untracked",
+            "-w",
+            "ws",
+        ]);
+        let depot = DepotState::default();
+        let workspace = WorkspaceState {
+            files: vec![workspace_file(r"C:\ws\a.txt")],
+            ..Default::default()
+        };
+
+        let error = task::block_on(discover_untracked(&options, "", &depot, &workspace))
+            .expect_err("空 depot 必须失败关闭");
+        assert!(error.to_string().contains("no depot records"), "{error}");
+    }
+
+    /// `--no-scope-file` 不登记隐式排除，范围文件会作为扫盘结果留下来；但它永远不是
+    /// 删除候选——否则一次「按所选执行」的删除档会删掉范围配置本身，之后每一轮都静默
+    /// 退化成整个工作区。剔掉它之后没有别的候选，连 `p4 where` 都不该起。
+    #[test]
+    fn delete_untracked_never_treats_the_scope_file_as_untracked() {
+        let options = Options::parse_from([
+            "p4delta",
+            "--sync",
+            "--force",
+            "--delete-untracked",
+            "--no-scope-file",
+            "-w",
+            "ws",
+        ]);
+        let root = if cfg!(windows) { r"C:\ws" } else { "/ws" };
+        let scope_path = Path::new(root).join(SCOPE_FILE_NAME);
+        let mut depot = DepotState::default();
+        depot.file_records = vec![record(
+            &Path::new(root).join("tracked.txt").display().to_string(),
+            "//depot/tracked.txt",
+        )];
+        let workspace = WorkspaceState {
+            files: vec![workspace_file(&scope_path.display().to_string())],
+            ..Default::default()
+        };
+
+        let untracked = task::block_on(discover_untracked(&options, root, &depot, &workspace))
+            .expect("范围文件被剔除后没有候选，不该起 p4");
+        assert!(untracked.is_empty());
+    }
+
     // ---- 投影 ----
 
     /// 摘要判定为「不是目标版本」的那批必须并进 Revert 组，而不是另开一类：
@@ -882,6 +1149,7 @@ mod tests {
                 record: &records[1],
                 target_rev: 5,
             }],
+            Vec::new(),
         );
 
         assert_eq!(
@@ -908,9 +1176,29 @@ mod tests {
             ..Default::default()
         };
 
-        let changes = SyncChanges::project(&analysis, Vec::new());
+        let changes = SyncChanges::project(&analysis, Vec::new(), Vec::new());
 
         assert_eq!(changes.total(), 0);
+    }
+
+    /// 未跟踪组独立于删除组：前者没有 have 记录可清，后者要下发 `#none`。
+    /// 混进删除组会让 `delete_specs` 给它们拼一条 p4 无事可做的规格。
+    #[test]
+    fn projection_keeps_the_untracked_group_separate() {
+        let analysis = SyncAnalysis::default();
+
+        let changes = SyncChanges::project(
+            &analysis,
+            Vec::new(),
+            vec![untracked_file("junk.log", "//depot/junk.log")],
+        );
+
+        assert_eq!(
+            changes.untracked,
+            [untracked_file("junk.log", "//depot/junk.log")]
+        );
+        assert!(changes.delete.is_empty());
+        assert_eq!(changes.total(), 1);
     }
 
     /// 删除组两个路径都要留着：本地路径用来删文件，depot 路径用来让 p4 清 have 记录。
@@ -930,7 +1218,7 @@ mod tests {
             ..Default::default()
         };
 
-        let changes = SyncChanges::project(&analysis, Vec::new());
+        let changes = SyncChanges::project(&analysis, Vec::new(), Vec::new());
 
         assert_eq!(
             changes.delete,
@@ -952,7 +1240,7 @@ mod tests {
             ..Default::default()
         };
 
-        let changes = SyncChanges::project(&analysis, Vec::new());
+        let changes = SyncChanges::project(&analysis, Vec::new(), Vec::new());
 
         assert_eq!(
             changes.delete,

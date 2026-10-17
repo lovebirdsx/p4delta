@@ -710,6 +710,65 @@ pub(crate) async fn map_new_paths(
     Ok(apply_where(files, &parse_where_lines(&lines)))
 }
 
+/// 一条本地路径在 client view 里的映射结果。
+#[derive(Debug, PartialEq)]
+pub(crate) struct MappedPath {
+    /// 请求里的本地路径，与扫描结果同一拼写。
+    pub(crate) client_file: String,
+
+    /// view 映射出的 depot 路径；被排除或 p4 没回答时为 `None`。
+    pub(crate) depot_file: Option<String>,
+
+    /// view 的排除行（例如 `-//depot/....tmp`）挡下了这个路径。
+    pub(crate) unmapped: bool,
+}
+
+/// 严格版 `p4 where`：命令失败即整轮失败，绝不把失败读成「没有映射」。
+///
+/// 删除未跟踪文件时，这个查询是「p4 到底管不管这个路径」的唯一证据。读成空映射的后果
+/// 不是少做一点，而是把 client view 之外的文件也删掉，所以判据用 [`FailureMode::ExitCode`]：
+/// 退出码非零必须中止，而 stderr 上的提示（`no such file(s)` 之类）不算失败。
+pub(crate) async fn map_paths_strict(
+    options: &Options,
+    work_dir: &str,
+    paths: &[String],
+) -> Result<Vec<MappedPath>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let escaped: Vec<String> = paths.iter().map(|path| escape_file_spec(path)).collect();
+    let lines = run_p4_command_batched(
+        options,
+        work_dir,
+        P4Command::Where,
+        &WHERE_ARGS,
+        &escaped,
+        false,
+        FailureMode::ExitCode,
+    )
+    .await?;
+
+    let mut records: HashMap<String, WhereRecord> = HashMap::new();
+    for record in parse_where_lines(&lines) {
+        records.insert(record.key.clone(), record);
+    }
+
+    Ok(paths
+        .iter()
+        .map(|path| {
+            let record = records.get(&local_path_key(path));
+            MappedPath {
+                client_file: path.clone(),
+                depot_file: record
+                    .filter(|record| !record.unmapped)
+                    .map(|record| record.depot_file.clone()),
+                unmapped: record.is_some_and(|record| record.unmapped),
+            }
+        })
+        .collect())
+}
+
 /// 把同步扫盘交给阻塞线程池。
 ///
 /// 遍历整段没有 await 点（`WalkDir` 与 `scan` 的收集器都是同步的），留在执行器线程上会让同一轮

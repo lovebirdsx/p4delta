@@ -46,6 +46,12 @@ pub struct Options {
     #[arg(long, requires = "sync")]
     pub(crate) force: bool,
 
+    /// 删除未跟踪文件（仅 `--sync --force`）：工作区范围内、client view 能映射、
+    /// 但 depot 里没有记录的本地文件。被 p4ignore 覆盖的文件会保留并在报告里点名。
+    /// 预演只报告不删除；加 `-a` 才真正删除，且不可撤销。
+    #[arg(long, requires_all = ["sync", "force"], conflicts_with = "clean")]
+    pub(crate) delete_untracked: bool,
+
     /// 同步的目标 changelist（`--sync`，普通与 `--force` 都支持）。默认是 head。
     ///
     /// 不接受 0：`-c 0` 在本工具里是「默认 changelist」，照搬成 `--to 0` 太容易，而
@@ -209,6 +215,42 @@ mod tests {
 
         // 普通同步仍然合法。
         assert!(Options::try_parse_from(["p4delta", "--sync", "-w", "ws"]).is_ok());
+    }
+
+    /// `--delete-untracked` 是强制修复的附加动作：普通同步不扫工作区，单独给出的
+    /// 语义不是「少做一点」而是另一个问题，解析层直接挡掉。
+    #[test]
+    fn delete_untracked_requires_force_sync() {
+        for argv in [
+            vec!["p4delta", "--delete-untracked", "-w", "ws"],
+            vec!["p4delta", "--sync", "--delete-untracked", "-w", "ws"],
+            vec![
+                "p4delta",
+                "--clean",
+                "--force",
+                "--delete-untracked",
+                "-w",
+                "ws",
+            ],
+        ] {
+            assert!(
+                Options::try_parse_from(argv.clone()).is_err(),
+                "{argv:?} 必须是用法错误"
+            );
+        }
+
+        let parsed = Options::parse_from([
+            "p4delta",
+            "--sync",
+            "--force",
+            "--delete-untracked",
+            "-w",
+            "ws",
+        ]);
+        assert!(parsed.delete_untracked);
+
+        let plain = Options::parse_from(["p4delta", "--sync", "--force", "-w", "ws"]);
+        assert!(!plain.delete_untracked);
     }
 
     /// `--to 0` 在 p4 语法里是「第一个修订版之前」：目标时刻什么都不存在，sync 会据此

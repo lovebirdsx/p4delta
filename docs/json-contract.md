@@ -117,14 +117,17 @@
 | sync | `restore` | `restoring` | 本地缺失 → 写回目标版本 |
 | sync | `delete` | `deleting` | 目标时刻不在库 → 删掉本地文件 |
 | sync | `resolve` | `scheduling` | 已打开、have 不在目标版本上 → 原生把 have 拉到目标版本、挂上待 resolve，内容一个字不改 |
+| sync | `untracked` | `deleting` | `--delete-untracked`：删掉 depot 不跟踪、client view 能映射、未被 p4ignore 保护的本地文件 |
 | 任意 | `handoff` | `handoff` 字段的值 | 转交给原生 p4 的文件，见下节 |
 
 `sync` 的类在两种模式下的**来源不同**（`force` 字段区分）：
 
 - 强制修复（`force:true`）的四类（`update` / `revert` / `restore` / `delete`）来自 δ 自己的
-  差异分析，那是「无论本地改没改都修成目标版本」；
+  差异分析，那是「无论本地改没改都修成目标版本」；带 `--delete-untracked` 时另有第五类
+  `untracked`（见「`kind:"file"`」的 class 表）；
 - 普通同步（`force:false`）只发原生**打算传**的文件，即 `add` / `update` / `delete` 三类，
-  外加 `resolve` 那一类。普通同步不做强制修复，所以 `revert` / `restore` 在它那里永不出现。
+  外加 `resolve` 那一类。普通同步不做强制修复，所以 `revert` / `restore` / `untracked` 在它
+  那里永不出现。
 
 `resolve` 那一类普通同步也不是照单全收：`p4 opened` 给的是范围内**全部**已打开文件，而
 原生只对 have 不在目标版本上的那些说话（have 已经在目标版本上的，预演连一句提示都没有），
@@ -164,6 +167,32 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 其余四种（clean 预演/应用、sync 预演/应用、open 应用）只发 handoff 记录：两个路径都有，
 没有逐文件动作，也不进 `counts`。
 
+### `kind:"conflict"`
+
+```json
+{"kind":"conflict","mode":"sync","reason":"update-modified","action":"not updated","depotFile":"//depot/ws/a.txt","clientFile":"//bench/ws/a.txt","rev":"2","stage":"apply","applied":true,"force":false}
+```
+
+普通同步的逐文件拒绝。`allwrite noclobber` 客户端下，原生对「本地改了又没打开」的文件不覆盖，
+只印一行 `info`（退出码仍是 0）；这条记录把身份与原因结构化，消费方不用再从 stderr 文本反推。
+
+| 字段 | 说明 |
+|---|---|
+| `mode` | 恒为 `"sync"` |
+| `reason` | `update-modified` / `delete-modified` / `overwrite-existing`，对应原生三种原文动词 |
+| `action` | `not updated`（update / overwrite）或 `not deleted`（delete）；只是描述，消费方按 `reason` 分桶 |
+| `depotFile` | 恒有 |
+| `clientFile` | client 语法，退化规则与 file 记录相同 |
+| `rev` | 原生拒绝原文里的 `#rev`（update 是要拉到的目标版本，delete 是本地 have 版本） |
+| `stage` | `"preview"` 或 `"apply"`：一次运行只发一套；带 `-a` 时统一 `apply`（被拒文件不会进入下发规格，apply 阶段的种子就是预演那份） |
+| `applied` | 这一轮是否带 `-a` |
+| `force` | 恒为 `false`：强制修复不走原生这套保护，它按自己的判据覆盖 |
+
+冲突**不是逐文件动作**：不进 `counts`、不进 `total`，只计入 summary 的 `conflicts`。范围外的
+拒绝不发记录也不计数。`ok:true`、`total:0`、`conflicts>0` 是合法组合——「这一轮没有文件被改」
+与「工作区已经是最新」是两件事。原生拒绝原文仍原样出现在 stderr 上，仅供人读；消费方只读
+结构化记录，并用 summary 的 `conflicts` 与记录条数对账——字段缺席或条数不符即这份流没有结论。
+
 ### `kind:"unmatched"`
 
 ```json
@@ -197,7 +226,7 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 ### `kind:"summary"`
 
 ```json
-{"kind":"summary","mode":"open","ok":true,"applied":false,"total":340,"counts":{"add":100,"edit":200,"delete":40},"p4Calls":12,"p4CallsByCommand":{"have":2,"fstat":6,"opened":4},"scopeMatched":1,"unmatched":0,"elapsedMs":249,"reason":null}
+{"kind":"summary","mode":"open","ok":true,"applied":false,"total":340,"counts":{"add":100,"edit":200,"delete":40},"conflicts":0,"p4Calls":12,"p4CallsByCommand":{"have":2,"fstat":6,"opened":4},"scopeMatched":1,"unmatched":0,"elapsedMs":249,"reason":null}
 ```
 
 | 字段 | 说明 |
@@ -208,6 +237,7 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 | `applied` | 是否带 `-a` 真跑了 |
 | `total` | `counts` 各值之和。口径是**「δ 给出逐文件动作的文件数」**：转交出去又没有逐条翻译的那批不进 `counts`，所以 clean / sync 的预演与应用、open 的应用都不含它；open 的预演例外（逐条翻译，见「`class:"handoff"` 变体」），那批进 `counts` |
 | `counts` | `class` → 数量；**只出现非零项**，缺席即 0。`handoff` 永不出现（它没有逐文件动作，`class:"handoff"` 的记录也从来不是「一个动作」） |
+| `conflicts` | 本轮普通同步的逐文件拒绝条数（`kind:"conflict"` 记录数）。恒为整数，非 `sync` 模式为 0；**不并入 `total`**——冲突没有逐文件动作 |
 | `p4Calls` | 这一轮**成功启动**的原生 p4 进程数（累计观测，口径见「`kind:"p4CommandCount"`」）。它是观测值，不是成败判据 |
 | `p4CallsByCommand` | `command` 类别 → 次数，取值同「`kind:"p4CommandCount"`」那张表；**只出现非零项**，各项之和恒等于 `p4Calls`。它回答的是「这 12 次调用花在哪」，与 `p4Calls` 出自同一把锁、同一份账 |
 | `scopeMatched` | 匹配到东西的入口数；**普通同步是 `null`**——判定权在原生手里，「入口匹配了几个」这个结论它拿不到。`null` 是「不知道」，不是 0 |
@@ -306,8 +336,9 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 | `--no-revert-groups` | 抑制 `open` 模式的 `revert_add` / `revert_edit` 两组，并把 `revert_delete` 并进 `reopen_edit`，语义回到逐行等于 `p4 reconcile -a -e -d`（理由见上一节的例外） |
 
 `--sync` 的两档由 `--force` 分：不带是**普通同步**（`force:false`，把工作区拉到目标版本，
-覆盖保护与 opened 交给原生），带上是**强制修复**（`force:true`，修成目标版本）。两者的记录
-形状差别见上文 `sync` 那几行。
+覆盖保护与 opened 交给原生），带上是**强制修复**（`force:true`，修成目标版本）。
+`--sync --force --delete-untracked` 再把 depot 不跟踪的本地文件一并删掉（client view 之外
+与 p4ignore 保护的不删），记录见 `class:"untracked"`。两者的记录形状差别见上文 `sync` 那几行。
 
 ## 范围配置（持久边界）
 
@@ -382,12 +413,16 @@ view 不受它影响。
   （`p4 opened` + `p4 fstat`，规模由打开数决定）拿身份，再按精确规格下发——这些文件因此
   以 `class:"resolve"` 出现在记录流里。have 已经在目标版本上的已打开文件原生连提示都不发，
   δ 也不把它们报出来。补查失败或解释不了那批提示时整轮停下，不拿一份少了东西的答案去写。
-- **普通同步里被 p4 拒绝覆盖的文件不进记录流**：`allwrite noclobber` 客户端下，本地改了又没
-  打开的文件由原生逐文件拒绝（`#rev - can't update/delete modified file`、同名未跟踪文件是
-  `can't overwrite existing file`；都是 `info` 提示 + 退出码 0）。δ 把这些原文照样转出
-  （stderr），但它们**没有逐文件动作**，所以一条 file 记录都不发、也不进 `counts`。全部文件
-  都被拒时 `total` 是 0 而 `ok` 仍是 `true`——「没有动作」在这里是结论，不是失败；消费方要靠
-  stderr 上的拒绝原文判断「不是最新」，别把 `total:0` 读成 up-to-date。
+- **普通同步里被 p4 拒绝覆盖的文件走 `kind:"conflict"`**：`allwrite noclobber` 客户端下，本地
+  改了又没打开的文件由原生逐文件拒绝（`#rev - can't update/delete modified file`、同名未跟踪
+  文件是 `can't overwrite existing file`；都是 `info` 提示 + 退出码 0）。δ 把原文照样转出
+  （stderr），同时发结构化记录；它们**没有逐文件动作**，所以不进 `counts` / `total`，只进
+  summary 的 `conflicts`。全部文件都被拒时 `total` 是 0、`conflicts>0` 而 `ok` 仍是 `true`——
+  「没有动作」在这里是结论，不是失败；消费方只读结构化记录，并用 `conflicts` 与记录条数对账，
+  缺席或条数不符即无结论，不回退 stderr 原文。
+- **`--delete-untracked` 的删除判据在 δ 这边**：候选是「`p4 where` 能映射进 client view、
+  `p4 fstat` 没有记录」的本地文件；`p4 where` / `p4 ignores` 查询失败即整轮失败，空 depot
+  记录也拒绝执行。这一档只删磁盘、不下发 `#none`（未跟踪路径没有 have 记录）。
 - **普通同步里「本地已删、have 还在」的删除落地**：目标处是删除版本、本地文件已经没了（外部
   工具删的）、have 记录还在时，原生预演只印一句 `#rev - deleted as <本地路径>` 作为 `info` 提示，
   正文记录一条都没有。δ 认这句话并把它归成删除候选（下发 `#none`，清掉 have），这一路的落地

@@ -38,6 +38,255 @@ fn an_untracked_file_survives_a_sync() {
     assert!(sandbox.opened().is_empty(), "sync never opens files");
 }
 
+/// `--delete-untracked`：预演只报告，`-a` 才真删；不带这个 flag 时未跟踪文件照旧
+/// 不受影响（见 `an_untracked_file_survives_a_sync`）。
+///
+/// 记录与计数是这条能力的对外契约：每个文件一条 `class:"untracked"`、`action:"deleting"`，
+/// 没有 `rev`（这些路径从来没有修订号），`total` 与 `counts.untracked` 都计入。
+#[test]
+fn delete_untracked_reports_in_a_dry_run_and_deletes_only_on_apply() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox.write("junk.log", "not in the depot\n");
+    sandbox.write("build/scratch.txt", "also not in the depot\n");
+
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "--delete-untracked", "-l"])
+        .arg(".")
+        .assert()
+        .success()
+        // 删除不可逆，授权之前必须看得见这一档多做了什么。
+        .stdout(predicate::str::contains(
+            "WARNING: --delete-untracked also removes local files",
+        ))
+        .stdout(predicate::str::contains(
+            "Deleting 2 untracked files from the workspace.",
+        ))
+        .stdout(predicate::str::contains("Counted 2 files to sync"))
+        .stdout(predicate::str::contains(
+            "Re-run with -a to sync the workspace.",
+        ));
+
+    assert!(sandbox.exists("junk.log"), "预演不该删文件");
+    assert!(sandbox.exists("build/scratch.txt"), "预演不该删文件");
+    assert!(sandbox.opened().is_empty(), "sync never opens files");
+
+    let output = sandbox
+        .cli()
+        .args(["--json", "--sync", "--force", "--delete-untracked", "-a"])
+        .arg(".")
+        .output()
+        .expect("run the tool");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!sandbox.exists("junk.log"), "应用档该真删");
+    assert!(!sandbox.exists("build/scratch.txt"), "应用档该真删");
+
+    let records = json_lines(&output.stdout);
+    let untracked: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|record| record["kind"] == "file" && record["class"] == "untracked")
+        .collect();
+    assert_eq!(untracked.len(), 2, "{records:?}");
+    for record in &untracked {
+        assert_eq!(record["mode"], "sync");
+        assert_eq!(record["action"], "deleting");
+        assert_eq!(record["force"], true);
+        assert_eq!(record["applied"], true);
+        assert!(
+            record.get("rev").is_none(),
+            "未跟踪文件没有修订号：{record}"
+        );
+        assert!(
+            record["depotFile"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("//")),
+            "{record}"
+        );
+        assert!(
+            record["clientFile"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("//")),
+            "{record}"
+        );
+    }
+
+    let summary = records.last().expect("记录流以 summary 收尾");
+    assert_eq!(summary["kind"], "summary");
+    assert_eq!(summary["total"], 2, "{summary}");
+    assert_eq!(summary["counts"]["untracked"], 2, "{summary}");
+}
+
+/// `--no-scope-file`（用户确认「按所选执行」）不会登记隐式排除，范围文件因此会像普通
+/// 本地文件一样进入扫盘结果。它永远不是删除候选——删掉它等于把之后每一轮的范围静默
+/// 放大到整个工作区。同一轮里放一个真正的未跟踪文件，证明删除档确实执行了。
+#[test]
+fn delete_untracked_never_deletes_the_scope_file_without_the_scope_file() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox.write(".p4delta-scope", r#"{"exclude": [{"dir": "ignored"}]}"#);
+    sandbox.write("junk.log", "not in the depot\n");
+
+    sandbox
+        .cli()
+        .args([
+            "--sync",
+            "--force",
+            "--delete-untracked",
+            "--no-scope-file",
+            "-a",
+        ])
+        .arg(".")
+        .assert()
+        .success();
+
+    assert!(sandbox.exists(".p4delta-scope"), "范围配置永远不是删除候选");
+    assert!(!sandbox.exists("junk.log"), "删除档该删真正的未跟踪文件");
+}
+
+/// 被 p4ignore 覆盖的未跟踪文件**保留并报告**：删除是唯一不可逆的动作，忽略规则是用户
+/// 明确表达的「这个别动」。
+#[test]
+fn a_p4ignore_protected_untracked_file_is_kept_and_reported() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    // 规则文件自己也入库：不然它会作为一条未跟踪文件被这一档删掉。
+    sandbox.commit(".p4ignore", "*.tmp\n");
+    sandbox.write("cache.tmp", "ignored build output\n");
+    sandbox.write("junk.log", "plain untracked file\n");
+    let probe = sandbox.p4_ok(&["ignores", "-i", "cache.tmp"]);
+    assert!(
+        probe.contains(" ignored"),
+        "前提不成立：规则没盖住 cache.tmp：{probe}"
+    );
+
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "--delete-untracked", "-a"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Kept 1 p4ignore-protected untracked file(s).",
+        ))
+        .stdout(predicate::str::contains(
+            "Deleting 1 untracked files from the workspace.",
+        ));
+
+    assert!(sandbox.exists("cache.tmp"), "被忽略的文件不该被删");
+    assert_eq!(sandbox.read("cache.tmp"), "ignored build output\n");
+    assert!(!sandbox.exists("junk.log"), "没被忽略的照删");
+}
+
+/// client view 之外的文件一个都不碰：p4 根本不管它们（可能是另一个工具的仓库），
+/// 删它们是越界。这类候选保留并单独报告。
+#[test]
+fn an_untracked_file_outside_the_client_view_is_never_deleted() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    let client = sandbox.client().to_owned();
+    sandbox.set_client_view(&[
+        format!("//depot/main/... //{client}/..."),
+        // 排除行：这个子树不映射到工作区。
+        format!("-//depot/main/tmp/... //{client}/tmp/..."),
+    ]);
+
+    sandbox.write("tmp/scratch.txt", "outside the view\n");
+    sandbox.write("junk.log", "inside the view\n");
+
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "--delete-untracked", "-a"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Skipped 1 untracked candidate(s) outside the client view (1 excluded by the view).",
+        ))
+        .stdout(predicate::str::contains(
+            "Deleting 1 untracked files from the workspace.",
+        ));
+
+    assert!(sandbox.exists("tmp/scratch.txt"), "view 之外的文件不该被删");
+    assert_eq!(sandbox.read("tmp/scratch.txt"), "outside the view\n");
+    assert!(!sandbox.exists("junk.log"), "view 之内的照删");
+}
+
+/// 空 depot 记录 fail-closed：这时「全部本地文件都未跟踪」与「范围/client 映射坏了」
+/// 在数据上分不出来，照前者执行就是删光工作区。
+#[test]
+fn delete_untracked_refuses_an_empty_depot() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox.write("only/junk.txt", "nothing is tracked here\n");
+
+    let output = sandbox
+        .cli()
+        .args(["--sync", "--force", "--delete-untracked", "-a"])
+        .arg("only")
+        .output()
+        .expect("run the tool");
+
+    assert!(!output.status.success(), "空 depot 必须被拒绝：{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("p4 returned no depot records at all"),
+        "失败得说清是哪条护栏：{stderr}"
+    );
+    assert!(
+        sandbox.exists("only/junk.txt"),
+        "失败的一轮一个文件都不许动"
+    );
+}
+
+/// 已打开待提交的新文件（open for add）不是未跟踪：它在 pending changelist 里，
+/// 删掉就是丢用户的活儿。判据来自 `p4 fstat` 的 action 记录，不是「depot 里有没有」。
+#[test]
+fn an_opened_for_add_file_is_not_untracked() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox.write("new.txt", "opened for add\n");
+    sandbox.p4_ok(&["add", "new.txt"]);
+    sandbox.write("junk.log", "plain untracked file\n");
+    assert_eq!(
+        sandbox.opened().len(),
+        1,
+        "前提：new.txt 在默认 changelist 里"
+    );
+
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "--delete-untracked", "-a"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Deleting 1 untracked files from the workspace.",
+        ));
+
+    assert!(sandbox.exists("new.txt"), "已打开的文件不该被删");
+    assert_eq!(sandbox.read("new.txt"), "opened for add\n");
+    assert_eq!(sandbox.opened().len(), 1, "打开状态也不该被动");
+    assert!(!sandbox.exists("junk.log"), "真正未跟踪的那份照删");
+}
+
 /// dry run：三类差异都数得出来，而磁盘、opened、have 三处都不许动。
 #[test]
 fn sync_dry_run_changes_nothing() {
@@ -1819,6 +2068,18 @@ fn write_keeping_the_synced_mtime(sandbox: &support::Sandbox, relative: &str, co
         .expect("open the file to restore its mtime");
     file.set_modified(synced)
         .expect("restore the sync-time mtime");
+}
+
+/// 把 `--json` 的 stdout 解析成记录流；混进非 JSON 行就是契约被破坏。
+fn json_lines(stdout: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("stdout must be JSON Lines only: {error}\n{line}"))
+        })
+        .collect()
 }
 
 /// 最近一次已提交的 changelist 号。

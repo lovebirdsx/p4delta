@@ -461,13 +461,158 @@ fn a_refused_local_change_is_reported_as_a_refusal_not_an_incomplete_answer() {
     );
     assert_eq!(sandbox.opened(), opened_before);
 
-    // 机器可读一侧：拒绝不是逐文件动作，一条记录都不发；这一轮仍有结论（ok），
-    // 消费方靠 stderr 上的拒绝原文判断「不是最新」。
+    // 机器可读一侧：拒绝不是逐文件动作，但也不再只活在 stderr 里——每条拒绝一条
+    // `kind:"conflict"`，身份、原因与阶段都在字段上，消费方不用再从文本反推。
     let records = run_json(&sandbox, &["--json", "--sync", "-a", "."]);
-    assert!(files_in(&records).is_empty(), "拒绝的文件不该进记录流");
+    assert!(
+        files_in(&records).is_empty(),
+        "拒绝的文件不该进逐文件动作记录"
+    );
+    let conflicts = conflicts_in(&records);
+    assert_eq!(conflicts.len(), 2, "{conflicts:?}");
+
+    let update = &conflicts["//depot/main/readme.txt"];
+    assert_eq!(update["mode"], "sync");
+    assert_eq!(update["reason"], "update-modified");
+    assert_eq!(update["action"], "not updated");
+    assert_eq!(
+        update["rev"], "2",
+        "update 拒绝带的是要拉到的目标版本（head）"
+    );
+    assert_eq!(update["stage"], "apply", "带 -a 时只发 apply 一套");
+    assert_eq!(update["applied"], true);
+    assert_eq!(update["force"], false);
+    let client_file = update["clientFile"].as_str().expect("clientFile");
+    assert!(
+        client_file.starts_with("//") && client_file.ends_with("/readme.txt"),
+        "clientFile 该是 client 语法：{client_file}"
+    );
+
+    let delete = &conflicts["//depot/main/going.txt"];
+    assert_eq!(delete["reason"], "delete-modified");
+    assert_eq!(delete["action"], "not deleted");
+    assert_eq!(delete["rev"], "1");
+
     let summary = summary_in(&records);
     assert_eq!(summary["ok"], true, "{summary}");
     assert_eq!(summary["total"], 0, "拒绝不产生逐文件动作：{summary}");
+    assert_eq!(summary["conflicts"], 2, "{summary}");
+}
+
+/// 三种拒绝（update / delete / overwrite）在预演与执行两档都发结构化记录。
+///
+/// 一次运行只发一套：预演 `stage:"preview"`、`applied:false`；带 `-a` 时统一
+/// `stage:"apply"`、`applied:true`（被拒文件不会进入 apply 的规格列表，apply 阶段的
+/// 种子就是预演那份）。三种原因映射到两种动作：`overwrite-existing` 也是「没更新」，
+/// 只有 `delete-modified` 是「没删除」。
+#[test]
+fn the_three_refusal_shapes_reach_the_json_stream() {
+    let Some(sandbox) = sandbox_with_allwrite_noclobber() else {
+        return;
+    };
+
+    // update：落后一版、本地改了、未打开。
+    behind_then_modified(&sandbox, "readme.txt", "local update\n");
+    // delete：目标处已删除，本地未打开地改了。
+    sandbox.commit("going.txt", "will go\n");
+    sandbox.p4_ok(&["delete", "going.txt"]);
+    sandbox.p4_ok(&["submit", "-d", "delete it"]);
+    sandbox.p4_ok(&["sync", "//depot/main/going.txt#1"]);
+    sandbox.write("going.txt", "local delete\n");
+    // overwrite：depot 有、本地是一份可写的同名文件、没有 have 记录。
+    sandbox.commit("blocked.txt", "from the depot\n");
+    sandbox.p4_ok(&["sync", "//depot/main/blocked.txt#none"]);
+    sandbox.write("blocked.txt", "my own copy\n");
+
+    for (stage, applied, args) in [
+        ("preview", false, ["--json", "--sync", "-l", "."].as_slice()),
+        ("apply", true, ["--json", "--sync", "-a", "."].as_slice()),
+    ] {
+        let records = run_json(&sandbox, args);
+        assert!(
+            files_in(&records).is_empty(),
+            "{stage}: 拒绝的文件不该进逐文件动作记录"
+        );
+        let conflicts = conflicts_in(&records);
+        assert_eq!(conflicts.len(), 3, "{stage}: {conflicts:?}");
+
+        for (depot_file, reason, action) in [
+            ("//depot/main/readme.txt", "update-modified", "not updated"),
+            ("//depot/main/going.txt", "delete-modified", "not deleted"),
+            (
+                "//depot/main/blocked.txt",
+                "overwrite-existing",
+                "not updated",
+            ),
+        ] {
+            let conflict = &conflicts[depot_file];
+            assert_eq!(conflict["reason"], reason, "{stage}: {conflict}");
+            assert_eq!(conflict["action"], action, "{stage}: {conflict}");
+            assert_eq!(
+                conflict["stage"], stage,
+                "一次运行只发一套冲突记录：{conflict}"
+            );
+            assert_eq!(conflict["applied"], applied, "{stage}: {conflict}");
+            assert_eq!(conflict["force"], false, "{stage}: {conflict}");
+            assert!(
+                conflict["rev"].as_str().is_some_and(|rev| !rev.is_empty()),
+                "{stage}: rev 必须是原生原文里的版本号：{conflict}"
+            );
+            assert!(
+                conflict["clientFile"]
+                    .as_str()
+                    .is_some_and(|path| path.starts_with("//")),
+                "{stage}: clientFile 该是 client 语法：{conflict}"
+            );
+        }
+
+        let summary = summary_in(&records);
+        assert_eq!(summary["ok"], true, "{stage}: {summary}");
+        assert_eq!(summary["total"], 0, "{stage}: 冲突不是逐文件动作");
+        assert_eq!(summary["conflicts"], 3, "{stage}: {summary}");
+    }
+}
+
+/// 同一轮里既有被拒的文件、也有原生真会传的文件：两类记录并存，计数各归各的。
+///
+/// `total` 只数真正有动作的文件（安全那批），`conflicts` 只数被拒那批；把两者相加或
+/// 让其中一类吞掉另一类，都会让消费方读到一个假的「这一轮做了几件事」。
+#[test]
+fn conflicts_and_file_records_share_the_stream() {
+    let Some(sandbox) = sandbox_with_allwrite_noclobber() else {
+        return;
+    };
+
+    behind_then_modified(&sandbox, "readme.txt", "local\n");
+    sandbox.commit("safe.txt", "v1\n");
+    sandbox.p4_ok(&["edit", "safe.txt"]);
+    sandbox.write("safe.txt", "v2\n");
+    sandbox.p4_ok(&["submit", "-d", "v2"]);
+    sandbox.p4_ok(&["sync", "//depot/main/safe.txt#1"]);
+
+    let records = run_json(&sandbox, &["--json", "--sync", "-a", "."]);
+
+    let files = files_in(&records);
+    assert_eq!(files.len(), 1, "{files:?}");
+    let safe = &files["//depot/main/safe.txt"];
+    assert_eq!(safe["class"], "update");
+    assert_eq!(safe["stage"], "apply");
+    assert_eq!(safe["nativeAction"], "updated");
+
+    let conflicts = conflicts_in(&records);
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    let refused = &conflicts["//depot/main/readme.txt"];
+    assert_eq!(refused["reason"], "update-modified");
+    assert_eq!(refused["stage"], "apply");
+
+    let summary = summary_in(&records);
+    assert_eq!(summary["total"], 1, "{summary}");
+    assert_eq!(summary["counts"]["update"], 1, "{summary}");
+    assert_eq!(summary["conflicts"], 1, "{summary}");
+
+    // 独立取证：安全那份到了目标版本，被拒那份一个字节没动。
+    assert_eq!(sandbox.read("safe.txt"), "v2\n");
+    assert_eq!(sandbox.read("readme.txt"), "local\n");
 }
 
 /// 同一轮里既有被拒的文件、也有原生真会传的文件：安全的那批照原生同步，被拒的原样留着。
@@ -549,6 +694,12 @@ fn a_refusal_inside_an_excluded_entry_is_never_written_to() {
         have_before,
         "排除项里的文件连 have 都不该被推"
     );
+
+    // 范围外的拒绝同样不发记录：消费方拿到它只会多出一条点不动的补救项。
+    let records = run_json(&sandbox, &["--json", "--sync", "-a", "."]);
+    assert!(conflicts_in(&records).is_empty(), "{records:?}");
+    let summary = summary_in(&records);
+    assert_eq!(summary["conflicts"], 0, "{summary}");
 }
 
 /// 被拒的文件与「已打开、have 落后」的文件在同一轮：拒绝被滤掉，已打开那条照旧走补查。
@@ -1253,6 +1404,27 @@ fn files_in(records: &[Value]) -> BTreeMap<String, Value> {
         );
     }
     files
+}
+
+/// 记录流里的冲突记录，按 `depotFile` 建索引——同一文件的重复记录会在这里暴露出来。
+fn conflicts_in(records: &[Value]) -> BTreeMap<String, Value> {
+    let mut conflicts = BTreeMap::new();
+    for record in records {
+        if record["kind"] != "conflict" {
+            continue;
+        }
+        let depot_file = record["depotFile"]
+            .as_str()
+            .expect("a conflict record always carries depotFile")
+            .to_owned();
+        assert!(
+            conflicts
+                .insert(depot_file.clone(), record.clone())
+                .is_none(),
+            "同一个文件出现了两条冲突记录：{depot_file}"
+        );
+    }
+    conflicts
 }
 
 fn summary_in(records: &[Value]) -> &Value {

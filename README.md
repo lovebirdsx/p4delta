@@ -423,8 +423,9 @@ depot，而是把工作区修正到与 depot 一致。它对三类**未打开**�
   `Can't clobber writable file` 并以非零退出停下；`allwrite noclobber` 只能靠内容/时间戳判定，
   原生对每个这样的文件印一行 `#rev - can't update modified file <本地路径>`（删除腿是
   `can't delete modified file`，同名未跟踪文件挡路是 `can't overwrite existing file`），退出码
-  仍是 0、整轮继续。后一种原样转给用户，被拒的文件不进记录流、一个字节都不动，同一轮里其余文件
-  照常同步。
+  仍是 0、整轮继续。后一种原样转给用户，被拒的文件一个字节都不动，同一轮里其余文件照常同步；
+  `--json` 下每条拒绝另发一条 `kind:"conflict"` 记录（`reason` / `depotFile` / `clientFile` /
+  `rev` / `stage`），消费方不用再从 stderr 文本反推。
 - **不删 depot 里没有的本地文件**——那是用户自己的东西（这与 `--clean` 的分水岭）。
 - **不做自动 resolve**：已打开、have 又落后于目标的文件，原生会把 have 推到目标版本并挂上
   待 resolve，合并留给用户。
@@ -454,9 +455,11 @@ being changed`），路径埋在文本里、正文记录一条都没有，工具
 这句提示本身没有逐文件动作，不进记录流；本地与 have 都没有该路径时原生连这句都不说，工具也不产生
 任何候选。
 
-被 p4 拒绝覆盖的文件不属于这四组：原生没给它们动作，工具也就一条记录都不发。一个文件都没得做、
-只剩拒绝时，输出是 `p4 refused to overwrite N file(s)…`，不是「everything up to date」——
-拒绝意味着工作区与目标不同，只是这一轮不去覆盖它。
+被 p4 拒绝覆盖的文件不属于这四组：原生没给它们逐文件动作，所以不进 `counts` / `total`，
+而是以 `kind:"conflict"` 单独记录（`reason` 区分三种拒绝）。一个文件都没得做、只剩拒绝时，
+输出是 `p4 refused to overwrite N file(s)…`，不是「everything up to date」——拒绝意味着
+工作区与目标不同，只是这一轮不去覆盖它。summary 里的 `conflicts` 记的是本轮冲突条数，
+与 `total` 恒不相加；不带 `--json` 时 stderr 上的原生原文照旧保留。
 
 不带 `-a` 仍是预演：报出要做的四组，一个字节都不写（磁盘、have、opened、摘要缓存都不动）。
 
@@ -487,6 +490,27 @@ being changed`），路径埋在文本里、正文记录一条都没有，工具
 - **不碰 depot 里没有的本地文件**——那是用户自己的东西。同一批文件交给 `--clean` 会被删掉。
 - **已打开的文件一律不碰**，与 `p4 sync -f` 的官方口径一致（"does not affect open files"）。
 
+### 删除未跟踪文件（`--delete-untracked`）
+
+`--delete-untracked` 把第一条分水岭也翻过去，但只在显式 opt-in 时生效：它必须与
+`--sync --force` 同时给出，单独出现是用法错误。
+
+候选是「client view 能映射、depot 里没有任何记录」的本地文件。已打开的文件（含 open for
+add）在 `p4 fstat` 里有 action 记录，不算未跟踪。删除前的两道保护都是 fail-closed：
+
+- `p4 where` 失败即整轮停下（失败不能被读成「没有映射」）；view 之外的文件不删，报告
+  `Skipped N untracked candidate(s) outside the client view`。
+- 对剩余候选逐条查 `p4 ignores -i -v`；被 `.p4ignore` 覆盖的文件**保留**并报告
+  `Kept N p4ignore-protected untracked file(s).`，查询失败/裁决不完整同样整轮停下。
+- depot 记录为空时拒绝执行：这时分不清「本地全部未跟踪」与「范围或映射坏了」，照着前者
+  做就是删光工作区。
+
+报告里单列第五组 `Untracked`，记录为 `class:"untracked"`、`action:"deleting"`、无 `rev`，
+计入 `counts` / `total`。预演只报告，`-a` 才真正删除；删除只动磁盘，不下发 `#none`——
+这些路径从来没有 have 记录。
+
+> 这一档删的是 p4 从来不管的文件，`p4 sync` 找不回来。先跑预演，`-l` 会逐个列出来。
+
 与 `p4 sync -f` 的差别只有「传多少」：目标版本、对已打开文件的处理、以及「未打开文件上的本地
 改动会被覆盖」三者都一样。少数文件没法在这里比对，会转交原生的 `p4 sync -f`（带 `-a` 时真正
 下发，否则下发 `p4 sync -f -n`）：Apple/Resource 旧格式，以及 `headType` 认不出来的文件。
@@ -494,7 +518,8 @@ being changed`），路径埋在文本里、正文记录一条都没有，工具
 不带 `-a` 仍是预演。只是预演也会打印那句覆盖警告——代价得在授权之前就看得见。
 
 > **强制修复不可逆。** 它丢弃未打开文件上的本地改动，删掉目标时刻不在库的本地文件，
-> 两者都没法用 p4 找回来。普通同步没有这个风险——需要它就别加 `--force`。
+> 两者都没法用 p4 找回来。打开 `--delete-untracked` 时，depot 不跟踪的本地文件也会被删
+> （p4ignore 保护的除外）。普通同步没有这个风险——需要它就别加 `--force`。
 
 ### 强制修复的快档与 `--verify-all`
 

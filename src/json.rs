@@ -67,6 +67,9 @@ fn action_for(mode: Mode, class: &str) -> &'static str {
         // 强制修复多出来的两类：本地内容不对的还原、本地缺失的写回。
         (Mode::Sync, "revert") => "reverting",
         (Mode::Sync, "restore") => "restoring",
+        // `--delete-untracked`：depot 没有记录、client view 又能映射的本地文件。
+        // 只删磁盘，不碰 have（它们本来就没有 have 记录）。
+        (Mode::Sync, "untracked") => "deleting",
         _ => "unknown",
     }
 }
@@ -344,6 +347,52 @@ pub(crate) fn emit_file(record: &FileRecord<'_>) {
     }
 
     emit(&value);
+}
+
+/// 一条「p4 拒绝了逐文件动作」的记录。它不是 file 记录：被拒的文件一个字节都没动，
+/// `counts` / `total` 记的是真正有动作的文件，所以冲突单独计数（summary 的 `conflicts`）。
+pub(crate) struct ConflictRecord<'a> {
+    /// `update-modified` / `delete-modified` / `overwrite-existing`，见契约文档。
+    pub(crate) reason: &'a str,
+    pub(crate) depot_file: &'a str,
+    /// 本地路径，写记录时翻成 client 语法。
+    pub(crate) client_file: &'a str,
+    /// 原生拒绝原文里的 `#rev`（普通同步里是 have 版本）。
+    pub(crate) rev: &'a str,
+    pub(crate) stage: &'static str,
+    pub(crate) applied: bool,
+}
+
+/// 冲突条数。summary 的 `conflicts` 读它；与 `counts` 分开是因为冲突没有逐文件动作。
+static CONFLICT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// 每轮 `run()` 调一次，理由同 [`reset_p4_command_count`]：同一进程跑多轮时各自从 0 起算。
+pub(crate) fn reset_conflict_count() {
+    CONFLICT_COUNT.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn emit_conflict(record: &ConflictRecord<'_>) {
+    if !is_json() {
+        return;
+    }
+
+    CONFLICT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let action = match record.reason {
+        "delete-modified" => "not deleted",
+        _ => "not updated",
+    };
+    emit(&json!({
+        "kind": "conflict",
+        "mode": Mode::Sync.as_str(),
+        "reason": record.reason,
+        "action": action,
+        "depotFile": record.depot_file,
+        "clientFile": client_syntax(record.client_file),
+        "rev": record.rev,
+        "stage": record.stage,
+        "applied": record.applied,
+        "force": FORCE_MODE.load(Ordering::Relaxed),
+    }));
 }
 
 /// 一批转交给原生 p4 的文件：depot 路径用来点名，本地路径翻成 client 语法进记录。
@@ -747,6 +796,7 @@ pub(crate) fn emit_summary(mode: Mode, ok: bool, applied: bool, elapsed_ms: u128
         "force": FORCE_MODE.load(Ordering::Relaxed),
         "total": total,
         "counts": counts,
+        "conflicts": CONFLICT_COUNT.load(Ordering::Relaxed),
         "p4Calls": p4_calls,
         "p4CallsByCommand": p4_calls_by_command,
         "scopeMatched": scope_matched,
@@ -812,7 +862,16 @@ mod tests {
             (Mode::Clean, ["delete", "revert", "restore"].as_slice()),
             (
                 Mode::Sync,
-                ["add", "update", "resolve", "revert", "restore", "delete"].as_slice(),
+                [
+                    "add",
+                    "update",
+                    "resolve",
+                    "revert",
+                    "restore",
+                    "delete",
+                    "untracked",
+                ]
+                .as_slice(),
             ),
         ] {
             for class in classes {
