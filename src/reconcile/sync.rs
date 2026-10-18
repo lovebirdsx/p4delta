@@ -9,7 +9,7 @@
 //!
 //! 判定与分类在 [`analyze_at_target`]，这里只管「报告什么」与「下发什么」。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -24,11 +24,13 @@ use crate::digest::{CachePolicy, is_unchanged_since_sync, parallel_compute_diges
 use crate::json::{
     HandoffFile, Mode, P4Command, emit_progress, ignore_query_count, say_phase, sayln,
 };
-use crate::model::{DepotState, HaveRecord, TargetMap, WorkspaceCache, WorkspaceState};
+use crate::model::{
+    DepotFileRecord, DepotState, HaveRecord, TargetMap, WorkspaceCache, WorkspaceState,
+};
 use crate::p4::process::{FailureMode, run_p4_command_batched};
 use crate::path::local_path_key;
 use crate::scope::SCOPE_FILE_NAME;
-use crate::workspace::{IgnoreQueryMode, map_paths_strict, query_ignored_paths};
+use crate::workspace::{IgnoreQueryMode, MappedPath, map_paths_strict, query_ignored_paths};
 
 /// 把文件拉到目标版本时下发的 p4 命令。
 ///
@@ -410,14 +412,78 @@ async fn delete_untracked_from_workspace(files: &[UntrackedFile]) -> Result<()> 
     delete_workspace_files(&paths)
 }
 
-/// 发现未跟踪文件并做删除前的两道保护。
+/// 未跟踪核对的纯函数结果。
+///
+/// 只带报告需要的三个值，不塞任何性能统计字段——遍历次数由测试用可计数迭代器直接观测。
+#[derive(Debug, Default, PartialEq)]
+struct UntrackedCrossCheck {
+    /// depot 里没有记录的映射结果，保持 `mapped` 的原顺序与重复项。
+    files: Vec<UntrackedFile>,
+
+    /// `p4 where` 没给出 depot 路径的候选数。
+    outside_view: usize,
+
+    /// client view 的排除行挡下的候选数；它们同时计入 [`outside_view`](Self::outside_view)。
+    view_excluded: usize,
+}
+
+/// 把映射结果与 depot 记录对一遍，留下真正未跟踪的项。
+///
+/// 复杂度是 O(D + U)：先把候选的原始 depot 路径收进候选规模的 `HashSet`，**单趟**扫过
+/// depot 记录把已跟踪项剔除（候选全部命中后立即停），再按映射顺序筛选。旧实现为每个
+/// 候选 `any()` 一遍全部记录，候选多时是 O(U×D)。
+///
+/// 路径按**原始字符串**比较：depot 路径的身份由服务端定义，客户端不自行折叠大小写。
+fn cross_check_untracked<'a>(
+    mapped: &[MappedPath],
+    depot_records: impl IntoIterator<Item = &'a DepotFileRecord>,
+) -> UntrackedCrossCheck {
+    let mut pending: HashSet<&str> = mapped
+        .iter()
+        .filter_map(|entry| entry.depot_file.as_deref())
+        .collect();
+
+    // 没有可映射的候选（零候选或全被忽略挡掉）时不必碰 depot：那是几百万条记录的固定成本。
+    if !pending.is_empty() {
+        for record in depot_records {
+            pending.remove(record.depot_file.as_str());
+            // 候选全部命中后，剩下的 depot 记录不再影响裁决。
+            if pending.is_empty() {
+                break;
+            }
+        }
+    }
+
+    let mut result = UntrackedCrossCheck::default();
+    for entry in mapped {
+        if entry.unmapped {
+            result.view_excluded += 1;
+        }
+        let Some(depot_file) = entry.depot_file.as_deref() else {
+            result.outside_view += 1;
+            continue;
+        };
+        // 二次核对：映射出的 depot 路径已经有记录，说明前一步的本地键没对上（大小写或
+        // 拼写差异）。宁可少删，不可把已跟踪文件当成未跟踪。
+        if pending.contains(depot_file) {
+            result.files.push(UntrackedFile {
+                client_file: entry.client_file.clone(),
+                depot_file: depot_file.to_owned(),
+            });
+        }
+    }
+    result
+}
+
+/// 发现未跟踪文件并做删除前的保护。
 ///
 /// 判据是两条同时成立：`p4 where` 能把它映射进 client view，且 depot 记录里没有它。
 /// 只有第一条不够——depot 记录为空时，任何本地文件都会被看成未跟踪；只有第二条也不够——
 /// view 之外的文件 p4 根本不看，删它们是在动用户明确排除的东西（比如另一个工具的仓库）。
 ///
-/// 两道保护都是 fail-closed：`p4 where` 失败即整轮失败（失败不能被读成「没有映射」），
-/// `p4 ignores` 的严格查询失败也即整轮失败（空结果会被读成「一个都没被忽略」）。
+/// 顺序是「先忽略规则、后 where」：被 `.p4ignore` 盖住的候选根本不需要映射查询，而这一步
+/// 在几万候选上的省下的是成批子进程。忽略查询仍用严格口径，任何失败整轮中止，绝不把失败
+/// 读成「一个都没被忽略」；`p4 where` 失败同样中止。
 async fn discover_untracked(
     options: &Options,
     work_dir: &str,
@@ -436,6 +502,9 @@ async fn discover_untracked(
         );
     }
 
+    // 汇总计时从发现阶段起点开始：候选准备、忽略查询、映射与本地核对都算保护成本。
+    let protection_start = Instant::now();
+
     // 范围文件永远不是删除候选：正常路径下它由 `scope.rs` 的隐式排除挡在扫盘之外，但
     // `--no-scope-file`（用户确认「按所选执行」）根本不会登记那条排除。删掉它会让之后
     // 每一轮都静默退化成「没有范围配置」、范围放大到整个工作区——一次删除换来更大的
@@ -453,74 +522,99 @@ async fn discover_untracked(
         .filter(|file| depot.get_client_record(&file.path_lower).is_none())
         .map(|file| file.path.clone())
         .collect();
-    if candidates.is_empty() {
-        return Ok(Vec::new());
+    let scanned = candidates.len();
+
+    let mut kept = 0;
+    let mut queries = 0;
+    let mut mapped = Vec::new();
+
+    if !candidates.is_empty() {
+        emit_progress(
+            "untracked",
+            Some("Screening untracked candidates against the ignore rules."),
+        );
+        let ignores_start = Instant::now();
+        let queries_before = ignore_query_count();
+        let ignored = query_ignored_paths(
+            options,
+            work_dir,
+            candidates.iter(),
+            IgnoreQueryMode::Strict,
+        )
+        .await?;
+        queries = ignore_query_count() - queries_before;
+        // 过滤只走一趟：remaining 的长度直接给出 kept，候选字符串原样保留。
+        let remaining: Vec<String> = candidates
+            .into_iter()
+            .filter(|path| !ignored.contains(path))
+            .collect();
+        kept = scanned - remaining.len();
+        say_phase(
+            "untracked-ignores",
+            &format!(
+                "{kept} of {scanned} candidate(s) protected by the ignore rules with {queries} \
+                 p4 query/queries"
+            ),
+            Some(ignores_start.elapsed().as_secs_f32()),
+        );
+        if kept > 0 {
+            sayln!("Kept {kept} p4ignore-protected untracked file(s).");
+        }
+
+        if !remaining.is_empty() {
+            emit_progress(
+                "untracked",
+                Some("Mapping untracked candidates into the client view."),
+            );
+            let where_start = Instant::now();
+            mapped = map_paths_strict(options, work_dir, &remaining).await?;
+            say_phase(
+                "untracked-where",
+                &format!("{} candidate(s) mapped", remaining.len()),
+                Some(where_start.elapsed().as_secs_f32()),
+            );
+        }
     }
 
-    let scanned = candidates.len();
-    let mapped = map_paths_strict(options, work_dir, &candidates).await?;
-    let mut untracked = Vec::new();
-    let mut outside_view = 0;
-    let mut view_excluded = 0;
-    for entry in mapped {
-        if entry.unmapped {
-            view_excluded += 1;
-        }
-        let Some(depot_file) = entry.depot_file else {
-            outside_view += 1;
-            continue;
-        };
-        // 二次核对：映射出的 depot 路径已经有记录，说明前一步的本地键没对上（大小写或
-        // 拼写差异）。宁可少删，不可把已跟踪文件当成未跟踪。
-        if depot
-            .file_records
-            .iter()
-            .any(|record| record.depot_file == depot_file)
-        {
-            continue;
-        }
-        untracked.push(UntrackedFile {
-            client_file: entry.client_file,
-            depot_file,
-        });
-    }
-    if outside_view > 0 {
+    emit_progress(
+        "untracked",
+        Some("Cross-checking mapped candidates against the depot records."),
+    );
+    let cross_start = Instant::now();
+    let checked = cross_check_untracked(&mapped, depot.file_records.iter());
+    say_phase(
+        "untracked-cross-check",
+        &format!(
+            "{} mapped path(s) checked; {} outside the client view, {} excluded by the view; \
+             {} untracked",
+            mapped.len(),
+            checked.outside_view,
+            checked.view_excluded,
+            checked.files.len()
+        ),
+        Some(cross_start.elapsed().as_secs_f32()),
+    );
+    if checked.outside_view > 0 {
         sayln!(
-            "Skipped {outside_view} untracked candidate(s) outside the client view \
-             ({view_excluded} excluded by the view)."
+            "Skipped {} untracked candidate(s) outside the client view \
+             ({} excluded by the view).",
+            checked.outside_view,
+            checked.view_excluded
         );
     }
-    if untracked.is_empty() {
-        return Ok(Vec::new());
-    }
 
-    let start_time = Instant::now();
-    let queries_before = ignore_query_count();
-    let ignored = query_ignored_paths(
-        options,
-        work_dir,
-        untracked.iter().map(|file| &file.client_file),
-        IgnoreQueryMode::Strict,
-    )
-    .await?;
-    let queries = ignore_query_count() - queries_before;
-
-    let before = untracked.len();
-    untracked.retain(|file| !ignored.contains(&file.client_file));
-    let kept = before - untracked.len();
-    if kept > 0 {
-        sayln!("Kept {kept} p4ignore-protected untracked file(s).");
-    }
+    // 零候选、全被忽略、全部已跟踪都要留下这条汇总：否则删除档在长跑里看起来像没跑过，
+    // 也分不清「保护花了多久」与「应用花了多久」。
     say_phase(
         "untracked-protection",
         &format!(
-            "{scanned} untracked candidate(s) checked against the client view and the ignore \
-             rules with {queries} p4 query/queries, {kept} kept"
+            "{scanned} untracked candidate(s) screened against the ignore rules, the client view \
+             and the depot with {queries} ignore query/queries, {kept} kept"
         ),
-        Some(start_time.elapsed().as_secs_f32()),
+        Some(protection_start.elapsed().as_secs_f32()),
     );
 
-    Ok(untracked)
+    Ok(checked.files)
 }
 
 /// 报告 sync 的五类变更，并在 `-a` 时执行它们。
@@ -912,6 +1006,14 @@ mod tests {
         }
     }
 
+    fn mapped(client_file: &str, depot_file: Option<&str>, unmapped: bool) -> MappedPath {
+        MappedPath {
+            client_file: client_file.to_owned(),
+            depot_file: depot_file.map(str::to_owned),
+            unmapped,
+        }
+    }
+
     /// 一条够用的 depot 记录：`SyncSource` 与投影只用到路径字段。
     fn record(client_file: &str, depot_file: &str) -> DepotFileRecord {
         DepotFileRecord {
@@ -1123,6 +1225,167 @@ mod tests {
         let untracked = task::block_on(discover_untracked(&options, root, &depot, &workspace))
             .expect("范围文件被剔除后没有候选，不该起 p4");
         assert!(untracked.is_empty());
+    }
+
+    // ---- 未跟踪核对：候选规模索引 ----
+
+    /// depot 路径按**原始字符串**比较：`//depot/Main/a.txt` 与 `//depot/main/a.txt` 是两个
+    /// 文件。depot 路径的身份由服务端定义，客户端不自行折叠大小写。
+    #[test]
+    fn untracked_cross_check_matches_the_raw_depot_path() {
+        let records = [record("tracked.txt", "//depot/Main/tracked.txt")];
+        let candidates = [
+            mapped("same.txt", Some("//depot/Main/tracked.txt"), false),
+            mapped("case.txt", Some("//depot/main/tracked.txt"), false),
+        ];
+
+        let checked = cross_check_untracked(&candidates, records.iter());
+
+        assert_eq!(
+            checked.files,
+            [untracked_file("case.txt", "//depot/main/tracked.txt")]
+        );
+        assert_eq!(checked.outside_view, 0);
+        assert_eq!(checked.view_excluded, 0);
+    }
+
+    /// 重复映射保持原样：两个本地路径映到同一个 depot 路径时，二者都跟着那条 depot 记录
+    /// 走。已跟踪就都不返回；未跟踪就按请求顺序都返回。
+    #[test]
+    fn untracked_cross_check_preserves_order_and_duplicates() {
+        let tracked = [record("one.txt", "//depot/one.txt")];
+        let tracked_candidates = [
+            mapped("one-a.txt", Some("//depot/one.txt"), false),
+            mapped("one-b.txt", Some("//depot/one.txt"), false),
+        ];
+        assert!(
+            cross_check_untracked(&tracked_candidates, tracked.iter())
+                .files
+                .is_empty()
+        );
+
+        let records: [DepotFileRecord; 0] = [];
+        let untracked_candidates = [
+            mapped("b.txt", Some("//depot/b.txt"), false),
+            mapped("a.txt", Some("//depot/a.txt"), false),
+            mapped("b-copy.txt", Some("//depot/b.txt"), false),
+        ];
+        assert_eq!(
+            cross_check_untracked(&untracked_candidates, records.iter()).files,
+            [
+                untracked_file("b.txt", "//depot/b.txt"),
+                untracked_file("a.txt", "//depot/a.txt"),
+                untracked_file("b-copy.txt", "//depot/b.txt"),
+            ]
+        );
+    }
+
+    /// view 排除与「没有映射」分开计数：前者是排除行挡下的，后者是 p4 没给出映射。
+    /// 两者都不删，但诊断要把两种原因区分开。
+    #[test]
+    fn untracked_cross_check_keeps_the_view_counters_separate() {
+        let records: [DepotFileRecord; 0] = [];
+        let candidates = [
+            mapped("inside.txt", Some("//depot/inside.txt"), false),
+            mapped("outside.txt", None, false),
+            mapped("excluded.txt", None, true),
+        ];
+
+        let checked = cross_check_untracked(&candidates, records.iter());
+
+        assert_eq!(
+            checked.files,
+            [untracked_file("inside.txt", "//depot/inside.txt")]
+        );
+        assert_eq!(checked.outside_view, 2);
+        assert_eq!(checked.view_excluded, 1);
+    }
+
+    /// 已跟踪与未跟踪混在一起时，只留下 depot 里没有记录的那些，顺序不变。
+    #[test]
+    fn untracked_cross_check_mixes_tracked_and_untracked_files() {
+        let records = [
+            record("tracked-1.txt", "//depot/tracked-1.txt"),
+            record("tracked-2.txt", "//depot/tracked-2.txt"),
+        ];
+        let candidates = [
+            mapped("junk.txt", Some("//depot/junk.txt"), false),
+            mapped("tracked-1.txt", Some("//depot/tracked-1.txt"), false),
+            mapped("other-junk.txt", Some("//depot/other-junk.txt"), false),
+            mapped("tracked-2.txt", Some("//depot/tracked-2.txt"), false),
+        ];
+
+        assert_eq!(
+            cross_check_untracked(&candidates, records.iter()).files,
+            [
+                untracked_file("junk.txt", "//depot/junk.txt"),
+                untracked_file("other-junk.txt", "//depot/other-junk.txt"),
+            ]
+        );
+    }
+
+    /// 性能缺陷的判据不是秒数，而是**遍历次数**：depot 记录只允许走一轮。旧实现对每个
+    /// 候选 `any()` 一次，候选一多就是 O(U×D)。这里保留一个真正的未跟踪候选，保证
+    /// 「记录走满一轮」是正常路径，而不是靠提前停走出来的。
+    #[test]
+    fn untracked_cross_check_walks_the_depot_records_once() {
+        let records = [
+            record("a.txt", "//depot/a.txt"),
+            record("b.txt", "//depot/b.txt"),
+            record("c.txt", "//depot/c.txt"),
+        ];
+        let candidates = [
+            mapped("junk.txt", Some("//depot/junk.txt"), false),
+            mapped("a.txt", Some("//depot/a.txt"), false),
+            mapped("b.txt", Some("//depot/b.txt"), false),
+        ];
+
+        let mut visited = 0;
+        let checked = cross_check_untracked(&candidates, records.iter().inspect(|_| visited += 1));
+
+        assert_eq!(visited, records.len(), "depot 记录只该遍历一轮");
+        assert_eq!(
+            checked.files,
+            [untracked_file("junk.txt", "//depot/junk.txt")]
+        );
+    }
+
+    /// 候选全部已跟踪时，pending 一空就结束：后面的 depot 记录与裁决无关。
+    #[test]
+    fn untracked_cross_check_stops_once_every_candidate_is_tracked() {
+        let records = [
+            record("a.txt", "//depot/a.txt"),
+            record("b.txt", "//depot/b.txt"),
+            record("c.txt", "//depot/c.txt"),
+            record("d.txt", "//depot/d.txt"),
+        ];
+        let candidates = [
+            mapped("a.txt", Some("//depot/a.txt"), false),
+            mapped("b.txt", Some("//depot/b.txt"), false),
+        ];
+
+        let mut visited = 0;
+        let checked = cross_check_untracked(&candidates, records.iter().inspect(|_| visited += 1));
+
+        assert_eq!(visited, 2, "候选全部命中后不该继续扫 depot");
+        assert!(checked.files.is_empty());
+    }
+
+    /// 没有可映射的候选（零候选，或全被忽略规则挡掉）时不该碰 depot 记录：
+    /// 那些记录本来就不在删除判据里，白扫几百万条只是给每一轮强制同步加固定成本。
+    #[test]
+    fn untracked_cross_check_skips_the_depot_when_nothing_was_mapped() {
+        let records = [record("a.txt", "//depot/a.txt")];
+        let candidates = [
+            mapped("outside.txt", None, false),
+            mapped("excluded.txt", None, true),
+        ];
+
+        let mut visited = 0;
+        let checked = cross_check_untracked(&candidates, records.iter().inspect(|_| visited += 1));
+
+        assert_eq!(visited, 0);
+        assert!(checked.files.is_empty());
     }
 
     // ---- 投影 ----

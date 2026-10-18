@@ -893,14 +893,15 @@ fn the_batch_only_handoff_paths_still_carry_both_paths() {
 }
 
 /// 强制修复的阶段阶梯：与默认表（open / clean）和普通同步那张都不同——它多一段 `scan`
-/// （查询四路与工作区扫描都在这里，一次宽拉取里最长的一段），`total` 是 6。
+/// （查询四路与工作区扫描都在这里，一次宽拉取里最长的一段）和一段 `untracked`（删除档的
+/// 候选保护，未启用时跳过），`total` 是 7。
 ///
 /// 两条独立断言，缺一不可：
 /// - 阶梯本身——消费方靠它显示「现在在干什么」，段位缺了或顺序错了，进度就在骗人；
-/// - `start` 那条的 `total` 已经是 6——表必须在发 `start` 之前换掉，晚一步消费方会看到
-///   1/5 接 2/6，进度当场回跳。
+/// - `start` 那条的 `total` 已经是 7——表必须在发 `start` 之前换掉，晚一步消费方会看到
+///   1/6 接 2/7，进度当场回跳。
 #[test]
-fn a_force_sync_reports_the_six_stage_ladder() {
+fn a_force_sync_reports_the_seven_stage_ladder() {
     let Some(sandbox) = support::sandbox_or_skip() else {
         return;
     };
@@ -918,10 +919,11 @@ fn a_force_sync_reports_the_six_stage_ladder() {
         .collect();
 
     for record in &progress {
-        assert_eq!(record["total"], 6, "force 表的 total 恒为 6：{record}");
+        assert_eq!(record["total"], 7, "force 表的 total 恒为 7：{record}");
     }
 
-    // `digest` 只在「目标版本没变」的候选上出现，是否出现取决于种子；主干各段必须齐。
+    // `digest` 只在「目标版本没变」的候选上出现，`untracked` 只在删除档出现；是否出现
+    // 取决于种子与开关。主干各段必须齐。
     for phase in ["start", "scan", "analyze", "apply", "done"] {
         assert!(phases.contains(&phase), "缺了 {phase} 段：{phases:?}");
     }
@@ -939,7 +941,7 @@ fn a_force_sync_reports_the_six_stage_ladder() {
     assert!(step("scan") < step("analyze"), "{phases:?}");
     assert!(step("analyze") < step("apply"), "{phases:?}");
     assert!(step("apply") < step("done"), "{phases:?}");
-    assert_eq!(step("done"), 6, "{phases:?}");
+    assert_eq!(step("done"), 7, "{phases:?}");
 
     // step 单调不回跳——回跳的进度条比没有进度条更难读。
     let steps: Vec<u64> = progress
@@ -947,4 +949,77 @@ fn a_force_sync_reports_the_six_stage_ladder() {
         .map(|record| record["step"].as_u64().expect("step 必须是整数"))
         .collect();
     assert!(steps.windows(2).all(|pair| pair[0] < pair[1]), "{steps:?}");
+}
+
+/// 启用 `--delete-untracked` 时，`untracked` 段必须出现在 `analyze` 与 `digest`/`apply`
+/// 之间，且同一段里可以有多条消息（过滤、映射、核对）——step 相等不是回跳。
+///
+/// 这一段是删除档最贵的部分；没有它，长跑里的进度会停在 `analyze` 不动，用户分不清
+/// 是卡在候选保护还是已经进入应用阶段。
+#[test]
+fn a_force_sync_with_untracked_deletion_reports_the_untracked_stage() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox.write("junk.log", "not in the depot\n");
+    sandbox.write("readme.txt", "locally changed\n");
+
+    let run = run_json(
+        &sandbox,
+        &["--sync", "--force", "--delete-untracked", "-l", "."],
+    );
+    assert!(run.ok, "{}", run.stderr);
+
+    let progress = run.progress();
+    let phases: Vec<&str> = progress
+        .iter()
+        .map(|record| record["phase"].as_str().expect("phase 必须是字符串"))
+        .collect();
+
+    for record in &progress {
+        assert_eq!(record["total"], 7, "force 表的 total 恒为 7：{record}");
+    }
+    assert!(
+        phases.contains(&"untracked"),
+        "删除档必须报 untracked 段：{phases:?}"
+    );
+    assert!(
+        phases.contains(&"apply"),
+        "预演也要走到 apply 段：{phases:?}"
+    );
+
+    let index = |phase: &str| -> usize {
+        phases
+            .iter()
+            .position(|candidate| *candidate == phase)
+            .unwrap_or_else(|| panic!("没有 {phase} 段：{phases:?}"))
+    };
+    let step = |phase: &str| -> u64 {
+        progress
+            .iter()
+            .find(|record| record["phase"] == phase)
+            .unwrap_or_else(|| panic!("没有 {phase} 段：{phases:?}"))["step"]
+            .as_u64()
+            .expect("step 必须是整数")
+    };
+    assert!(
+        index("analyze") < index("untracked"),
+        "untracked 必须在 analyze 之后：{phases:?}"
+    );
+    assert!(
+        index("untracked") < index("apply"),
+        "untracked 必须在 apply 之前：{phases:?}"
+    );
+    assert!(
+        step("analyze") < step("untracked") && step("untracked") < step("apply"),
+        "段位必须递增：{phases:?}"
+    );
+
+    // 同一段的多条消息共享 step；整个阶梯只允许不回跳。
+    let steps: Vec<u64> = progress
+        .iter()
+        .map(|record| record["step"].as_u64().expect("step 必须是整数"))
+        .collect();
+    assert!(steps.windows(2).all(|pair| pair[0] <= pair[1]), "{steps:?}");
 }

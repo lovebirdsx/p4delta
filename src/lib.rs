@@ -205,7 +205,7 @@ fn run_once(options: &mut Options) -> Result<()> {
     };
 
     // 强制修复走 reconcile 管线，阶段表要在 `start` 之前定下来——晚一步，`start` 会按默认
-    // 表读成 1/5，与随后的 2/6 对不上。
+    // 表读成 1/5，与随后的 2/7 对不上。
     if options.sync && options.force {
         json::set_phases(&reconcile::SYNC_FORCE_PHASES);
     }

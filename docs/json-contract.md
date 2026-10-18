@@ -309,9 +309,12 @@ open 模式的**预演**额外把原生 `p4 reconcile -n -Mj -Ztag` 的记录逐
 
 - 默认（open / clean 的 reconcile 管线）：`start` `analyze` `digest` `report` `done`（`total:5`）
 - 普通同步（`--sync` 不带 `--force`）：`start` `preview` `filter` `apply` `done`（`total:5`）
-- 强制修复（`--sync --force`，同样走 reconcile 管线）：`start` `scan` `analyze` `digest`
-  `apply` `done`（`total:6`）。比默认表多一段 `scan`——查询四路与工作区扫描都在这一段，
-  一次宽拉取里占掉大半时间，只报 `start` 会一直停在原地。
+- 强制修复（`--sync --force`，同样走 reconcile 管线）：`start` `scan` `analyze` `untracked`
+  `digest` `apply` `done`（`total:7`）。比默认表多一段 `scan`——查询四路与工作区扫描都在
+  这一段，一次宽拉取里占掉大半时间，只报 `start` 会一直停在原地；`untracked` 是
+  `--delete-untracked` 的候选保护，未启用时整段跳过，但编号不变。该段内会依次发
+  「过滤忽略规则」「映射 client view」「与 depot 记录核对」多条 `message`，它们共享同一个
+  `step`（相等不是回跳）。
 
 表定的是**顺序与编号**，不是「每段必到」：中间任意段都可能整段跳过，消费方按收到的最后一条
 为准。两条已知的跳法：`digest` 在 mtime 捷径全部命中时没有摘要要算（`step` 从 `analyze` 直接
@@ -420,9 +423,12 @@ view 不受它影响。
   summary 的 `conflicts`。全部文件都被拒时 `total` 是 0、`conflicts>0` 而 `ok` 仍是 `true`——
   「没有动作」在这里是结论，不是失败；消费方只读结构化记录，并用 `conflicts` 与记录条数对账，
   缺席或条数不符即无结论，不回退 stderr 原文。
-- **`--delete-untracked` 的删除判据在 δ 这边**：候选是「`p4 where` 能映射进 client view、
-  `p4 fstat` 没有记录」的本地文件；`p4 where` / `p4 ignores` 查询失败即整轮失败，空 depot
-  记录也拒绝执行。这一档只删磁盘、不下发 `#none`（未跟踪路径没有 have 记录）。
+- **`--delete-untracked` 的删除判据在 δ 这边**：候选是「`p4 fstat` 没有记录、严格忽略规则
+  没有盖住、`p4 where` 能映射进 client view」的本地文件。顺序是先问忽略规则再映射：被忽略的
+  候选不进入 `p4 where`，全部被忽略时一个映射查询都不起。`p4 where` / `p4 ignores` 查询失败
+  即整轮失败，空 depot 记录也拒绝执行。与 depot 记录的二次核对走候选规模的 `HashSet` +
+  单趟记录扫描（O(D+U)），按原始 depot 字符串比较，不折叠大小写。这一档只删磁盘、不下发
+  `#none`（未跟踪路径没有 have 记录）。
 - **普通同步里「本地已删、have 还在」的删除落地**：目标处是删除版本、本地文件已经没了（外部
   工具删的）、have 记录还在时，原生预演只印一句 `#rev - deleted as <本地路径>` 作为 `info` 提示，
   正文记录一条都没有。δ 认这句话并把它归成删除候选（下发 `#none`，清掉 have），这一路的落地

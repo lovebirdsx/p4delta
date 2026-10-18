@@ -79,12 +79,21 @@ open 模式与 `--clean` 共用同一份缓存，两个方向互相加速。
   版本」，而 `.p4ignore` 拦不住 `p4 sync -f`——被规则盖着的**已入库**文件照旧按真实本地状态分析，
   所以逐文件过滤换来的结论在这条路上用不上：实测 429 万文件的工作区里，光是它就要 15,916 批
   `p4 ignores`（约 161 秒），而真正要传的只有 177 批。目录剪枝随之一并跳过（它是为省过滤查询量而存在
-  的）。唯一还需要问一次的是 `Delete` 组的**候选**（`src/reconcile/sync.rs::protect_delete_candidates`）：
-  删除不可逆，而 `p4 sync -f` 自己不看 `.p4ignore`，不查这一下就会删掉用户特意放在那儿、还没入库的
-  东西；失败或输出认不出来时整轮停下，不删（fail-closed）。Windows 上非 ASCII 的候选按静态判定
-  不交给这项查询，那批改走 `p4 ignores -i -v` 并**逐字核对回显**：回显对不上请求（命令行表示不了
-  那个名字时就是这样）同样整轮停下，不退回 `p4 add -n`——那条途径对已跟踪的路径根本给不出裁决。
-  open / clean 不受影响，仍逐文件过滤。
+  的）。只有两类**删除候选**还需要问严格忽略裁决：`Delete` 组由
+  `src/reconcile/sync.rs::protect_delete_candidates` 处理，`--delete-untracked` 由
+  `discover_untracked` 处理。删除不可逆，而 `p4 sync -f` 自己不看 `.p4ignore`，不查这一下就会删掉
+  用户特意放在那儿、还没入库的东西；失败或输出认不出来时整轮停下，不删（fail-closed）。
+  `--delete-untracked` 的查询顺序是**先忽略规则、后 `p4 where`**：被规则盖住的候选不进入映射查询，
+  全部被忽略时一个 `where` 都不起。Windows 上非 ASCII 的候选按静态判定不交给命令行查询，那批改走
+  `p4 ignores -i -v` 并**逐字核对回显**：回显对不上请求（命令行表示不了那个名字时就是这样）同样
+  整轮停下，不退回 `p4 add -n`——那条途径对已跟踪的路径根本给不出裁决。open / clean 不受影响，
+  仍逐文件过滤。
+- **未跟踪候选的 depot 核对是线性的**（`src/reconcile/sync.rs::cross_check_untracked`）：把映射出的
+  原始 depot 路径收进候选规模的 `HashSet`，单趟扫过 depot 记录剔除已跟踪项，再按映射原顺序筛选。
+  复杂度 O(D+U)、额外空间 O(U)。旧实现对每个候选线性 `any()` 一遍全部记录，在 578 万条记录、
+  数千候选时是 O(U×D)。路径按原始字符串比较，不做大小写折叠。`[diag]` 里 `untracked-ignores`、
+  `untracked-where`、`untracked-cross-check` 分别计时，`untracked-protection` 从候选准备开始汇总；
+  零候选、全过滤、全部已跟踪的早退也输出汇总，映射查询与本地 CPU 核对不合并归因给 `p4 where`。
 - **`p4 where` 只对判定为新增的文件查**（`src/workspace.rs::filter_unmapped_paths`），用来剔除被 client view
   排除行覆盖的路径。注释写明了原因：对全部工作区文件做这件事，在几十万文件的目录上会变成灾难。
 - **路径参数走 stdin 批处理**：`p4 -x - -b N`，一批一个进程（`src/p4/process.rs`）。这最初是为绕开

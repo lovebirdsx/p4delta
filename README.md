@@ -252,9 +252,10 @@ p4delta -w "your-workspace" -l --no-prune-ignored-dirs "E:\project\src"
 **强制修复（`--sync --force`）不做忽略过滤，也不做目录剪枝**：这一步的成本跟着工作区大小走
 （实测 429 万文件的工作区里，`p4 ignores` 分批查询占 15,916 批、约 161 秒，而真正要传的只有
 177 批），而它换来的结论在强制修复下用不上——`.p4ignore` 拦不住 `p4 sync -f`，被规则盖着的
-**已入库**文件照旧要按真实本地状态参与分析。因此这条模式下每个文件都不再被忽略过滤，唯一还需要
-问一次的是 `Delete` 组的候选（防止删掉用户自己放在那儿、还没入库的东西）——那是删除候选的数量，
-与工作区大小无关；查询失败或输出不可靠时整轮停下，不删。
+**已入库**文件照旧要按真实本地状态参与分析。因此这条模式下每个文件都不再被忽略过滤，只有
+删除候选还需要严格忽略裁决：`Delete` 组（防止删掉用户自己放在那儿、还没入库的东西）与
+`--delete-untracked`（见下文）各问一次，范围都是删除候选的数量，与工作区大小无关；查询失败
+或输出不可靠时整轮停下，不删。
 
 Windows 上，静态判定不敢交给 p4 命令行的非 ASCII 删除候选改用 `p4 ignores -i -v` 逐条问——
 它没有别的通道（`p4 ignores` 不认 stdin），所以工具改为**逐字核对 p4 回显的路径**：回显与请求
@@ -495,13 +496,18 @@ being changed`），路径埋在文本里、正文记录一条都没有，工具
 `--delete-untracked` 把第一条分水岭也翻过去，但只在显式 opt-in 时生效：它必须与
 `--sync --force` 同时给出，单独出现是用法错误。
 
-候选是「client view 能映射、depot 里没有任何记录」的本地文件。已打开的文件（含 open for
-add）在 `p4 fstat` 里有 action 记录，不算未跟踪。删除前的两道保护都是 fail-closed：
+候选是「depot 里没有任何记录」的本地文件。已打开的文件（含 open for add）在 `p4 fstat`
+里有 action 记录，不算未跟踪。删除前的判定顺序是**先忽略规则、再映射 view、最后核对
+depot 记录**：
 
-- `p4 where` 失败即整轮停下（失败不能被读成「没有映射」）；view 之外的文件不删，报告
-  `Skipped N untracked candidate(s) outside the client view`。
-- 对剩余候选逐条查 `p4 ignores -i -v`；被 `.p4ignore` 覆盖的文件**保留**并报告
-  `Kept N p4ignore-protected untracked file(s).`，查询失败/裁决不完整同样整轮停下。
+- 先对全部候选查 `p4 ignores -i`；被 `.p4ignore` 覆盖的文件**保留**并报告
+  `Kept N p4ignore-protected untracked file(s).`。Windows 上交不到命令行上的非 ASCII
+  名字改走逐字核对的 `p4 ignores -i -v`；查询失败/裁决不完整即整轮停下。被忽略的候选
+  不再进入映射查询，全部被忽略时一次 `p4 where` 都不起。
+- 对剩余候选查 `p4 where`：失败即整轮停下（失败不能被读成「没有映射」）；view 之外的
+  文件不删，报告 `Skipped N untracked candidate(s) outside the client view`。
+- 最后把映射出的原始 depot 路径与 depot 记录核对，已有记录的路径不算未跟踪。比较按原始
+  字符串（服务端路径身份），不做大小写折叠。
 - depot 记录为空时拒绝执行：这时分不清「本地全部未跟踪」与「范围或映射坏了」，照着前者
   做就是删光工作区。
 

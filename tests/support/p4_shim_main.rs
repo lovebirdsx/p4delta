@@ -11,7 +11,7 @@
 //! 「p4 起来了、退出码 0，但输出没有可用裁决」这一类最危险的失败形态——正是删除保护必须
 //! 稳住的那些。
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 fn main() {
@@ -19,6 +19,19 @@ fn main() {
         .skip(1)
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
+
+    // `p4 where` / `p4 sync` 用 `-x -` 把路径放 stdin，参数日志里看不到。需要核对「哪些
+    // 候选真的交给了 where」的用例打开这个开关，把 stdin 也按行记进同一份日志。
+    let capture_stdin = std::env::var_os("P4DELTA_SHIM_LOG_STDIN").is_some();
+    let stdin_data = if capture_stdin {
+        let mut data = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut data)
+            .expect("the p4 shim must read its stdin");
+        data
+    } else {
+        Vec::new()
+    };
 
     if let Some(log) = std::env::var_os("P4DELTA_SHIM_LOG") {
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -28,6 +41,15 @@ fn main() {
         {
             // 整行一次追加，避免并发进程把正文与换行交错写入。
             let _ = file.write_all(format!("{}\n", args.join(" ")).as_bytes());
+            if capture_stdin {
+                for line in stdin_data.split(|byte| *byte == b'\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let text = String::from_utf8_lossy(line);
+                    let _ = file.write_all(format!("stdin {text}\n").as_bytes());
+                }
+            }
         }
     }
 
@@ -40,19 +62,35 @@ fn main() {
             eprint!("{}", std::env::var("P4DELTA_SHIM_FAULT_STDERR").unwrap_or_default());
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
-            std::process::exit(0);
+            let code = std::env::var("P4DELTA_SHIM_FAULT_EXIT")
+                .ok()
+                .and_then(|code| code.parse().ok())
+                .unwrap_or(0);
+            std::process::exit(code);
         }
     }
 
     let real =
         std::env::var_os("P4DELTA_SHIM_REAL_P4").expect("the p4 shim needs P4DELTA_SHIM_REAL_P4");
-    let status = Command::new(real)
+    let mut command = Command::new(real);
+    command
         .args(std::env::args_os().skip(1))
-        .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stderr(Stdio::inherit());
+    if capture_stdin {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::inherit());
+    }
+    let mut child = command
+        .spawn()
         .expect("the p4 shim must forward to the real p4");
+    if capture_stdin {
+        let mut pipe = child.stdin.take().expect("stdin was piped");
+        pipe.write_all(&stdin_data)
+            .expect("the p4 shim must forward stdin");
+    }
+    let status = child.wait().expect("the p4 shim must wait for the real p4");
 
     std::process::exit(status.code().unwrap_or(1));
 }

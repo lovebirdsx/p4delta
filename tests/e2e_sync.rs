@@ -225,6 +225,404 @@ fn an_untracked_file_outside_the_client_view_is_never_deleted() {
     assert!(!sandbox.exists("junk.log"), "view 之内的照删");
 }
 
+/// 窄 include view：只映射一个子目录，client root 下还有未映射的 ASCII 与非 ASCII 文件。
+///
+/// 严格忽略查询在映射之前跑，必须对两类未映射候选都给出成功裁决（而不是因为 `p4 where`
+/// 映射不到就失败关闭）；随后 view 外的文件保留，view 内的未跟踪文件删除。默认种子在
+/// `src/` 下有已跟踪文件，窄 view 之后 depot 记录仍非空。
+#[test]
+fn narrow_include_view_untracked_candidates_still_pass_the_ignore_query() {
+    const UNMAPPED_ASCII: &str = "root-extra.txt";
+    const UNMAPPED_NON_ASCII: &str = "根目录说明.txt";
+    const VIEWED_JUNK: &str = "src/junk.log";
+
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        return;
+    };
+    #[cfg(windows)]
+    if !non_ascii_argv_available(&sandbox) {
+        return;
+    }
+
+    let client = sandbox.client().to_owned();
+    sandbox.set_client_view(&[format!("//depot/main/src/... //{client}/src/...")]);
+
+    sandbox.write(UNMAPPED_ASCII, "outside the view\n");
+    sandbox.write(UNMAPPED_NON_ASCII, "outside the view too\n");
+    sandbox.write(VIEWED_JUNK, "inside the view\n");
+
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+
+    sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_LOG_STDIN", "1")
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "--delete-untracked", "-a"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Deleting 1 untracked files from the workspace.",
+        ));
+
+    let calls = shim_calls(&log);
+    let ignores = shim_call_with(&calls, "ignores");
+    assert!(!ignores.is_empty(), "严格忽略查询必须先执行：{calls:?}");
+    let ignores_log = ignores
+        .iter()
+        .map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        ignores_log.contains(UNMAPPED_ASCII),
+        "未映射的 ASCII 候选也要拿到忽略裁决：{ignores_log}"
+    );
+    assert!(
+        ignores_log.contains(UNMAPPED_NON_ASCII),
+        "未映射的非 ASCII 候选也要拿到忽略裁决：{ignores_log}"
+    );
+
+    let where_stdin = shim_stdin_for(&calls, "where");
+    assert!(
+        where_stdin.iter().any(|line| line.contains(UNMAPPED_ASCII)),
+        "未映射的 ASCII 候选仍要交给 where：{where_stdin:?}"
+    );
+    assert!(
+        where_stdin
+            .iter()
+            .any(|line| line.contains(UNMAPPED_NON_ASCII)),
+        "未映射的非 ASCII 候选仍要交给 where：{where_stdin:?}"
+    );
+
+    let position = |command: &str| {
+        calls
+            .iter()
+            .position(|line| line.split_whitespace().any(|token| token == command))
+    };
+    assert!(
+        matches!(
+            (position("ignores"), position("where")),
+            (Some(ignores), Some(where_)) if ignores < where_
+        ),
+        "忽略裁决必须排在映射之前：{calls:?}"
+    );
+
+    assert!(
+        sandbox.exists(UNMAPPED_ASCII),
+        "view 外的 ASCII 文件不该被删"
+    );
+    assert!(
+        sandbox.exists(UNMAPPED_NON_ASCII),
+        "view 外的非 ASCII 文件不该被删"
+    );
+    assert!(!sandbox.exists(VIEWED_JUNK), "view 内的未跟踪文件照删");
+    assert!(sandbox.exists("src/lib.txt"), "view 内的已跟踪文件保留");
+    // view 之外的**已跟踪**副本仍会按强制同步的目标分析处理（那是既有的 target 缺失
+    // 行为，不是删除档），本用例只钉未跟踪候选的边界。
+}
+
+/// 提前跑严格忽略查询：被规则盖住的候选不该再交给 `p4 where`。
+///
+/// 判据走 shim 的 stdin 日志（`p4 where` 用 `-x -` 传路径，命令行上看不到）。这一轮是
+/// 预演，不会起 `p4 sync`，所以日志里的 stdin 行只可能来自 `p4 where`。
+#[test]
+fn untracked_candidates_are_screened_by_ignore_rules_before_mapping() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        return;
+    };
+
+    // 规则文件自己也入库：否则它会作为一条未跟踪文件进入候选。
+    sandbox.commit(".p4ignore", "*.tmp\n");
+    sandbox.write("cache.tmp", "ignored build output\n");
+    sandbox.write("junk.log", "plain untracked file\n");
+    let probe = sandbox.p4_ok(&["ignores", "-i", "cache.tmp"]);
+    assert!(
+        probe.contains(" ignored"),
+        "前提不成立：规则没盖住 cache.tmp：{probe}"
+    );
+
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+
+    sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_LOG_STDIN", "1")
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "--delete-untracked", "-l"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Kept 1 p4ignore-protected untracked file(s).",
+        ))
+        .stdout(predicate::str::contains(
+            "Deleting 1 untracked files from the workspace.",
+        ));
+
+    let calls = shim_calls(&log);
+    let ignores = shim_call_with(&calls, "ignores");
+    assert_eq!(ignores.len(), 1, "两个候选该合成一批：{calls:?}");
+    assert!(
+        ignores[0].contains("cache.tmp") && ignores[0].contains("junk.log"),
+        "忽略查询该看到全部候选：{:?}",
+        ignores[0]
+    );
+
+    let stdin_lines = shim_stdin_for(&calls, "where");
+    assert!(
+        stdin_lines.iter().any(|line| line.contains("junk.log")),
+        "没被忽略的候选仍要交给 where：{stdin_lines:?}"
+    );
+    assert!(
+        stdin_lines.iter().all(|line| !line.contains("cache.tmp")),
+        "被忽略的候选不该再起 where：{stdin_lines:?}"
+    );
+}
+
+/// 全部候选都被忽略时，`p4 where` 一次都不该起。
+#[test]
+fn all_ignored_untracked_candidates_skip_the_mapping_query() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        return;
+    };
+
+    sandbox.commit(".p4ignore", "*.tmp\n");
+    sandbox.write("cache.tmp", "ignored build output\n");
+
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+
+    let output = sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_LOG_STDIN", "1")
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "--delete-untracked", "-l"])
+        .arg(".")
+        .output()
+        .expect("run the tool");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Kept 1 p4ignore-protected untracked file(s)."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("[diag] untracked-protection: 1 untracked candidate(s)"),
+        "全过滤的早退也要有保护汇总：{stdout}"
+    );
+
+    let calls = shim_calls(&log);
+    let where_calls = shim_call_with(&calls, "where");
+    assert!(
+        where_calls.is_empty(),
+        "全部被忽略时不必问 where：{calls:?}"
+    );
+    assert!(
+        shim_stdin_for(&calls, "where").is_empty(),
+        "没有可映射的候选，不该有 where 的 stdin 批次：{calls:?}"
+    );
+    assert!(sandbox.exists("cache.tmp"), "被忽略的文件不该被删");
+}
+
+/// 零候选的早退同样要输出保护汇总——否则删除档看起来像「没跑过」。
+#[test]
+fn a_force_sync_without_untracked_candidates_still_reports_the_protection_summary() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "--delete-untracked", "-l"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[diag] untracked-protection: 0 untracked candidate(s)",
+        ));
+}
+
+/// client view 之外的候选也要先过严格忽略查询：查询本身不能因为「p4 不给它映射」而失败。
+/// 这一条同时钉住正常行为不被提前查询改变——view 外的照旧保留，view 内的照旧删除。
+#[test]
+fn untracked_candidates_outside_the_client_view_survive_the_earlier_ignore_query() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        return;
+    };
+
+    let client = sandbox.client().to_owned();
+    sandbox.set_client_view(&[
+        format!("//depot/main/... //{client}/..."),
+        format!("-//depot/main/tmp/... //{client}/tmp/..."),
+    ]);
+
+    sandbox.write("tmp/scratch.txt", "outside the view\n");
+    sandbox.write("junk.log", "inside the view\n");
+
+    let log = sandbox.instance_dir().join("p4-shim.log");
+    let _ = std::fs::remove_file(&log);
+
+    sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_LOG", &log)
+        .env("P4DELTA_SHIM_LOG_STDIN", "1")
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "--delete-untracked", "-a"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Skipped 1 untracked candidate(s) outside the client view (1 excluded by the view).",
+        ))
+        .stdout(predicate::str::contains(
+            "Deleting 1 untracked files from the workspace.",
+        ));
+
+    let calls = shim_calls(&log);
+    let ignores = shim_call_with(&calls, "ignores");
+    assert_eq!(ignores.len(), 1, "两个候选该合成一批：{calls:?}");
+    assert!(
+        ignores[0].contains("scratch.txt") && ignores[0].contains("junk.log"),
+        "view 外的候选也要先拿到忽略裁决：{:?}",
+        ignores[0]
+    );
+
+    assert!(sandbox.exists("tmp/scratch.txt"), "view 之外的文件不该被删");
+    assert_eq!(sandbox.read("tmp/scratch.txt"), "outside the view\n");
+    assert!(!sandbox.exists("junk.log"), "view 之内的照删");
+}
+
+/// 忽略裁决不可用时整轮中止，未跟踪删除也不例外（fail-closed，绝不把失败读成空集合）。
+#[test]
+fn an_unusable_ignores_verdict_stops_untracked_deletion() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        return;
+    };
+
+    sandbox.commit(".p4ignore", "*.tmp\n");
+    sandbox.write("junk.log", "plain untracked file\n");
+
+    let output = sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_FAULT_COMMAND", "ignores")
+        .env(
+            "P4DELTA_SHIM_FAULT_STDERR",
+            "Error: unable to read the ignore file.\n",
+        )
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "--delete-untracked", "-a"])
+        .arg(".")
+        .output()
+        .expect("run the tool");
+
+    assert!(
+        !output.status.success(),
+        "拿不到可靠的忽略裁决就必须停下：{output:?}"
+    );
+    assert!(sandbox.exists("junk.log"), "失败的一轮一个文件都不许动");
+}
+
+/// `p4 where` 失败同样整轮中止：把失败读成「没有映射」只会少删，但把失败读成「映射为空」
+/// 再结合其它判据就可能删错。严格口径要的是「不猜」。
+#[test]
+fn a_failed_where_query_stops_untracked_deletion() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    let Some(shim) = support::P4Shim::build() else {
+        return;
+    };
+
+    sandbox.write("junk.log", "plain untracked file\n");
+
+    let output = sandbox
+        .cli()
+        .env("P4_EXE", &shim.path)
+        .env("P4DELTA_SHIM_FAULT_COMMAND", "where")
+        .env("P4DELTA_SHIM_FAULT_EXIT", "1")
+        .env(
+            "P4DELTA_SHIM_FAULT_STDERR",
+            "Error: cannot query the view.\n",
+        )
+        .env("P4DELTA_SHIM_REAL_P4", sandbox.p4_exe())
+        .args(["--sync", "--force", "--delete-untracked", "-a"])
+        .arg(".")
+        .output()
+        .expect("run the tool");
+
+    assert!(
+        !output.status.success(),
+        "where 失败必须中止整轮：{output:?}"
+    );
+    assert!(sandbox.exists("junk.log"), "失败的一轮一个文件都不许动");
+}
+
+/// Windows 上非 ASCII 的未跟踪候选走 `p4 ignores -i -v` 逐字裁决；提前查询不能把成功路径
+/// 变成 fail-closed——被规则盖着的留下，没盖着的照删。
+#[cfg(windows)]
+#[test]
+fn a_non_ascii_untracked_candidate_is_judged_by_the_verbatim_ignores_query() {
+    const KEPT: &str = "中文目录/保留的.tmp";
+    const DELETED: &str = "中文目录/删除的.txt";
+
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    if !non_ascii_argv_available(&sandbox) {
+        return;
+    }
+
+    sandbox.commit(".p4ignore", "*.tmp\n");
+    sandbox.write(KEPT, "ignored build output\n");
+    sandbox.write(DELETED, "plain untracked file\n");
+
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "--delete-untracked", "-a"])
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Kept 1 p4ignore-protected untracked file(s).",
+        ))
+        .stdout(predicate::str::contains(
+            "Deleting 1 untracked files from the workspace.",
+        ));
+
+    assert!(sandbox.exists(KEPT), "被忽略的候选不该被删");
+    assert_eq!(sandbox.read(KEPT), "ignored build output\n");
+    assert!(!sandbox.exists(DELETED), "没被规则盖住，照删");
+}
+
 /// 空 depot 记录 fail-closed：这时「全部本地文件都未跟踪」与「范围/client 映射坏了」
 /// 在数据上分不出来，照前者执行就是删光工作区。
 #[test]
@@ -1439,7 +1837,6 @@ fn non_ascii_argv_available(sandbox: &support::Sandbox) -> bool {
 }
 
 /// 从 shim 的调用日志读出这一轮起过的 p4 进程（见 `tests/support/p4shim.rs`）。
-#[cfg(windows)]
 fn shim_calls(log: &std::path::Path) -> Vec<String> {
     std::fs::read_to_string(log)
         .unwrap_or_default()
@@ -1449,12 +1846,28 @@ fn shim_calls(log: &std::path::Path) -> Vec<String> {
 }
 
 /// 日志里调用了这个命令的那些行。p4 的全局选项会排在命令名前面，所以按 token 比。
-#[cfg(windows)]
 fn shim_call_with<'a>(calls: &'a [String], command: &str) -> Vec<&'a String> {
     calls
         .iter()
         .filter(|line| line.split_whitespace().any(|token| token == command))
         .collect()
+}
+
+/// 某次命令启动时经 stdin 喂进去的路径。日志格式是「一行启动参数，随后若干行 `stdin …`」，
+/// 所以从命中命令的那一行开始收集，直到下一次启动行为止。
+fn shim_stdin_for<'a>(calls: &'a [String], command: &str) -> Vec<&'a String> {
+    let mut collected = Vec::new();
+    let mut in_command = false;
+    for line in calls {
+        if line.starts_with("stdin ") {
+            if in_command {
+                collected.push(line);
+            }
+            continue;
+        }
+        in_command = line.split_whitespace().any(|token| token == command);
+    }
+    collected
 }
 
 /// 把一批路径从 depot 删掉并提交，再把 have 拉回 #1：得到「head 说删了、本地还有一份」的
