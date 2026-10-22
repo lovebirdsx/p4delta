@@ -29,7 +29,7 @@ use crate::json::{P4Command, sayln};
 use crate::p4::process::{FailureMode, run_p4_command_slice};
 use crate::path::{
     canonical_local_path, directory_key, escape_file_spec, local_path_key, normalize_local_path,
-    path_is_under_key, strip_depot_wildcard_suffix,
+    path_is_under_key, strip_depot_wildcard_suffix, strip_recursive_suffix_owned,
 };
 use crate::scope_config::{ConfigEntry, ScopeConfig, parse_scope_config};
 
@@ -61,6 +61,18 @@ pub(crate) struct ScopeEntry {
 
 impl ScopeEntry {
     pub(crate) fn new(path: String, kind: EntryKind) -> Self {
+        // 目录入口统一存**规范形式**：`...` 是 file spec 的后缀（[`Self::file_spec`] 会自己
+        // 补），不属于路径本身。位置参数在 `parse_target` 里已经剥过一次，但配置条目、
+        // 排除项与将来别的入口来源都必须在这里收敛——一侧带后缀、一侧不带，`path_is_under_key`
+        // 的前缀比较就认不出同一个目录，交集会静默缩水，后面的扫盘与 fstat 一条都匹配不到。
+        //
+        // 剥成根（`C:/...` → `C:\`、`/...` → `/`）时由被调用的辅助补回分隔符：`C:` 在
+        // Windows 上指的是「C 盘的当前目录」，不是盘根。
+        let path = match kind {
+            EntryKind::Directory => strip_recursive_suffix_owned(&path),
+            // 文件名的末尾 `...` 是文件名的一部分（Unix 上合法的名字），不动它。
+            EntryKind::File => path,
+        };
         let path_lower = local_path_key(&path);
         ScopeEntry {
             path,
@@ -548,14 +560,18 @@ fn parse_target(argument: &str) -> Option<RawTarget> {
         });
     }
 
-    // 先归一分隔符再剥后缀：用户可能写正斜杠，也可能写平台分隔符。
+    // 先归一分隔符再剥后缀：用户可能写正斜杠，也可能写平台分隔符。剥成盘根时
+    // （`C:/...`、`/...`）要把分隔符补回来——`C:` 在 Windows 路径 API 里是「C 盘的
+    // 当前目录」，继续往下算会让「整个盘」悄悄变成另一个位置。
     let normalized = normalize_local_path(argument);
-    let stripped = strip_depot_wildcard_suffix(&normalized);
+    let explicit_dir = strip_depot_wildcard_suffix(&normalized).len() != normalized.len();
+    let path = if explicit_dir {
+        strip_recursive_suffix_owned(&normalized)
+    } else {
+        normalized.into_owned()
+    };
 
-    Some(RawTarget {
-        explicit_dir: stripped.len() != normalized.len(),
-        path: stripped.to_owned(),
-    })
+    Some(RawTarget { explicit_dir, path })
 }
 
 /// 判定目标在本地是目录还是文件：本地存在就按本地类型（符号链接算文件，与扫盘口径一致）；
@@ -640,11 +656,11 @@ pub(crate) fn resolve_cli_excludes(options: &Options, client_root: &str) -> Vec<
             }
 
             let normalized = normalize_local_path(value);
-            let stripped: &str = strip_depot_wildcard_suffix(&normalized);
-            let path = if Path::new(stripped).is_absolute() {
-                canonical_local_path(stripped)
+            let stripped = strip_recursive_suffix_owned(&normalized);
+            let path = if Path::new(&stripped).is_absolute() {
+                canonical_local_path(&stripped)
             } else {
-                canonical_local_path(&Path::new(client_root).join(stripped).display().to_string())
+                canonical_local_path(&Path::new(client_root).join(&stripped).display().to_string())
             };
             entries.push(ScopeEntry::new(path, kind));
         }
@@ -884,6 +900,54 @@ pub(crate) fn combine_scope(
         );
     }
 
+    // 若干条目标**整条**落在最终范围之外时失败关闭：它们不会贡献任何一条文件，后面照常
+    // 跑完还可能报「已是最新」，等于这一轮实际处理的范围比参数说的更小。判据是「最终入口
+    // 里有没有一条与这条目标相交」，不是比条数——重叠入口本来就该合并（`a` 与 `a/b` 只留
+    // `a`），按条数比会把正常的合并误报成缩水。
+    //
+    // 范围比某条目标更窄（目录目标与配置里的子目录求交，甚至只命中配置里的一个文件）是正常
+    // 求交，不算落空：这里只拦「整条目标一条文件都不剩」。
+    //
+    // 显式排除掉的目标不算缩水：exclude 永远优先是用户明示的规则，不是这一轮悄悄改小的
+    // 范围（真被排到一条不剩时，上面那条「do not overlap」会连排除项一起列出来）。
+    if !targets.is_empty() {
+        let dropped: Vec<ScopeEntry> = targets
+            .iter()
+            .filter(|target| !excludes.excludes_key(&target.path_lower))
+            .filter(|target| {
+                !includes
+                    .iter()
+                    .any(|include| intersect_entry(include, target).is_some())
+            })
+            .cloned()
+            .collect();
+
+        if !dropped.is_empty() {
+            let scope_name = scope_file
+                .map(|file| file.path.clone())
+                .unwrap_or_else(|| "no scope file".to_owned());
+            let scope_shape = config
+                .map(ScopeConfig::describe)
+                .unwrap_or_else(|| "no scope file".to_owned());
+            let excluded = if excludes.declared_len() > 0 {
+                format!("\n  excluded: {}", excludes.describe())
+            } else {
+                String::new()
+            };
+
+            bail!(
+                "Refusing to run: the scope would drop {} of the {} given paths (they fall \
+                 outside it), so the run would cover a smaller range than the arguments name. \
+                 Fix the paths, or widen the scope.{excluded}\n  dropped: {}\n  \
+                 scope ({scope_name}): {scope_shape}\n  given: {}",
+                dropped.len(),
+                targets.len(),
+                describe_entries(&dropped),
+                describe_entries(targets)
+            );
+        }
+    }
+
     Ok((includes, excludes))
 }
 
@@ -945,6 +1009,21 @@ mod tests {
         entries.iter().map(|entry| entry.path.as_str()).collect()
     }
 
+    /// 位置参数 → 入口，走产线同一条本地路径管线（`parse_target` → `canonical_local_path`
+    /// → `classify_entry`）。depot 路径翻译那一步不在这里，这里的用例都用本地绝对路径。
+    fn cli_target(argument: &str) -> ScopeEntry {
+        let target = parse_target(argument).expect("非空目标");
+        let path = canonical_local_path(&target.path);
+        let kind = classify_entry(&path, target.explicit_dir);
+        ScopeEntry::new(path, kind)
+    }
+
+    /// 平台形状的绝对路径，写成编辑器传参时的正斜杠形式：Windows 上 `C:\ws\src` →
+    /// `C:/ws/src`，Unix 原样（它本来就是 `/`）。
+    fn slash_path(parts: &[&str]) -> String {
+        ws_path(parts).replace('\\', "/")
+    }
+
     // ---- 命令行目标的解析 ----
 
     /// 每个 argv 就是一条目标：不按 `;` 拆，也不认 `-` 前缀那套排除 DSL。
@@ -978,6 +1057,31 @@ mod tests {
         let plain = parse_target("readme.txt").expect("有内容");
         assert!(!plain.explicit_dir);
         assert_eq!(plain.path, "readme.txt");
+    }
+
+    /// 后缀后面的尾分隔符（`dir/.../`）是同一种写法；剥到盘根时不能留下裸盘符，
+    /// 那在 Windows 上是「C 盘的当前目录」而不是盘根。
+    #[test]
+    fn wildcard_suffixes_with_a_trailing_separator_still_name_the_same_directory() {
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let target = parse_target(&format!("some-folder{sep}...{sep}")).expect("有内容");
+        assert!(target.explicit_dir);
+        assert_eq!(target.path, "some-folder");
+
+        if cfg!(windows) {
+            for argument in ["C:/...", "C:/.../", "C:\\...", "C:/...//"] {
+                let target = parse_target(argument).expect("有内容");
+                assert!(target.explicit_dir, "{argument}");
+                assert_eq!(target.path, "C:\\", "{argument}");
+            }
+        } else {
+            for argument in ["/...", "/.../", "/...//"] {
+                let target = parse_target(argument).expect("有内容");
+                assert!(target.explicit_dir, "{argument}");
+                assert_eq!(target.path, "/", "{argument}");
+            }
+        }
     }
 
     #[test]
@@ -1386,6 +1490,171 @@ mod tests {
             resolved,
             [ws_path(&[]), ws_path(&["a", "b"]), ws_path(&["readme.txt"])]
         );
+    }
+
+    // ---- 位置参数与配置的交集：子目录 ----
+
+    /// 目录入口统一存规范形式：任何来源带进来的递归后缀都在 `ScopeEntry::new` 这一处剥掉，
+    /// 否则一侧带 `...`、一侧不带，`path_is_under_key` 的前缀比较会把同一个目录判成两个。
+    /// 文件是另一回事——末尾的 `...` 在 Unix 上可能是真的文件名，不能动。
+    #[test]
+    fn directory_entries_never_store_the_recursive_suffix() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let with_suffix = format!("{}{sep}...", ws_path(&["a"]));
+
+        let directory = ScopeEntry::new(with_suffix.clone(), EntryKind::Directory);
+        assert_eq!(directory.path, ws_path(&["a"]));
+        assert_eq!(directory.path_lower, local_path_key(&ws_path(&["a"])));
+        assert_eq!(
+            directory.file_spec(),
+            format!("{}{sep}...", ws_path(&["a"])),
+            "后缀由 file_spec 补，入口里再存一份会变成 `.../...`"
+        );
+
+        let file = ScopeEntry::new(with_suffix.clone(), EntryKind::File);
+        assert_eq!(file.path, with_suffix);
+    }
+
+    /// 位置参数里的子目录与配置里的**同一个**目录必须相交。命令行那一侧可能带递归后缀
+    /// （编辑器就是这么传的），配置条目不带。
+    #[test]
+    fn a_positional_subdirectory_intersects_the_same_configured_subdirectory() {
+        let (includes, _) = combine(
+            Some(r#"{"include": [{"dir": "Source/Config"}]}"#),
+            &[cli_target(&format!(
+                "{}/...",
+                slash_path(&["Source", "Config"])
+            ))],
+            &[],
+        );
+
+        assert_eq!(paths(&includes), [ws_path(&["Source", "Config"])]);
+        assert_eq!(includes[0].kind, EntryKind::Directory);
+    }
+
+    /// 位置参数子目录收窄配置根：include 省略（整个 root）或写成目标的父目录时，
+    /// 交出来都该是那个子目录本身，而不是被剥成 root 或整条丢掉。
+    #[test]
+    fn a_positional_subdirectory_narrows_the_configured_root() {
+        let target = cli_target(&format!("{}/...", slash_path(&["Source", "Config"])));
+
+        let (includes, _) = combine(Some("{}"), std::slice::from_ref(&target), &[]);
+        assert_eq!(paths(&includes), [ws_path(&["Source", "Config"])]);
+
+        let (includes, _) = combine(
+            Some(r#"{"include": [{"dir": "Source"}]}"#),
+            std::slice::from_ref(&target),
+            &[],
+        );
+        assert_eq!(paths(&includes), [ws_path(&["Source", "Config"])]);
+    }
+
+    /// 位置参数与配置完全不相交：交集空掉，报错而不是静默成功。
+    #[test]
+    fn positional_targets_that_miss_the_configured_scope_are_an_error() {
+        let error = combine_scope(
+            ROOT,
+            Some(&config_of(r#"{"include": [{"dir": "src"}]}"#)),
+            &[cli_target(&format!("{}/...", slash_path(&["docs"])))],
+            true,
+            &[],
+        )
+        .expect_err("完全不相交必须报错")
+        .to_string();
+
+        assert!(error.contains("do not overlap"), "{error}");
+        assert!(error.contains("docs"), "{error}");
+    }
+
+    /// 只有**一部分**目标整条落在范围外才是错误：静默丢掉几条等于让这一轮的作用域比参数
+    /// 说的更小，而收尾还会报「已是最新」。文件目标也照此办理。
+    #[test]
+    fn a_partially_dropped_target_set_is_an_error() {
+        let kept = cli_target(&format!("{}/...", slash_path(&["src", "deep"])));
+        let dropped = cli_target(&format!("{}/readme.txt", slash_path(&["docs"])));
+
+        let error = combine_scope(
+            ROOT,
+            Some(&config_of(r#"{"include": [{"dir": "src"}]}"#)),
+            &[kept, dropped],
+            true,
+            &[],
+        )
+        .expect_err("部分目标被丢掉必须报错")
+        .to_string();
+
+        assert!(
+            error.contains("would drop 1 of the 2 given paths"),
+            "{error}"
+        );
+        assert!(error.contains("dropped: file"), "{error}");
+        assert!(error.contains(&ws_path(&["docs", "readme.txt"])), "{error}");
+    }
+
+    /// 范围比目标**更窄**不算落空：目录目标与配置里的文件求交，交出来的是一个文件——
+    /// 这一轮仍会处理这条目标里的东西。护栏只拦「整条目标一条文件都不剩」，否则
+    /// 「配置只关心这个目录里的某个文件」这种正常写法会被误报成缩水。
+    #[test]
+    fn a_directory_target_narrowed_to_a_configured_file_is_not_dropped() {
+        let target = cli_target(&format!("{}/...", slash_path(&["src"])));
+
+        let (includes, _) = combine(
+            Some(r#"{"include": [{"file": "src/readme.txt"}]}"#),
+            std::slice::from_ref(&target),
+            &[],
+        );
+
+        assert_eq!(paths(&includes), [ws_path(&["src", "readme.txt"])]);
+        assert_eq!(includes[0].kind, EntryKind::File);
+    }
+
+    /// 重叠入口的合并不是缩水：`a` 与 `a/b` 只留 `a`，但两条目标都被这一条覆盖。
+    /// 护栏按「有没有一条最终入口与它相交」判，而不是比条数。
+    #[test]
+    fn overlapping_targets_are_not_mistaken_for_dropped_ones() {
+        let (includes, _) = combine(
+            Some("{}"),
+            &[
+                cli_target(&format!("{}/...", slash_path(&["src"]))),
+                cli_target(&format!("{}/...", slash_path(&["src", "deep"]))),
+            ],
+            &[],
+        );
+
+        assert_eq!(paths(&includes), [ws_path(&["src"])]);
+    }
+
+    /// 显式排除掉的目标不算「静默缩水」：exclude 永远优先是用户明示的规则，其余入口照常
+    /// 处理；护栏只拦非排除原因造成的丢失。
+    #[test]
+    fn a_target_removed_by_an_explicit_exclusion_is_not_a_scope_shrink() {
+        let (includes, _) = combine(
+            Some(r#"{"include": [{"dir": "src"}], "exclude": [{"dir": "src/gen"}]}"#),
+            &[
+                cli_target(&format!("{}/...", slash_path(&["src"]))),
+                cli_target(&format!("{}/...", slash_path(&["src", "gen"]))),
+            ],
+            &[],
+        );
+
+        assert_eq!(paths(&includes), [ws_path(&["src"])]);
+    }
+
+    /// 文件型位置参数不受目录规范化影响：配置目录之下的文件入口仍是文件，交集结果就是
+    /// 那个文件本身，`file_spec` 也不会被追加 `...`。
+    #[test]
+    fn a_file_target_inside_the_configured_directory_stays_a_file() {
+        let target = cli_target(&format!("{}/lib.txt", slash_path(&["src"])));
+
+        let (includes, _) = combine(
+            Some(r#"{"include": [{"dir": "src"}]}"#),
+            std::slice::from_ref(&target),
+            &[],
+        );
+
+        assert_eq!(paths(&includes), [ws_path(&["src", "lib.txt"])]);
+        assert_eq!(includes[0].kind, EntryKind::File);
+        assert_eq!(includes[0].file_spec(), ws_path(&["src", "lib.txt"]));
     }
 
     // ---- 共享契约向量 ----

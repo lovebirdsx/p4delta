@@ -16,6 +16,8 @@
     "重复键（同一个对象里出现两次同一个键）报错，而不是让后一个盖掉前一个——否则一个手误就会把整份范围换掉。",
     "空文件、null、错容器类型、非法路径都报错，一律不当成缺省值。只有「文件不存在」（ENOENT）才是「没有配置」。",
     "求值：include = 配置 ∩ 目标；exclude = 配置 ∪ 命令行排除，且 exclude 无条件优先。目标被排除项整个盖住就是错误，绝不回退到整个 root。",
+    "目标有一部分整条落在最终范围之外（显式排除掉的除外）是错误：只处理剩下的等于悄悄缩小作用域。范围比目标更窄（目录目标与配置里的子目录或文件求交）不是这种情况。",
+    "目录目标末尾的递归后缀 ...（连同其后的尾分隔符）在比较前剥掉；剥成盘根时恢复成 C:\\ / /。文件目标原样保留。",
     "配置整个缺席时范围只由目标决定；没有配置也没有目标＝错误（绝不默认整个 root）。",
     "生效的配置文件自身是隐式的 file 排除：它既不属于 include 也不属于 exclude 的声明列表，但 scope 判定里必须覆盖不到它。",
     "目标一律与 client root 求交：root 的兄弟目录与 root 不相交（错误），而 root 的父目录包含 root，交出来仍然是 root（收窄成 root，不是错误）。",
@@ -509,6 +511,30 @@
       "config": "{\"exclude\": [{\"dir\": \"src/deep\"}]}",
       "targets": [{ "path": "src/deep", "kind": "directory" }],
       "expect": { "error": "do not overlap" }
+    },
+    {
+      "name": "a-partially-dropped-target-set-is-an-error",
+      "platform": "any",
+      "config": "{\"include\": [{\"dir\": \"src\"}]}",
+      "targets": [
+        { "path": "src/deep", "kind": "directory" },
+        { "path": "docs", "kind": "directory" }
+      ],
+      "expect": { "error": "would drop 1 of the 2 given paths" }
+    },
+    {
+      "name": "a-directory-target-narrowed-to-a-file-include-is-not-dropped",
+      "platform": "any",
+      "config": "{\"include\": [{\"file\": \"src/a.txt\"}]}",
+      "targets": [{ "path": "src", "kind": "directory" }],
+      "expect": {
+        "include": ["src/a.txt"],
+        "exclude": [],
+        "members": {
+          "src/a.txt": true,
+          "src/b.txt": false
+        }
+      }
     }
   ],
   "fileBytes": {

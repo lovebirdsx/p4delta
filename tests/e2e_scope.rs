@@ -153,6 +153,90 @@ fn the_scope_file_caps_the_given_paths() {
     assert!(opened[0].contains("lib.txt"), "{opened:?}");
 }
 
+/// 编辑器传的是**绝对路径 + `/...`**：配置里写同一个子目录时，两侧必须认成同一个入口。
+/// 递归后缀（以及它后面的尾分隔符）不属于路径本身，剥干净之前做前缀比较会让交集静默落空。
+#[test]
+fn an_absolute_subdirectory_target_matches_the_configured_subdirectory() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox.write(".p4delta-scope", r#"{"include": [{"dir": "src/deep"}]}"#);
+    sandbox.write("src/deep/a/b/c.txt", "changed deep\n");
+    sandbox.write("src/lib.txt", "changed\n");
+
+    let target = sandbox
+        .client_root()
+        .join("src/deep")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+
+    // 两种写法是同一个目录：裸后缀与后缀后再跟一个尾分隔符。用 `-l` 预览，不落 open。
+    for suffix in ["/...", "/.../"] {
+        let run = sandbox
+            .cli()
+            .args(["-l"])
+            .arg(format!("{target}{suffix}"))
+            .output()
+            .expect("run tool");
+        assert!(run.status.success(), "{run:?}");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            stdout.contains("Processing 1 scope entry."),
+            "位置参数与配置里的同一个目录应当合并成一条入口：{stdout}"
+        );
+        assert!(stdout.contains("c.txt"), "{stdout}");
+        assert!(
+            !stdout.contains("lib.txt"),
+            "配置只覆盖 src/deep，src 下的兄弟文件不该进来：{stdout}"
+        );
+    }
+
+    sandbox
+        .cli()
+        .args(["-a", "-l"])
+        .arg(format!("{target}/..."))
+        .assert()
+        .success();
+
+    let opened = sandbox.opened();
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert!(opened[0].contains("c.txt"), "{opened:?}");
+}
+
+/// 一部分目标**整条**落在配置范围外：在碰任何 p4 写之前失败，并点名被丢掉的入口。
+/// 跑完剩下的再报「已是最新」会让调用方以为那几条路径也处理过了。
+#[test]
+fn a_partially_dropped_target_set_fails_before_any_write() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+
+    sandbox.write(".p4delta-scope", r#"{"include": [{"dir": "src"}]}"#);
+    sandbox.write("src/lib.txt", "changed\n");
+    sandbox.write("readme.txt", "changed at the root\n");
+
+    let root = sandbox.client_root().to_path_buf();
+    sandbox
+        .cli()
+        .args(["-a", "-l"])
+        .arg(root.join("src"))
+        .arg(root.join("readme.txt"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "would drop 1 of the 2 given paths",
+        ))
+        .stderr(predicate::str::contains("readme.txt"));
+
+    let opened = sandbox.opened();
+    assert!(
+        opened.is_empty(),
+        "范围求值阶段就该失败，一个文件都不该被打开: {opened:?}"
+    );
+}
+
 /// 重叠的入口先归并再查询：不去重的话 fstat 会返回重复记录，同一个文件被打开两次。
 #[test]
 fn overlapping_entries_do_not_duplicate_commands() {

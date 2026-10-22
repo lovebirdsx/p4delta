@@ -122,13 +122,92 @@ pub(crate) fn directory_key(path: &str) -> String {
     trimmed.to_owned()
 }
 
+/// 平台的分隔符字节：Windows 上 `/` 与 `\` 都算，Unix 上只有 `/`。
+fn is_separator(byte: u8) -> bool {
+    byte == std::path::MAIN_SEPARATOR as u8 || (cfg!(windows) && byte == b'/')
+}
+
+/// 折掉末尾的路径分隔符。只在**探测后缀**时用：调用方发现确实有后缀才采用这个结果，
+/// 所以 `dir/` 这种没有后缀的写法保持原样。
+fn trim_trailing_separators(path: &str) -> &str {
+    let bytes = path.as_bytes();
+    let mut end = bytes.len();
+
+    while end > 0 && is_separator(bytes[end - 1]) {
+        end -= 1;
+    }
+
+    // 只切 ASCII 分隔符，切点一定落在字符边界上。
+    &path[..end]
+}
+
 /// 剥掉末尾的 p4 通配后缀（`/...` 或 `\...`）：P4V 等工具传进来的目录参数常常带着它。
 ///
-/// 注意 `trim_end_matches` 剥的是**所有**连续匹配的后缀，所以 `C:\ws\...\...` 会被
-/// 整个剥成 `C:\ws`。实践中不会出现双后缀，这里把「剥干净」当成显式契约写下来，
-/// 而不是留给读者去推敲它是副作用还是本意。
+/// Windows 上 `/` 与 `\` 都是分隔符，两种写法都要认（编辑器拼参数时就是正斜杠）；Unix 上
+/// 反斜杠是合法的文件名字符，只认 `/...`。剥的是**所有**连续后缀，且两种分隔符可以混用：
+/// `C:\ws\.../...` 整个剥成 `C:\ws`——`trim_end_matches` 一次只处理一种，混着写时得再来
+/// 一轮。后缀后面跟着尾分隔符（`dir/.../`）也是同一种写法，一起剥掉。
+///
+/// 注意这个函数只做**切片**：`C:\...` 剥完是 `C:`、`/...` 剥完是空串，补回根分隔符是
+/// [`strip_recursive_suffix_owned`] 的事。
 pub(crate) fn strip_depot_wildcard_suffix(path: &str) -> &str {
-    path.trim_end_matches(if cfg!(windows) { "\\..." } else { "/..." })
+    let mut current = path;
+
+    loop {
+        // `dir/.../`：后缀后面可能还有尾分隔符，先折掉再判断；没有后缀就保持原样。
+        let trimmed = trim_trailing_separators(current);
+        let candidate = if trimmed.len() < current.len() {
+            let stripped = trim_recursive_suffix(trimmed);
+            if stripped.len() == trimmed.len() {
+                return current;
+            }
+            stripped
+        } else {
+            trim_recursive_suffix(current)
+        };
+
+        if candidate.len() == current.len() {
+            return current;
+        }
+        current = candidate;
+    }
+}
+
+/// 一次剥掉所有连续、可混用的递归后缀（不处理尾分隔符）。
+fn trim_recursive_suffix(path: &str) -> &str {
+    let mut current = path;
+
+    loop {
+        let stripped = if cfg!(windows) {
+            current.trim_end_matches("/...").trim_end_matches("\\...")
+        } else {
+            current.trim_end_matches("/...")
+        };
+
+        if stripped.len() == current.len() {
+            return current;
+        }
+        current = stripped;
+    }
+}
+
+/// [`strip_depot_wildcard_suffix`] 的所有权版本，并把「剥成根」的形状补回来。
+///
+/// `C:\...` 剥完只剩 `C:`——在 Windows 路径 API 里那是「C 盘的当前目录」，不是盘根；
+/// Unix 的 `/...` 剥完是空串。两者都得还原成 `C:\` / `/`，否则「整个盘」会悄悄变成
+/// 别的地方（甚至不是同一棵树）。
+pub(crate) fn strip_recursive_suffix_owned(path: &str) -> String {
+    let stripped = strip_depot_wildcard_suffix(path);
+    if stripped.len() == path.len() {
+        return path.to_owned();
+    }
+    if stripped.is_empty() {
+        return std::path::MAIN_SEPARATOR.to_string();
+    }
+    if cfg!(windows) && stripped.ends_with(':') {
+        return format!("{stripped}{}", std::path::MAIN_SEPARATOR);
+    }
+    stripped.to_owned()
 }
 
 /// 本地路径 → p4 的 **file spec** 里可以安全出现的文本：把在 p4 语法里有特殊含义的字符
@@ -400,6 +479,86 @@ mod tests {
             strip_depot_wildcard_suffix(&path),
             format!("c:{sep}ws{sep}stream")
         );
+    }
+
+    /// 分隔符风格要跟着平台走：Windows 上 `/` 与 `\` 都是边界，编辑器传的正斜杠与
+    /// 规范化后的反斜杠混着写、连着写都要剥干净；Unix 上反斜杠是合法的文件名字符，
+    /// 只认 `/...`。
+    #[test]
+    fn wildcard_suffixes_follow_the_platform_separator_rules() {
+        let sep = std::path::MAIN_SEPARATOR;
+
+        if cfg!(windows) {
+            for path in [
+                format!("c:{sep}ws{sep}..."),
+                format!("c:{sep}ws/..."),
+                format!("c:{sep}ws{sep}.../..."),
+                format!("c:{sep}ws/...{sep}..."),
+            ] {
+                assert_eq!(strip_depot_wildcard_suffix(&path), format!("c:{sep}ws"));
+            }
+        } else {
+            assert_eq!(strip_depot_wildcard_suffix("/ws/..."), "/ws");
+            assert_eq!(
+                strip_depot_wildcard_suffix("/ws\\..."),
+                "/ws\\...",
+                "Unix 上反斜杠是文件名的一部分，不能当成后缀"
+            );
+        }
+    }
+
+    /// 后缀后面还能跟尾分隔符（`dir/.../`）：P4V 与编辑器拼参数时两种写法都会出现，
+    /// 不剥掉的话同一个目录会被当成另一个路径，交集静默落空。没有后缀的 `dir/` 不动。
+    #[test]
+    fn trailing_separators_after_a_wildcard_are_stripped_too() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let suffix = if cfg!(windows) { r"\..." } else { "/..." };
+        let dir = format!("c:{sep}ws{sep}src");
+
+        for path in [
+            format!("{dir}{suffix}/"),
+            format!("{dir}{suffix}{sep}"),
+            format!("{dir}{suffix}//"),
+            format!("{dir}{suffix}{sep}{sep}"),
+        ] {
+            assert_eq!(
+                strip_depot_wildcard_suffix(&path),
+                dir,
+                "带尾分隔符的后缀没有剥干净: {path}"
+            );
+        }
+
+        // 没有后缀：尾分隔符属于路径，原样返回（借用原串，不多分配）。
+        let plain = format!("{dir}{sep}");
+        let stripped = strip_depot_wildcard_suffix(&plain);
+        assert_eq!(stripped, plain);
+        assert!(std::ptr::eq(stripped.as_ptr(), plain.as_ptr()));
+    }
+
+    /// 剥成根时要把分隔符补回去：`C:\...` 只剩 `C:`，在 Windows 路径 API 里那是
+    /// 「C 盘的当前目录」，不是盘根；Unix 的 `/...` 剥完是空串。补错会让「整个盘」
+    /// 悄悄变成别的地方。
+    #[test]
+    fn stripping_a_wildcard_at_the_root_keeps_the_root() {
+        let sep = std::path::MAIN_SEPARATOR;
+
+        if cfg!(windows) {
+            assert_eq!(strip_recursive_suffix_owned("C:\\..."), "C:\\");
+            assert_eq!(strip_recursive_suffix_owned("c:/..."), "c:\\");
+            assert_eq!(strip_recursive_suffix_owned("C:\\.../"), "C:\\");
+            assert_eq!(
+                strip_recursive_suffix_owned("\\\\server\\share\\..."),
+                "\\\\server\\share"
+            );
+        } else {
+            assert_eq!(strip_recursive_suffix_owned("/..."), "/");
+            assert_eq!(strip_recursive_suffix_owned("/.../"), "/");
+            assert_eq!(strip_recursive_suffix_owned("/ws/..."), "/ws");
+        }
+
+        // 不是后缀的路径原样返回，不做无谓分配。
+        let plain = format!("c:{sep}ws{sep}src");
+        assert_eq!(strip_recursive_suffix_owned(&plain), plain);
     }
 
     /// `trim_end_matches` 剥的是所有连续匹配的后缀。实践中不会有双后缀，
