@@ -95,14 +95,22 @@ pub(crate) fn feed_arguments_via_stdin(cmd: &mut Command, args: &[String]) -> Op
 
 /// 把载荷写进 p4 的 stdin，然后关掉管道让它读到 EOF。
 ///
-/// 写入失败不上报：p4 可能在读完全部参数之前就退出（比如整批失败），那时写入拿到的是
-/// EPIPE，它不是新信息——p4 自己的退出状态才是结论。
+/// 写入失败照旧不算 p4 调用的结论（p4 可能在读完全部参数之前就退出，比如整批失败，
+/// 这时写入拿到的是 EPIPE），但**必须留下痕迹**：同一种 EPIPE 也可能出现在 p4 只读走
+/// 前半批的时候——那后半批规格根本没送进 p4，而 p4 会照常以 0 退出、stderr 干净，
+/// 调用方只会看到「成功」。静默吞掉就等于把「少传了一半」报成成功。
 pub(crate) async fn write_p4_arguments(arguments: Option<(ChildStdin, Vec<u8>)>) {
     let Some((mut stdin, payload)) = arguments else {
         return;
     };
 
-    let _ = stdin.write_all(&payload).await;
+    let expected = payload.len();
+    if let Err(error) = stdin.write_all(&payload).await {
+        eprintln!(
+            "Warning: failed to write the whole {expected}-byte argument payload to p4: {error}; \
+             the tail of this batch never reached p4."
+        );
+    }
     // 关掉管道，p4 才读得到 EOF；只 drop 也行，但显式关掉更清楚。
     let _ = stdin.close().await;
 }

@@ -380,6 +380,76 @@ fn delete_specs(files: &[DeleteFile]) -> Vec<String> {
         .collect()
 }
 
+/// 从 p4 的逐条应答里找出**没有**被回应的规格。
+///
+/// p4 对每条被它处理的规格打一行 `<规格> - <动作> <本地路径>`。规格名本身也可能含
+/// `" - "`（例如 `//depot/a - b.txt#3`），所以不能在第一处就切：逐处试，取**最后**一个
+/// 恰好等于已知规格的前缀。规格总在行首、后面紧跟分隔符；本地路径在它之后，那里切出来
+/// 的前缀不会命中规格集合。
+///
+/// 有输出却一条都认不出时返回 `Err`：那说明输出形状与这里的假设不符（p4 换了版本或
+/// 说法）。此时若把它当成「全都没同步」去补发，只会让整轮白跑一遍，而且下一轮还会同样
+/// 白跑；直接失败，让问题落在「看不懂 p4 的输出」上。
+fn missing_specs(specs: &[String], lines: &[String]) -> Result<Vec<String>> {
+    let known: HashSet<&str> = specs.iter().map(String::as_str).collect();
+    let mut acknowledged: HashSet<&str> = HashSet::new();
+
+    for line in lines {
+        let mut matched = None;
+        for (at, _) in line.match_indices(" - ") {
+            let candidate = &line[..at];
+            if known.contains(candidate) {
+                matched = Some(candidate);
+            }
+        }
+        if let Some(spec) = matched {
+            acknowledged.insert(spec);
+        }
+    }
+
+    if acknowledged.is_empty() && !lines.is_empty() {
+        bail!(
+            "p4 sync wrote {} line(s), but none of them matched a requested file spec; p4delta \
+             cannot tell which files were synced (the p4 output format may have changed). \
+             Nothing was retried.",
+            lines.len()
+        );
+    }
+
+    Ok(specs
+        .iter()
+        .filter(|spec| !acknowledged.contains(spec.as_str()))
+        .cloned()
+        .collect())
+}
+
+/// 下发一批 `p4 sync` 规格，返回 p4 **没有**逐条应答的规格。
+///
+/// p4 对每条规格都会打一行 `<规格> - <动作> <本地路径>`。退出码 0 且 stderr 干净并不代表
+/// 每条规格都真被动过：规格没送到 p4、或 p4 静默忽略了某几批时，整轮照报成功，而工作区
+/// 停在一个既没拉全、也没人知道的状态上（实测遇到过一次：82,485 条规格里 17,215 条对应
+/// 的文件根本没有被写，`have` 的 syncTime 还停在几轮同步之前）。
+///
+/// 输出非空却一条规格都认不出时直接失败，理由见 [`missing_specs`]。
+async fn run_p4_sync_specs(
+    options: &Options,
+    work_dir: &str,
+    specs: &[String],
+) -> Result<Vec<String>> {
+    let lines = run_p4_command_batched(
+        options,
+        work_dir,
+        P4Command::Sync,
+        SYNC_ARGS,
+        specs,
+        false,
+        FailureMode::ExitCodeOrStderr,
+    )
+    .await?;
+
+    missing_specs(specs, &lines)
+}
+
 /// 把一批文件拉到它们的目标版本。
 ///
 /// 传 depot 路径而不是 client 路径：目标修订本来就长在 depot 记录上，而且同一个 client
@@ -392,18 +462,40 @@ async fn sync_to_target(options: &Options, work_dir: &str, files: &[SyncFile]) -
     // 否则工作区会停在一个既没拉全、也没人知道的状态上。
     // 判据同 [`crate::reconcile::changes::apply_changes`]：p4 的逐文件错误不改退出码。
     // 错误由 [`apply_sync`] 收集，等其余各类做完再一起报。
-    run_p4_command_batched(
-        options,
-        work_dir,
-        P4Command::Sync,
-        SYNC_ARGS,
-        &specs,
-        false,
-        FailureMode::ExitCodeOrStderr,
-    )
-    .await?;
+    let unacknowledged = run_p4_sync_specs(options, work_dir, &specs).await?;
+    sayln!(
+        "      p4 acknowledged {} of {} file spec(s).",
+        specs.len() - unacknowledged.len(),
+        specs.len()
+    );
 
-    Ok(())
+    if unacknowledged.is_empty() {
+        return Ok(());
+    }
+
+    // 「Synced N files」必须等于 p4 真动过的文件数，所以缺的那些先补一次：只重发没被应答的
+    // 规格，p4 这一轮的状态没人知道，重发是幂等的；补完还是不齐，才把这一组报成失败。
+    sayln!(
+        "      Retrying {} file spec(s) p4 did not act on.",
+        unacknowledged.len()
+    );
+    let still_missing = run_p4_sync_specs(options, work_dir, &unacknowledged).await?;
+    if still_missing.is_empty() {
+        return Ok(());
+    }
+
+    let examples: Vec<&str> = still_missing
+        .iter()
+        .take(10)
+        .map(|spec| spec.as_str())
+        .collect();
+    bail!(
+        "p4 sync exited cleanly but did not act on {} of {} file spec(s), even after retrying \
+         them; those files are still at their old revisions. First: {}",
+        still_missing.len(),
+        specs.len(),
+        examples.join(", ")
+    );
 }
 
 /// 从工作区里删掉一批未跟踪文件。它们没有 have 记录，所以只删磁盘，不下发 `#none`。
@@ -1154,6 +1246,81 @@ mod tests {
 
         // 钉住版本是全部要点：不带版本的 `-f` 会同步到 head，`--to <CL>` 下就跑到目标前面去了。
         assert_eq!(specs, ["//depot/a.txt#3", "//depot/b.txt#7"]);
+    }
+
+    // ---- p4 应答核对 ----
+
+    /// p4 对每条规格回一行 `<规格> - <动作> <本地路径>`：逐条对上才算完成。
+    #[test]
+    fn sync_replies_acknowledge_every_spec() {
+        let specs = vec!["//depot/a.txt#3".to_owned(), "//depot/b.txt#7".to_owned()];
+        let lines = vec![
+            r"//depot/a.txt#3 - updating C:\ws\a.txt".to_owned(),
+            r"//depot/b.txt#7 - added as C:\ws\b.txt".to_owned(),
+        ];
+
+        assert_eq!(missing_specs(&specs, &lines).unwrap(), Vec::<String>::new());
+    }
+
+    /// 没被回应的规格要原样留出来，交给调用方补发。
+    #[test]
+    fn sync_replies_report_the_specs_p4_did_not_answer() {
+        let specs = vec![
+            "//depot/a.txt#3".to_owned(),
+            "//depot/b.txt#7".to_owned(),
+            "//depot/c.txt#1".to_owned(),
+        ];
+        let lines = vec![
+            r"//depot/a.txt#3 - refreshing C:\ws\a.txt".to_owned(),
+            r"//depot/c.txt#1 - refreshing C:\ws\c.txt".to_owned(),
+        ];
+
+        assert_eq!(
+            missing_specs(&specs, &lines).unwrap(),
+            ["//depot/b.txt#7".to_owned()]
+        );
+    }
+
+    /// 规格名本身含 `" - "`：按第一处分隔会把规格截成 `//depot/a`，永远对不上，
+    /// 于是一个已经同步好的文件会被误报成「没应答」并触发无谓的重发。
+    #[test]
+    fn a_spec_containing_the_separator_is_still_recognized() {
+        let specs = vec!["//depot/a - b.txt#3".to_owned()];
+        let lines = vec![r"//depot/a - b.txt#3 - updating C:\ws\a - b.txt".to_owned()];
+
+        assert!(missing_specs(&specs, &lines).unwrap().is_empty());
+    }
+
+    /// 两条规格是前缀关系时，较长那条的应答不能记到较短那条头上。
+    #[test]
+    fn a_longer_spec_is_not_credited_to_its_shorter_prefix() {
+        let specs = vec!["//depot/a#1".to_owned(), "//depot/a - b.txt#3".to_owned()];
+        // 只回较长那条；较短那条必须仍算「没应答」。
+        let lines = vec![r"//depot/a - b.txt#3 - updating C:\ws\a - b.txt".to_owned()];
+
+        assert_eq!(
+            missing_specs(&specs, &lines).unwrap(),
+            ["//depot/a#1".to_owned()]
+        );
+    }
+
+    /// 有输出却一条都认不出：这是输出格式与假设不符，不能当成「全都没同步」去补发，
+    /// 否则每一轮都会先白跑一遍再失败。
+    #[test]
+    fn output_that_matches_no_spec_is_a_format_error() {
+        let specs = vec!["//depot/a.txt#3".to_owned()];
+        let lines = vec!["unexpected line shape".to_owned()];
+
+        let error = missing_specs(&specs, &lines).expect_err("认不出任何规格必须失败");
+        assert!(error.to_string().contains("output format"), "{error}");
+    }
+
+    /// p4 一句话都没说（例如整批没送到）：不是格式问题，全部记为待补发。
+    #[test]
+    fn empty_output_marks_every_spec_as_missing() {
+        let specs = vec!["//depot/a.txt#3".to_owned()];
+
+        assert_eq!(missing_specs(&specs, &[]).unwrap(), specs);
     }
 
     // ---- 未跟踪文件 ----
