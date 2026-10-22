@@ -192,8 +192,7 @@ function Reset-Root {
 # PATH 前置垫片目录、工作目录切到一次性仓库，调用前后都还原；跑的是新进程，
 # 输出走文件而不是管道，退出码读 $LASTEXITCODE（原生命令进了管道也读得到，
 # 但输出就分不出是 stdout 还是 stderr 了）。
-# -EmptyStdin：把子进程的 stdin 接成空管道（等价于非交互下读不到回答），用来验确认那一步。
-function Invoke-Release([string[]] $Arguments, [switch] $EmptyStdin) {
+function Invoke-Release([string[]] $Arguments) {
     $previousPath = $env:PATH
     $previousLog = $env:CARGO_SHIM_LOG
     try {
@@ -201,11 +200,7 @@ function Invoke-Release([string[]] $Arguments, [switch] $EmptyStdin) {
         $env:CARGO_SHIM_LOG = $ShimLog
         Push-Location $Repo
         try {
-            if ($EmptyStdin) {
-                '' | & $HostExe -NoProfile -ExecutionPolicy Bypass -File $RepoScript @Arguments > $OutFile 2> $ErrFile
-            } else {
-                & $HostExe -NoProfile -ExecutionPolicy Bypass -File $RepoScript @Arguments > $OutFile 2> $ErrFile
-            }
+            & $HostExe -NoProfile -ExecutionPolicy Bypass -File $RepoScript @Arguments > $OutFile 2> $ErrFile
             return $LASTEXITCODE
         } finally {
             Pop-Location
@@ -256,7 +251,7 @@ function Test-DryRunChangesNothing {
 function Test-Releases {
     Reset-Root
 
-    $code = Invoke-Release ('9.9.9', '-Yes')
+    $code = Invoke-Release ('9.9.9')
     Assert-Equal 0 $code "发布失败：$(Get-Stderr)$(Get-Stdout)"
 
     # 三个文件各改一处
@@ -291,7 +286,7 @@ function Test-AutoBumpsPatch {
     Reset-Root
     $before = Get-RepoVersion
 
-    $code = Invoke-Release ('-SkipCheck', '-Yes')
+    $code = Invoke-Release ('-SkipCheck')
     Assert-Equal 0 $code "不带版本号发布失败：$(Get-Stderr)$(Get-Stdout)"
 
     $after = Get-RepoVersion
@@ -304,7 +299,7 @@ function Test-AutoBumpsMinor {
     Reset-Root
     $before = Get-RepoVersion
 
-    $code = Invoke-Release ('-Minor', '-SkipCheck', '-Yes')
+    $code = Invoke-Release ('-Minor', '-SkipCheck')
     Assert-Equal 0 $code "-Minor 发布失败：$(Get-Stderr)$(Get-Stdout)"
 
     $after = Get-RepoVersion
@@ -315,7 +310,7 @@ function Test-AutoBumpsMajor {
     Reset-Root
     $before = Get-RepoVersion
 
-    $code = Invoke-Release ('-Major', '-SkipCheck', '-Yes')
+    $code = Invoke-Release ('-Major', '-SkipCheck')
     Assert-Equal 0 $code "-Major 发布失败：$(Get-Stderr)$(Get-Stdout)"
 
     $after = Get-RepoVersion
@@ -329,7 +324,7 @@ function Test-AutoBumpRespectsExistingTags {
     $next = Get-ExpectedBump (Get-RepoVersion) 'patch'
     Invoke-Git ('push', '--quiet', 'origin', "HEAD:refs/tags/v$next") | Out-Null
 
-    $code = Invoke-Release ('-Yes')
+    $code = Invoke-Release @()
     Assert-True ($code -ne 0) "自动升出来 v$next 已经有 tag 了，不该继续"
     Assert-Contains (Get-Stderr) "远端已经有 tag v$next" '错误信息'
 }
@@ -338,7 +333,7 @@ function Test-RejectsVersionWithBumpFlag {
     Reset-Root
     $before = Get-RepoVersion
 
-    $code = Invoke-Release ('9.9.9', '-Minor', '-Yes')
+    $code = Invoke-Release ('9.9.9', '-Minor')
     Assert-True ($code -ne 0) '既给了版本号又给了 -Minor 时不该继续'
     Assert-Contains (Get-Stderr) '就不要再给' '错误信息'
     Assert-Equal $before (Get-RepoVersion) '拒绝时不该改版本号'
@@ -347,7 +342,7 @@ function Test-RejectsVersionWithBumpFlag {
 function Test-SkipCheckSkipsTheGate {
     Reset-Root
 
-    $code = Invoke-Release ('9.9.9', '-SkipCheck', '-Yes')
+    $code = Invoke-Release ('9.9.9', '-SkipCheck')
     Assert-Equal 0 $code "发布失败：$(Get-Stderr)$(Get-Stdout)"
 
     $gate = @((Get-ShimLog) -split "`r?`n" | Where-Object { $_ -match '^(fmt|clippy|nextest) ' })
@@ -361,7 +356,7 @@ function Test-GateFailureStopsTheRelease {
     # 版本号这时已经写进工作区了，脚本故意不回滚：现场留给用户自己看、自己 git checkout。
     $env:CARGO_SHIM_FAIL = 'fmt'
     try {
-        $code = Invoke-Release ('9.9.9', '-Yes')
+        $code = Invoke-Release ('9.9.9')
     } finally {
         Remove-Item Env:\CARGO_SHIM_FAIL -ErrorAction SilentlyContinue
     }
@@ -386,25 +381,13 @@ function Test-NoPushStopsBeforePushing {
     Assert-Contains (Get-Stdout) 'git push origin main && git push origin v9.9.9' '应当给出重推命令'
 }
 
-function Test-DeclinedConfirmationDoesNotPush {
-    Reset-Root
-
-    # 不带 -Yes、stdin 又读不到回答（非交互）：应当停在本地，而不是把提交推上去或直接崩掉。
-    $code = Invoke-Release ('9.9.9', '-SkipCheck') -EmptyStdin
-    Assert-Equal 0 $code "没确认时不该失败：$(Get-Stderr)$(Get-Stdout)"
-
-    Assert-Equal 'v9.9.9' ((Invoke-Git ('tag', '-l')) -join '') '本地应当已经提交并打好 tag'
-    Assert-Equal '' ((Invoke-GitIn $Origin ('tag', '-l')) -join '') '没确认就不该推 tag'
-    Assert-Equal '1' (Invoke-GitIn $Origin ('rev-list', '--count', 'main')) '没确认就不该推分支'
-}
-
 function Test-RejectsDirtyTree {
     Reset-Root
     # 拿一个已跟踪的文件弄脏工作区（版本号那一行还在，所以挡住它的只可能是这条检查）
     [System.IO.File]::AppendAllText((Join-Path $Repo 'p4delta.exe.manifest'), "`n", $Utf8NoBom)
     $before = Get-RepoVersion
 
-    $code = Invoke-Release ('9.9.9', '-Yes')
+    $code = Invoke-Release ('9.9.9')
     Assert-True ($code -ne 0) '工作区不干净时不该继续'
     Assert-Contains (Get-Stderr) '工作区不干净' '错误信息'
     Assert-Contains (Get-Stderr) 'p4delta.exe.manifest' '错误信息里应当带上是哪个文件脏了'
@@ -417,7 +400,7 @@ function Test-RejectsExistingTag {
     Invoke-Git ('tag', '-a', 'v9.9.9', '-m', 'v9.9.9') | Out-Null
     $before = Get-RepoVersion
 
-    $code = Invoke-Release ('9.9.9', '-Yes')
+    $code = Invoke-Release ('9.9.9')
     Assert-True ($code -ne 0) '本地已有同名 tag 时不该继续'
     Assert-Contains (Get-Stderr) '本地已经有 tag' '错误信息'
     Assert-Equal $before (Get-RepoVersion) '拒绝时不该改版本号'
@@ -428,7 +411,7 @@ function Test-RejectsRemoteTag {
     # 只推到远端，本地没有 —— 挡住它的必须是远端那一条检查
     Invoke-Git ('push', '--quiet', 'origin', 'HEAD:refs/tags/v9.9.9') | Out-Null
 
-    $code = Invoke-Release ('9.9.9', '-Yes')
+    $code = Invoke-Release ('9.9.9')
     Assert-True ($code -ne 0) '远端已有同名 tag 时不该继续'
     Assert-Contains (Get-Stderr) '远端已经有 tag' '错误信息'
 }
@@ -436,11 +419,11 @@ function Test-RejectsRemoteTag {
 function Test-RejectsBadVersion {
     Reset-Root
 
-    $code = Invoke-Release ('9.9', '-Yes')
+    $code = Invoke-Release ('9.9')
     Assert-True ($code -ne 0) '两段的版本号不该被接受'
     Assert-Contains (Get-Stderr) 'X.Y.Z' '错误信息'
 
-    $code = Invoke-Release ('v9.9.9', '-Yes')
+    $code = Invoke-Release ('v9.9.9')
     Assert-True ($code -ne 0) '带 v 前缀的版本号不该被接受（v 由脚本自己加）'
     Assert-Equal '1' (Invoke-Git ('rev-list', '--count', 'HEAD')) '拒绝时不该产生提交'
 }
@@ -449,11 +432,11 @@ function Test-RejectsVersionNotGreater {
     Reset-Root
     $current = Get-RepoVersion
 
-    $code = Invoke-Release ($current, '-Yes')
+    $code = Invoke-Release ($current)
     Assert-True ($code -ne 0) '重发同一版本不该被接受'
     Assert-Contains (Get-Stderr) '不比当前的' '错误信息'
 
-    $code = Invoke-Release ('0.0.1', '-Yes')
+    $code = Invoke-Release ('0.0.1')
     Assert-True ($code -ne 0) '更小的版本号不该被接受'
     Assert-Equal $current (Get-RepoVersion) '拒绝时不该改版本号'
 }
@@ -462,7 +445,7 @@ function Test-RejectsWrongBranch {
     Reset-Root
     Invoke-Git ('checkout', '--quiet', '-b', 'feature') | Out-Null
 
-    $code = Invoke-Release ('9.9.9', '-Yes')
+    $code = Invoke-Release ('9.9.9')
     Assert-True ($code -ne 0) '不在 main 上时不该继续'
     Assert-Contains (Get-Stderr) '当前在 feature 分支上' '错误信息'
     Assert-Equal '' ((Invoke-Git ('tag', '-l')) -join '') '拒绝时不该打 tag'
@@ -481,7 +464,7 @@ function Test-RejectsDivergedRemote {
     Invoke-GitIn $Other ('commit', '--quiet', '-m', '别人推的提交') | Out-Null
     Invoke-GitIn $Other ('push', '--quiet', 'origin', 'main') | Out-Null
 
-    $code = Invoke-Release ('9.9.9', '-Yes')
+    $code = Invoke-Release ('9.9.9')
     Assert-True ($code -ne 0) '本地落后远端时不该继续'
     Assert-Contains (Get-Stderr) '落后' '错误信息'
     Assert-Equal '1' (Invoke-Git ('rev-list', '--count', 'HEAD')) '拒绝时不该产生提交'
@@ -502,7 +485,6 @@ $cases = @(
     'Test-SkipCheckSkipsTheGate'
     'Test-GateFailureStopsTheRelease'
     'Test-NoPushStopsBeforePushing'
-    'Test-DeclinedConfirmationDoesNotPush'
     'Test-RejectsDirtyTree'
     'Test-RejectsExistingTag'
     'Test-RejectsRemoteTag'

@@ -41,9 +41,6 @@
 .PARAMETER NoPush
     本地做完：改文件、跑门禁、提交、打 tag，但不推送。
 
-.PARAMETER Yes
-    推送前不再确认。
-
 .PARAMETER Branch
     要求当前分支是 <名>（默认 main）。
 
@@ -69,7 +66,6 @@ param(
     [switch] $DryRun,
     [switch] $SkipCheck,
     [switch] $NoPush,
-    [switch] $Yes,
     [string] $Branch = 'main',
     [string] $Remote = 'origin',
     # 别名给了 -h：bash 版的 -h/--help 是肌肉记忆；PowerShell 自己还认 -?。
@@ -108,7 +104,6 @@ tag 一旦推出去 release.yml 就会跑，门禁在本地红比在 CI 红便�
   -DryRun         只做检查并打印将要做什么，不改文件、不提交、不打 tag、不推送
   -SkipCheck      跳过本地门禁（CI 里还会再跑一遍，但那要等 tag 推出去之后）
   -NoPush         本地做完：改文件、跑门禁、提交、打 tag，但不推送
-  -Yes            推送前不再确认
   -Branch <名>    要求当前分支是 <名>（默认 main）
   -Remote <名>    远端名（默认 origin）
   -Help           显示这段
@@ -375,23 +370,6 @@ try {
         Write-Host '没推送（-NoPush）'
         Write-Host "    提交和 tag 都在本地了。要推的时候：$(Get-PushHint $tag)"
         exit 0
-    }
-
-    if (-not $Yes) {
-        Write-Host "把提交与 tag $tag 推到 $Remote？[y/N] " -NoNewline
-        $reply = ''
-        try {
-            # 非交互时（stdin 被关掉或已到 EOF）读不到回答：按「没确认」处理，走「没有推送」，
-            # 而不是抛异常把脚本打断在半路。
-            $reply = Read-Host
-        } catch {
-            $reply = ''
-        }
-        if ($reply -notmatch '^[yY]') {
-            Write-Host '没有推送'
-            Write-Host "    提交和 tag 都在本地了。要推的时候：$(Get-PushHint $tag)"
-            exit 0
-        }
     }
 
     Write-Host "推送到 $Remote"
