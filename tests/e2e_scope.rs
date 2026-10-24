@@ -1145,3 +1145,66 @@ fn the_fixed_root_drives_the_run_from_any_directory() {
     assert_eq!(opened.len(), 1, "只有 src/lib.txt 该被打开：{opened:?}");
     assert!(opened[0].contains("lib.txt"), "{opened:?}");
 }
+
+/// 配置里的目录本地整棵都不存在（client 从没同步过它）：depot 里有、本地没有的部分正是
+/// 同步要拉下来的东西，扫盘把它当「零个本地文件」，而不是一条中止整轮的 IO 错误。
+///
+/// 真实形态：配置写满 `Package/...`、`Source/...` 一类大目录，工作区只同步了其中一个，
+/// 强制修复到某个 changelist 时第一个缺失的入口就让整轮失败。
+fn missing_configured_dir(sandbox: &support::Sandbox) {
+    sandbox.commit("pkg/a.txt", "only in the depot\n");
+    sandbox.p4_ok(&["sync", "pkg/...#none"]);
+    let pkg = sandbox.client_root().join("pkg");
+    if pkg.exists() {
+        std::fs::remove_dir_all(&pkg).expect("remove pkg");
+    }
+    sandbox.write(
+        ".p4delta-scope",
+        r#"{"include": [{"dir": "pkg"}, {"dir": "src"}]}"#,
+    );
+}
+
+#[test]
+fn a_force_sync_pulls_a_configured_dir_missing_locally() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    missing_configured_dir(&sandbox);
+
+    sandbox
+        .cli()
+        .args(["--sync", "--force", "-a", "."])
+        .assert()
+        .success();
+
+    assert!(sandbox.exists("pkg/a.txt"));
+    assert_eq!(sandbox.p4_lines(&["have", "pkg/..."]).len(), 1);
+}
+
+#[test]
+fn a_normal_sync_pulls_a_configured_dir_missing_locally() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    missing_configured_dir(&sandbox);
+
+    sandbox.cli().args(["--sync", "-a", "."]).assert().success();
+
+    assert!(sandbox.exists("pkg/a.txt"));
+}
+
+/// open 模式还会对入口做目录剪枝的预扫描，那一遍同样不能被缺失的入口打断。
+#[test]
+fn open_skips_a_configured_dir_missing_locally() {
+    let Some(sandbox) = support::sandbox_or_skip() else {
+        return;
+    };
+    missing_configured_dir(&sandbox);
+    sandbox.write("src/lib.txt", "changed under src\n");
+
+    sandbox.cli().args(["-a", "-l", "."]).assert().success();
+
+    let opened = sandbox.opened();
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert!(opened[0].contains("lib.txt"), "{opened:?}");
+}

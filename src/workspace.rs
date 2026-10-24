@@ -18,10 +18,11 @@ use crate::path::{
 use crate::prune::{IGNORES_ARGS, PrunePlan, parse_ignores_output, plan_directory_pruning};
 use crate::reconcile::changes::NewFile;
 use crate::scan;
-use crate::scope::{EntryKind, ExcludeSet, Scope, ScopeEntry};
+use crate::scope::{EntryKind, ExcludeSet, Scope, ScopeEntry, is_missing_locally};
 
-/// 扫描范围入口：目录入口递归收集；文件入口直接取单个文件（本地不存在就跳过，
-/// 让 depot 记录去判定——「本地删除、depot 还有」正是 open for delete 要看的状态）。
+/// 扫描范围入口：目录入口递归收集，文件入口直接取单个文件。两者本地不存在都跳过，让 depot
+/// 记录去判定——「本地删除、depot 还有」正是 open for delete 要看的状态，「本地整棵没有」
+/// 正是同步要拉下来的部分。
 ///
 /// `skip_dirs` 是 ignore 剪枝结果（语义：p4 看不见这些目录，但其中已跟踪文件要回扫）；
 /// `excludes` 是范围硬排除（命中即整棵子树跳过，且不像剪枝那样回扫）。
@@ -38,6 +39,9 @@ pub(crate) fn collect_scope_files(
     for entry in includes {
         match entry.kind {
             EntryKind::Directory => {
+                if is_missing_locally(&entry.path) {
+                    continue;
+                }
                 let (mut collected, dirs, size) = scan::collect(&entry.path, &skip_keys, excludes)?;
                 // 空表直接接管，避免 append 再分配一张完整文件表。
                 if files.is_empty() {

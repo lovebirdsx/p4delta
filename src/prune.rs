@@ -20,7 +20,7 @@ use crate::p4::process::{
     split_command_line_paths,
 };
 use crate::path::{local_path_key, normalize_local_path_owned, path_is_under_key};
-use crate::scope::ExcludeSet;
+use crate::scope::{ExcludeSet, is_missing_locally};
 
 /// P4IGNORE 必须恰好解析成这个名字，才允许用目录级判断剪枝。
 pub(crate) const P4IGNORE_FILE_NAME: &str = ".p4ignore";
@@ -297,7 +297,7 @@ pub(crate) fn is_ignore_file_name(name: &OsStr) -> bool {
 pub(crate) fn prescan_directories(roots: &[String], excludes: &ExcludeSet) -> Result<Prescan> {
     let mut prescan = Prescan::default();
 
-    for root in roots {
+    for root in roots.iter().filter(|root| !is_missing_locally(root)) {
         let mut walker = WalkDir::new(root).into_iter();
 
         while let Some(entry) = walker.next() {

@@ -591,6 +591,13 @@ fn classify_entry(path: &str, explicit_dir: bool) -> EntryKind {
     }
 }
 
+/// 目录入口在本地整个不存在（从没同步过、或整棵删掉了）。遍历本地的那几处据此跳过它：
+/// 它对本地是「零个文件」，depot 那一侧照常查询，缺的部分由差异分析判出来。
+/// 只认 `NotFound`：权限之类的其它错误仍交给遍历去报，不能静默当成空目录。
+pub(crate) fn is_missing_locally(path: &str) -> bool {
+    matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// 位置参数解析出来的目标。
 pub(crate) struct ResolvedTargets {
     pub(crate) entries: Vec<ScopeEntry>,
