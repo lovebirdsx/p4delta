@@ -585,6 +585,43 @@ pub(crate) fn analyze_at_target<'a>(
     Ok(analysis)
 }
 
+/// 「从未同步过」的写回在这个规模以下一律放行：新 client 的首次强制修复、或久未同步后
+/// 目标处新增了一批文件，都会落在 Restore 组里且没有 have 记录，这是正常的。
+const UNSYNCED_RESTORE_FLOOR: usize = 100_000;
+
+/// 挡住「强制修复其实是一次全量首拉」：范围内目标处在库、本 client 从未同步过、本地也没有的
+/// 文件，比本 client 已同步的文件还多（且超过 [`UNSYNCED_RESTORE_FLOOR`]）。
+///
+/// 典型来源是稀疏工作区——只拉过范围里的一小部分，范围配置却覆盖整棵大目录。按
+/// `p4 sync -f` 的语义这些都该写回，但「修复」的本意是把**已有的**文件拉回正确状态；
+/// 把它执行成几百万个文件的下载，既不是用户要的，`--json` 下逐文件的记录也会把消费方撑爆。
+/// 宁可拒绝并说清规模，让用户收窄范围或改走普通同步。
+pub(crate) fn guard_unsynced_restore(
+    analysis: &SyncAnalysis<'_>,
+    depot: &DepotState,
+) -> Result<()> {
+    let unsynced = analysis
+        .restore
+        .iter()
+        .filter(|source| source.record.have_rev.is_none())
+        .count();
+    let synced = depot
+        .file_records
+        .iter()
+        .filter(|record| record.have_rev.is_some())
+        .count();
+    check_unsynced_restore(unsynced, synced)
+}
+
+fn check_unsynced_restore(unsynced: usize, synced: usize) -> Result<()> {
+    if unsynced <= UNSYNCED_RESTORE_FLOOR || unsynced <= synced {
+        return Ok(());
+    }
+    bail!(
+        "Refusing to force-sync: {unsynced} file(s) in the scope have never been synced to this          client and are missing locally, more than the {synced} file(s) it has synced. This is a          first-time download rather than a repair. Narrow the scope (.p4delta-scope or the          targets) to what this workspace actually uses, or run a normal sync without --force."
+    );
+}
+
 /// 挡住「大小写冲突 + 目标态与 head 态背离」这个会误删本地文件的组合。
 ///
 /// [`build_mapping`] 选出的胜者是按 **head** 事实定的（在世的优先、有 have 记录的优先），
@@ -1637,5 +1674,41 @@ mod tests {
         );
         assert!(error.contains("missing head_type"), "{error}");
         assert!(error.contains("have_rev=Some(1)"), "{error}");
+    }
+
+    #[test]
+    fn unsynced_restore_within_the_floor_is_allowed() {
+        assert!(check_unsynced_restore(UNSYNCED_RESTORE_FLOOR, 0).is_ok());
+    }
+
+    /// 久未同步：新增的文件没有 have 记录，但不比已同步的多，仍是修复。
+    #[test]
+    fn unsynced_restore_not_exceeding_the_synced_files_is_allowed() {
+        assert!(check_unsynced_restore(1_000_000, 1_000_000).is_ok());
+    }
+
+    /// 稀疏工作区：范围内几百万个从没拉过的文件，已同步的只有几万。
+    #[test]
+    fn a_sparse_workspace_force_sync_is_refused_with_its_scale() {
+        let error = match check_unsynced_restore(5_167_647, 57_938) {
+            Err(error) => error.to_string(),
+            Ok(()) => panic!("全量首拉不该被当成修复执行"),
+        };
+
+        assert!(error.contains("Refusing to force-sync"), "{error}");
+        assert!(error.contains("5167647"), "{error}");
+        assert!(error.contains("57938"), "{error}");
+    }
+
+    /// 只数「从没同步过」的写回：have 记录在、本地被删掉的文件是真正的修复对象。
+    #[test]
+    fn restores_of_synced_files_do_not_count_towards_the_guard() {
+        let depot = depot_state(vec![synced_record(PATH)]);
+        let target = head_target(&depot.file_records);
+        let workspace = workspace_state(&[]);
+        let analysis = analyze_at_target(&depot, &workspace, &target).unwrap();
+
+        assert_eq!(non_empty_sync_groups(&analysis), ["restore"]);
+        assert!(guard_unsynced_restore(&analysis, &depot).is_ok());
     }
 }

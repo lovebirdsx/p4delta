@@ -15,7 +15,9 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 
-use super::analyze::{SyncAnalysis, SyncSource, analyze_at_target, guard_case_conflicts};
+use super::analyze::{
+    SyncAnalysis, SyncSource, analyze_at_target, guard_case_conflicts, guard_unsynced_restore,
+};
 use super::changes::{GroupReport, GroupRow, render_title, report_group};
 use super::{HashStats, delete_workspace_files};
 use crate::cache::{CacheWriter, save_cache};
@@ -930,6 +932,9 @@ pub(crate) async fn build_sync_changes(
         ),
         Some(start_time.elapsed().as_secs_f32()),
     );
+
+    // 排在任何 p4 查询与摘要之前：拒绝的话越早越省。
+    guard_unsynced_restore(&analysis, depot)?;
 
     if !analysis.archived.is_empty() {
         sayln!(
